@@ -1,0 +1,137 @@
+{
+  "ts": "2026-08-03T18:00:00",
+  "positions_sync": {
+    "ok": true,
+    "synced": true,
+    "skipped": false,
+    "reason": null,
+    "synced_at": "2026-08-03T18:00:00",
+    "age_seconds": 0,
+    "stale": false
+  },
+  "positions": [
+    {
+      "ticker": "DELL",
+      "date_purchased": "2026-07-01",
+      "shares_owned": 8,
+      "average_price": 120.5,
+      "current_price": 131.25,
+      "cost_basis": 964.0,
+      "market_value": 1050.0,
+      "day_pl": 12.5,
+      "day_pct": 1.2,
+      "open_pl": 86.0,
+      "open_pct": 8.9,
+      "trail_active": true,
+      "book": "algorithm",
+      "stop_order_price": 124.72,
+      "stop_display_price": 124.72,
+      "status": "armed",
+      "status_label": "armed at $124.72",
+      "min_hold_met": true,
+      "hold_hours_left": 0.0
+    },
+    {
+      "ticker": "MET",
+      "date_purchased": "2026-08-04",
+      "shares_owned": 12,
+      "average_price": 78.0,
+      "current_price": 75.0,
+      "cost_basis": 936.0,
+      "market_value": 900.0,
+      "day_pl": -8.0,
+      "day_pct": -0.9,
+      "open_pl": -36.0,
+      "open_pct": -3.8,
+      "trail_active": false,
+      "book": "algorithm",
+      "stop_order_price": 70.2,
+      "stop_display_price": 70.2,
+      "status": "holding",
+      "status_label": "holding · 10h left",
+      "min_hold_met": false,
+      "hold_hours_left": 10.0
+    }
+  ],
+  "pending_orders": [
+    {
+      "id": 1,
+      "ticker": "EXAMPLE",
+      "date_ordered": "2026-08-03",
+      "quantity_ordered": 10,
+      "order_amount_dollars": 1000.0,
+      "order_id": "demo-1"
+    }
+  ],
+  "open_orders": [],
+  "totals": {
+    "cost_basis": 1900.0,
+    "market_value": 1950.0,
+    "day_pl": 4.5,
+    "day_pct": 0.23,
+    "open_pl": 50.0,
+    "open_pct": 2.63,
+    "realized_note": "Realized P/L since algorithm_start is in algorithm.scorecard."
+  },
+  "algorithm": {
+    "algorithm_start": "2026-08-03T21:10:18",
+    "scorecard": {
+      "realized_pl": 0.0,
+      "unrealized_pl": 0.0,
+      "total_pl": 0.0,
+      "buy_dollars": 0.0,
+      "sell_dollars": 0.0,
+      "trade_count": 0,
+      "open_market_value": 0.0
+    },
+    "books": {
+      "legacy": [],
+      "algorithm": ["DELL", "MET"],
+      "algo_buys": [],
+      "enrolled": ["DELL", "MET"],
+      "untagged": []
+    }
+  },
+  "next_tasks": [
+    {
+      "job_name": "schwab_sync",
+      "title": "Schwab sync",
+      "minutes_until": 2,
+      "due_now": false,
+      "when": "in 2 minutes",
+      "label": "Schwab sync in 2 minutes"
+    },
+    {
+      "job_name": "sell_check",
+      "title": "Sell check",
+      "minutes_until": 12,
+      "due_now": false,
+      "when": "in 12 minutes",
+      "label": "Sell check in 12 minutes"
+    },
+    {
+      "job_name": "watchlist_and_buys",
+      "title": "Watchlist & buys",
+      "minutes_until": 18,
+      "due_now": false,
+      "when": "in 18 minutes",
+      "label": "Watchlist & buys in 18 minutes"
+    },
+    {
+      "job_name": "refresh_market_data",
+      "title": "Yahoo refresh",
+      "minutes_until": 40,
+      "due_now": false,
+      "when": "in 40 minutes",
+      "label": "Yahoo refresh in 40 minutes"
+    }
+  ],
+  "account_snapshot": {
+    "ts": "2026-08-03T17:00:00",
+    "cash": 18500.0,
+    "effective_cash": 17500.0,
+    "liquidation_value": 42000.0,
+    "total_value": 43000.0,
+    "note": "mock"
+  }
+}

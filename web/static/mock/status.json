@@ -1,0 +1,318 @@
+{
+  "ts": "2026-08-03T18:00:00",
+  "dashboard_rev": 1,
+  "trade_dry_run": true,
+  "buys_paused": false,
+  "last_loop_wake": "2026-08-03T17:55:00",
+  "jobs": [
+    {
+      "job_name": "refresh_market_data",
+      "interval_days": 0.0417,
+      "due_now": false,
+      "last_completed": "2026-08-03T17:00:00",
+      "status": "idle",
+      "progress_note": "batch done ok=150/150; overdue_left=8000",
+      "next_due": "2026-08-03T18:00:00"
+    },
+    {
+      "job_name": "watchlist_and_buys",
+      "interval_days": 1,
+      "due_now": true,
+      "last_completed": "2026-08-02T09:00:00",
+      "status": "idle",
+      "progress_note": "complete",
+      "next_due": null
+    },
+    {
+      "job_name": "sell_check",
+      "interval_days": 0.0104,
+      "due_now": false,
+      "last_completed": "2026-08-03T17:45:00",
+      "status": "idle",
+      "progress_note": "complete",
+      "next_due": "2026-08-03T18:00:00"
+    }
+  ],
+  "yahoo": {
+    "sla_days": 7,
+    "in_db": 10251,
+    "universe_size": 10412,
+    "updated_today": 420,
+    "overdue_or_stale": 8200,
+    "within_sla_est": 2051
+  },
+  "watchlist_filter": {
+    "active": "safe",
+    "count": 2,
+    "filters": [
+      {
+        "name": "safe",
+        "title": "Safe Giant",
+        "summary": "Mega-cap, relatively stable names with value characteristics, analyst upside, and a modest dividend — ranked by analyst upside.",
+        "ranking": "Analyst upside ((target_price − current_price) / current_price), highest first",
+        "criteria": [
+          {
+            "field": "market_cap",
+            "meaning": "Total market value of the company (shares outstanding × price)",
+            "set_to": "> $25B",
+            "why": "Stick to giant / mega-cap firms that tend to be more liquid and durable"
+          },
+          {
+            "field": "beta",
+            "meaning": "Volatility vs the broad market (1.0 ≈ moves with the market)",
+            "set_to": "0.0 – 1.3",
+            "why": "Cap high-volatility names; low beta is allowed for safety and diversity"
+          },
+          {
+            "field": "short_float",
+            "meaning": "Share of float sold short (0.10 = 10%)",
+            "set_to": "< 10%",
+            "why": "Avoid crowded short interest (“no enemies”) that can spike volatility"
+          },
+          {
+            "field": "pe_ratio",
+            "meaning": "Price-to-earnings (price per share / earnings per share)",
+            "set_to": "0.0 – 35.0",
+            "why": "Require profitability (P/E > 0) while excluding richly priced names"
+          },
+          {
+            "field": "peg_ratio",
+            "meaning": "P/E divided by expected earnings growth (growth at a reasonable price)",
+            "set_to": "NULL or 0.0 – 2.0",
+            "why": "Prefer growth that is not overpaying; missing PEG data is still allowed"
+          },
+          {
+            "field": "analyst_upside",
+            "meaning": "Implied upside from current price to consensus analyst target",
+            "set_to": "> 10%",
+            "why": "Even “safe” names should still have meaningful expected appreciation"
+          },
+          {
+            "field": "recommendation_mean",
+            "meaning": "Analyst consensus score (1=Strong Buy … 5=Sell)",
+            "set_to": "NULL or ≤ 2.0",
+            "why": "Bias toward Buy / Strong Buy; missing recommendation is allowed"
+          },
+          {
+            "field": "dividend_yield",
+            "meaning": "Annual dividend yield in percentage points (1.0 = 1%)",
+            "set_to": "> 1%",
+            "why": "Prefer income support for longer holds while waiting on upside"
+          }
+        ],
+        "disabled": [
+          {
+            "field": "fifty_day_average > two_hundred_day_average",
+            "meaning": "Classic “golden cross” uptrend (50-day MA above 200-day MA)",
+            "set_to": "disabled",
+            "why": "Turned off as noisy — too many false signals for this strategy"
+          }
+        ]
+      },
+      {
+        "name": "risky",
+        "title": "Risky Momentum",
+        "summary": "Liquid mid/large caps with high beta and short interest — short-squeeze / momentum candidates ranked by analyst upside.",
+        "ranking": "Analyst upside ((target_price − current_price) / current_price), highest first",
+        "criteria": [
+          {
+            "field": "market_cap",
+            "meaning": "Total market value of the company (shares outstanding × price)",
+            "set_to": "> $2B",
+            "why": "Stay above micro-caps for basic size and liquidity safety"
+          },
+          {
+            "field": "avg_volume",
+            "meaning": "Average daily trading volume in shares",
+            "set_to": "> 1M shares/day",
+            "why": "Need enough liquidity to enter and exit without huge slippage"
+          },
+          {
+            "field": "current_price",
+            "meaning": "Latest Yahoo Finance price",
+            "set_to": "> $5",
+            "why": "Exclude penny stocks that are hard to trade cleanly"
+          },
+          {
+            "field": "beta",
+            "meaning": "Volatility vs the broad market (1.0 ≈ moves with the market)",
+            "set_to": "> 1.5",
+            "why": "Want names that move more than the market (action / momentum)"
+          },
+          {
+            "field": "short_float",
+            "meaning": "Share of float sold short (0.15 = 15%)",
+            "set_to": "> 15%",
+            "why": "High short interest is the squeeze-potential signal"
+          },
+          {
+            "field": "analyst_upside",
+            "meaning": "Implied upside from current price to consensus analyst target",
+            "set_to": "> 20%",
+            "why": "Require a stronger value / upside case to justify the risk"
+          }
+        ],
+        "disabled": []
+      }
+    ],
+    "selected": {
+      "name": "safe",
+      "title": "Safe Giant",
+      "summary": "Mega-cap, relatively stable names with value characteristics, analyst upside, and a modest dividend — ranked by analyst upside.",
+      "ranking": "Analyst upside ((target_price − current_price) / current_price), highest first",
+      "criteria": [
+        {
+          "field": "market_cap",
+          "meaning": "Total market value of the company (shares outstanding × price)",
+          "set_to": "> $25B",
+          "why": "Stick to giant / mega-cap firms that tend to be more liquid and durable"
+        },
+        {
+          "field": "beta",
+          "meaning": "Volatility vs the broad market (1.0 ≈ moves with the market)",
+          "set_to": "0.0 – 1.3",
+          "why": "Cap high-volatility names; low beta is allowed for safety and diversity"
+        },
+        {
+          "field": "short_float",
+          "meaning": "Share of float sold short (0.10 = 10%)",
+          "set_to": "< 10%",
+          "why": "Avoid crowded short interest (“no enemies”) that can spike volatility"
+        },
+        {
+          "field": "pe_ratio",
+          "meaning": "Price-to-earnings (price per share / earnings per share)",
+          "set_to": "0.0 – 35.0",
+          "why": "Require profitability (P/E > 0) while excluding richly priced names"
+        },
+        {
+          "field": "peg_ratio",
+          "meaning": "P/E divided by expected earnings growth (growth at a reasonable price)",
+          "set_to": "NULL or 0.0 – 2.0",
+          "why": "Prefer growth that is not overpaying; missing PEG data is still allowed"
+        },
+        {
+          "field": "analyst_upside",
+          "meaning": "Implied upside from current price to consensus analyst target",
+          "set_to": "> 10%",
+          "why": "Even “safe” names should still have meaningful expected appreciation"
+        },
+        {
+          "field": "recommendation_mean",
+          "meaning": "Analyst consensus score (1=Strong Buy … 5=Sell)",
+          "set_to": "NULL or ≤ 2.0",
+          "why": "Bias toward Buy / Strong Buy; missing recommendation is allowed"
+        },
+        {
+          "field": "dividend_yield",
+          "meaning": "Annual dividend yield in percentage points (1.0 = 1%)",
+          "set_to": "> 1%",
+          "why": "Prefer income support for longer holds while waiting on upside"
+        }
+      ],
+      "disabled": [
+        {
+          "field": "fifty_day_average > two_hundred_day_average",
+          "meaning": "Classic “golden cross” uptrend (50-day MA above 200-day MA)",
+          "set_to": "disabled",
+          "why": "Turned off as noisy — too many false signals for this strategy"
+        }
+      ]
+    }
+  },
+  "trading_rules": {
+    "count": 15,
+    "rules": [
+      {
+        "id": "dry_run",
+        "title": "Dry-run safety net",
+        "set_to": "ON — no Schwab orders",
+        "why": "Paper-trade by default; flip TRADE_DRY_RUN only when ready for real fills"
+      },
+      {
+        "id": "market_hours",
+        "title": "Buys and sells only in regular hours",
+        "set_to": "9:30–16:00 America/New_York",
+        "why": "Watchlist/buys and sell-check jobs skip when the US equity session is closed"
+      },
+      {
+        "id": "no_day_trade",
+        "title": "No buy-and-sell the same day",
+        "set_to": "Hold at least 16 hours after purchase",
+        "why": "Avoid PDT / same-day round-trips; covers regular + extended hours buffer"
+      },
+      {
+        "id": "cash_floor",
+        "title": "Cash floor",
+        "set_to": "Keep ≥ $15,000 effective cash",
+        "why": "No buy may leave cash (minus pending buys) below this floor"
+      },
+      {
+        "id": "liquidation_floor",
+        "title": "Account size floor",
+        "set_to": "Liquidation value ≥ $25,000",
+        "why": "Trading is blocked entirely while account value is under this threshold"
+      },
+      {
+        "id": "watchlist_only",
+        "title": "Buy only from the active filter / watchlist",
+        "set_to": "Filter 'safe'",
+        "why": "New buys must be on the current watchlist — no random tickers"
+      },
+      {
+        "id": "position_size",
+        "title": "Fixed buy size",
+        "set_to": "~$1,000 per new name",
+        "why": "Keeps position sizing consistent and cash-floor math simple"
+      },
+      {
+        "id": "rebuy_debounce",
+        "title": "Re-buy debounce after a sell",
+        "set_to": "≤ last sell price − 5%",
+        "why": "Avoid immediately chasing the same name after a sell"
+      },
+      {
+        "id": "trail_activate",
+        "title": "Trailing stop arms after a gain",
+        "set_to": "Arm at +10% peak unrealized",
+        "why": "Protect winners once they have moved enough; ignore noise before that"
+      },
+      {
+        "id": "trail_buffer",
+        "title": "Trail buffer below peak",
+        "set_to": "5% on watchlist · 3% once off",
+        "why": "Stop ratchets up with new highs; tighter once the thesis (watchlist) breaks"
+      },
+      {
+        "id": "hard_stop",
+        "title": "Hard stop vs cost",
+        "set_to": "−10% on watchlist · −5% once off",
+        "why": "Catastrophe floor when a trail never armed, or thesis is gone"
+      },
+      {
+        "id": "broker_stop",
+        "title": "Resting broker STOP_LIMIT",
+        "set_to": "Limit 0.50% below stop · GOOD_TILL_CANCEL",
+        "why": "Protective sell sits at Schwab even if the bot is offline briefly"
+      },
+      {
+        "id": "sell_cadence",
+        "title": "Sell check cadence",
+        "set_to": "Every 15 minutes (RTH)",
+        "why": "Re-evaluate trails / hard stops while the market is open"
+      },
+      {
+        "id": "legacy_books",
+        "title": "Legacy holdings are sell-skipped",
+        "set_to": "Only algorithm / enrolled books get auto sells",
+        "why": "Pre-marked legacy carve-outs stay human-managed until enrolled"
+      },
+      {
+        "id": "buys_paused",
+        "title": "Buys can be paused",
+        "set_to": "Allowed (runtime flag)",
+        "why": "A runtime pause blocks new buys without changing the rest of the system"
+      }
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "ok": true,
+  "range": "1M",
+  "range_days": 30,
+  "algorithm_start": "2026-07-21T16:05:00",
+  "window_start": "2026-07-21",
+  "window_end": "2026-08-04",
+  "clamped": true,
+  "portfolio_return_pct": 1.84,
+  "spy_return_pct": 0.92,
+  "baseline_equity": 42000.0,
+  "baseline_spy": 560.0,
+  "point_count": 11,
+  "note": "Mock whole-account equity % vs SPY.",
+  "points": [
+    { "date": "2026-07-21", "equity": 42000.0, "spy": 560.00, "portfolio_pct": 0.0, "spy_pct": 0.0 },
+    { "date": "2026-07-22", "equity": 42120.0, "spy": 561.40, "portfolio_pct": 0.29, "spy_pct": 0.25 },
+    { "date": "2026-07-23", "equity": 41980.0, "spy": 559.10, "portfolio_pct": -0.05, "spy_pct": -0.16 },
+    { "date": "2026-07-24", "equity": 42250.0, "spy": 562.80, "portfolio_pct": 0.60, "spy_pct": 0.50 },
+    { "date": "2026-07-25", "equity": 42310.0, "spy": 563.20, "portfolio_pct": 0.74, "spy_pct": 0.57 },
+    { "date": "2026-07-28", "equity": 42400.0, "spy": 564.00, "portfolio_pct": 0.95, "spy_pct": 0.71 },
+    { "date": "2026-07-29", "equity": 42340.0, "spy": 562.50, "portfolio_pct": 0.81, "spy_pct": 0.45 },
+    { "date": "2026-07-30", "equity": 42520.0, "spy": 565.10, "portfolio_pct": 1.24, "spy_pct": 0.91 },
+    { "date": "2026-07-31", "equity": 42600.0, "spy": 564.40, "portfolio_pct": 1.43, "spy_pct": 0.79 },
+    { "date": "2026-08-03", "equity": 42680.0, "spy": 565.80, "portfolio_pct": 1.62, "spy_pct": 1.04 },
+    { "date": "2026-08-04", "equity": 42772.0, "spy": 565.15, "portfolio_pct": 1.84, "spy_pct": 0.92 }
+  ]
+}

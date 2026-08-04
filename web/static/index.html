@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Jame Trader</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="/static/favicon.png" type="image/png" />
+  <link rel="apple-touch-icon" href="/static/favicon.png" />
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="/static/config.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <nav class="side" aria-label="Primary">
+      <p class="brand">Jame Trader</p>
+      <p class="brand-sub">About this system</p>
+      <div class="nav-links">
+        <button type="button" data-page="about" class="active">About</button>
+        <button type="button" data-page="trader">Trader</button>
+        <button type="button" data-page="log">Log</button>
+        <button type="button" data-page="actions">Actions</button>
+      </div>
+    </nav>
+
+    <main>
+      <section id="page-about" class="page active">
+        <h1>What this system does</h1>
+        <p class="lead">
+          An always-on trading assistant: it refreshes market fundamentals from Yahoo,
+          maintains a filtered watchlist, proposes buys under cash floors, and watches
+          open positions with trail / hard-stop rules — with dry-run as the default safety net.
+        </p>
+        <div class="meta-row" id="home-pills"></div>
+        <div class="cards" id="home-cards"></div>
+
+        <div class="panel prose">
+          <h2>How it runs</h2>
+          <p>
+            On your home machine (or Pi), <code>python main.py --loop</code> wakes on a schedule:
+          </p>
+          <ul>
+            <li><strong>Yahoo refresh</strong> — oldest / missing tickers first (~150/hour), skips names already updated today, keeps the universe roughly within a few days.</li>
+            <li><strong>Watchlist + buys</strong> — re-ranks with the active filter below, then considers ~$1k buys when cash rules allow.</li>
+            <li><strong>Sell check</strong> — every ~15 minutes: arm trails after +10%, ratchet stops, hard stops when the thesis (watchlist) changes.</li>
+          </ul>
+          <p>
+            This page is read-only. Live data comes from the local API behind Cloudflare Tunnel
+            (or mock fixtures when designing offline).
+          </p>
+        </div>
+
+        <div class="panel" id="filter-panel">
+          <div class="filter-head">
+            <h2 id="filter-title">Watchlist filter</h2>
+            <label class="filter-select-wrap">
+              <span class="sr-only">Choose filter to view</span>
+              <select id="filter-select" aria-label="Watchlist filter"></select>
+            </label>
+          </div>
+          <div class="meta-row" id="filter-pills"></div>
+          <p class="filter-summary" id="filter-summary"></p>
+          <p class="filter-ranking" id="filter-ranking"></p>
+          <div class="scroll-x">
+            <table class="data filter-table" id="filter-table">
+              <thead>
+                <tr>
+                  <th>Field</th>
+                  <th>Meaning</th>
+                  <th>Set to</th>
+                  <th>Why</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div id="filter-disabled" class="filter-disabled" hidden></div>
+        </div>
+
+        <div class="panel">
+          <h2>Scheduled jobs</h2>
+          <ul class="job-list" id="home-jobs"></ul>
+        </div>
+
+        <div class="panel" id="rules-panel">
+          <h2>Trading rules</h2>
+          <p class="rules-intro">Guardrails the bot follows, from the basics up. Values come from live config.</p>
+          <ol class="rules-list" id="rules-list"></ol>
+        </div>
+      </section>
+
+      <section id="page-trader" class="page">
+        <h1>Trader</h1>
+        <p class="lead">Positions, open orders, and mark-to-market P/L from the local database (Schwab-synced when available).</p>
+        <div class="meta-row" id="trader-pills"></div>
+        <div class="cards" id="trader-cards"></div>
+
+        <div class="panel">
+          <h2>Algorithm scorecard</h2>
+          <p class="lead" style="margin-top:0">
+            Post-start buys only (<code>origin=algo_buy</code>). Pre-start enrolled holdings are sell-managed but excluded here.
+          </p>
+          <div class="meta-row" id="algo-pills"></div>
+          <div class="cards" id="algo-cards"></div>
+          <div class="next-tasks" id="algo-next-tasks" aria-live="polite">
+            <h3 class="next-tasks-title">Next tasks</h3>
+            <ul class="next-tasks-list" id="algo-next-tasks-list"></ul>
+          </div>
+        </div>
+
+        <div class="panel" id="perf-panel">
+          <div class="perf-head">
+            <div>
+              <h2>Performance vs S&amp;P 500</h2>
+              <p class="lead" style="margin:0.35rem 0 0">
+                Whole-account equity % since algorithm start, compared with SPY. Range toggles clamp to elapsed time.
+              </p>
+            </div>
+            <div class="perf-returns" id="perf-returns" aria-live="polite"></div>
+          </div>
+          <div class="range-toggles" id="perf-ranges" role="group" aria-label="Performance range">
+            <button type="button" data-range="1D">1D</button>
+            <button type="button" data-range="1W">1W</button>
+            <button type="button" data-range="1M" class="active">1M</button>
+            <button type="button" data-range="3M">3M</button>
+            <button type="button" data-range="6M">6M</button>
+            <button type="button" data-range="1Y">1Y</button>
+          </div>
+          <div class="perf-meta" id="perf-meta"></div>
+          <div class="perf-chart-wrap">
+            <canvas id="perf-chart" height="220" aria-label="Portfolio versus SPY percent chart"></canvas>
+          </div>
+          <p class="perf-empty" id="perf-empty" hidden></p>
+        </div>
+
+        <div class="panel">
+          <h2>Positions</h2>
+          <div class="scroll-x">
+            <table class="data" id="positions-table">
+              <thead>
+                <tr>
+                  <th>Ticker</th>
+                  <th class="num">Shares</th>
+                  <th class="num">Mkt value</th>
+                  <th class="num">Day G/L</th>
+                  <th class="num">G/L [$]</th>
+                  <th class="num">G/L [%]</th>
+                  <th class="num">Price</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Open / pending orders</h2>
+          <div class="scroll-x">
+            <table class="data" id="orders-table">
+              <thead>
+                <tr>
+                  <th>Source</th>
+                  <th>Ticker</th>
+                  <th class="num">Qty</th>
+                  <th>Detail</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-log" class="page">
+        <div class="toolbar">
+          <div>
+            <h1>Log</h1>
+            <p class="lead" style="margin-bottom:0">Trading story by default (Buy / Sell / Watchlist). Tasks hides scheduler noise until you select it.</p>
+          </div>
+          <button type="button" class="btn-ghost" id="btn-refresh-log">Refresh</button>
+        </div>
+        <div class="meta-row log-filters" id="log-filters" aria-label="Filter by event type"></div>
+        <p class="log-filter-hint" id="log-filter-hint"></p>
+        <div class="panel" id="event-list"></div>
+      </section>
+
+      <section id="page-actions" class="page">
+        <h1>Actions</h1>
+        <p class="lead">Remote controls will live here later (dry-run, Yahoo catch-up, pause buys).</p>
+        <div class="actions-blank">
+          <h2>Coming soon</h2>
+          <p>No action buttons in v1 — layout reserved for safe, whitelisted commands.</p>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+pandas>=2.0
+yfinance>=0.2
+requests>=2.28
+schwabdev>=2.0
+fastapi>=0.110
+uvicorn>=0.27

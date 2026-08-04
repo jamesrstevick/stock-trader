@@ -1,0 +1,39 @@
+{
+  "events": [
+    {
+      "id": 5,
+      "ts": "2026-08-03T17:52:00",
+      "level": "info",
+      "category": "sell",
+      "message": "STOP LIVE 12 MET @ $70.20 (order 12345)"
+    },
+    {
+      "id": 4,
+      "ts": "2026-08-03T17:51:00",
+      "level": "info",
+      "category": "buy",
+      "message": "BOUGHT RELX: fill confirmed — 27 sh @ ~$36.66 (order 999)"
+    },
+    {
+      "id": 3,
+      "ts": "2026-08-03T17:50:00",
+      "level": "info",
+      "category": "task",
+      "message": "Sell check finished: sell_now=0, stop_limit=12"
+    },
+    {
+      "id": 2,
+      "ts": "2026-08-03T17:05:00",
+      "level": "info",
+      "category": "task",
+      "message": "Yahoo batch finished: ok=150/150, invalid=0, deferred=0, overdue_left=8000"
+    },
+    {
+      "id": 1,
+      "ts": "2026-08-03T09:00:00",
+      "level": "info",
+      "category": "watchlist",
+      "message": "Watchlist updated (filter=safe): {'added': 3, 'removed': 1}"
+    }
+  ]
+}
