@@ -18,6 +18,7 @@
       if (path.indexOf('/api/events') === 0) mockPath = '/static/mock/events.json';
       if (path.indexOf('/api/log') === 0) mockPath = '/static/mock/log.json';
       if (path.indexOf('/api/performance') === 0) mockPath = '/static/mock/performance.json';
+      if (path.indexOf('/api/schwab/auth') === 0) mockPath = '/static/mock/schwab_auth.json';
       var mr = await fetch(mockPath);
       if (!mr.ok) throw new Error('Mock missing: ' + mockPath);
       var mockData = await mr.json();
@@ -29,6 +30,28 @@
     var r = await fetch(apiBase() + path);
     if (!r.ok) throw new Error(path + ' → ' + r.status);
     return r.json();
+  }
+
+  async function postJson(path, body) {
+    if (useMock()) {
+      return {
+        ok: true,
+        message: 'Mock: would submit Schwab callback (no live exchange)',
+        schwab: await fetchJson('/api/schwab/auth'),
+      };
+    }
+    var r = await fetch(apiBase() + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+    var data = {};
+    try { data = await r.json(); } catch (e) { data = {}; }
+    if (!r.ok) {
+      var err = (data && data.error) ? data.error : (path + ' → ' + r.status);
+      throw new Error(err);
+    }
+    return data;
   }
 
   var PERF_RANGE_DAYS = { '1D': 1, '1W': 7, '1M': 30, '3M': 91, '6M': 182, '1Y': 365 };
@@ -304,7 +327,278 @@
     if (name === 'about') loadAbout();
     if (name === 'trader') loadTrader();
     if (name === 'log') loadLog();
+    if (name === 'actions') loadActions();
   }
+
+  // --- Schwab reconnect (Actions + site banner) ---
+  var SCHWAB_SNOOZE_KEY = 'schwabAuthBannerSnoozeUntil';
+  var lastSchwabStatus = null;
+
+  function schwabSnoozeUntil() {
+    try {
+      var v = parseInt(localStorage.getItem(SCHWAB_SNOOZE_KEY) || '0', 10);
+      return isNaN(v) ? 0 : v;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  function setSchwabSnooze(hours) {
+    var ms = (hours != null ? Number(hours) : 4) * 3600 * 1000;
+    try {
+      localStorage.setItem(SCHWAB_SNOOZE_KEY, String(Date.now() + ms));
+    } catch (e) {}
+  }
+
+  function clearSchwabSnooze() {
+    try { localStorage.removeItem(SCHWAB_SNOOZE_KEY); } catch (e) {}
+  }
+
+  function schwabBannerSnoozed() {
+    return Date.now() < schwabSnoozeUntil();
+  }
+
+  function formatTimeLeft(h, warnHours) {
+    /** Days while above warn window; hours (or minutes) once inside it. */
+    if (h == null || isNaN(h)) return '—';
+    if (h <= 0) return '0 hours';
+    var warnH = (warnHours != null && !isNaN(warnHours)) ? Number(warnHours) : 48;
+    if (h > warnH) {
+      var days = h / 24;
+      var dRounded = days >= 10 ? Math.round(days) : Math.round(days * 10) / 10;
+      var dStr = String(dRounded).replace(/\.0$/, '');
+      return dStr + (dRounded === 1 ? ' day' : ' days');
+    }
+    if (h < 1) return Math.max(1, Math.round(h * 60)) + ' minutes';
+    var rounded = h >= 10 ? Math.round(h) : Math.round(h * 10) / 10;
+    var s = String(rounded).replace(/\.0$/, '');
+    return s + (rounded === 1 ? ' hour' : ' hours');
+  }
+
+  function looksLikeSchwabCallback(url, redirectUri) {
+    var s = (url || '').trim();
+    if (!s) return false;
+    var redir = (redirectUri || 'https://127.0.0.1').toLowerCase();
+    if (s.toLowerCase().indexOf(redir) !== 0) return false;
+    return /[?&]code=/.test(s);
+  }
+
+  function applySchwabChrome(schwab) {
+    lastSchwabStatus = schwab || null;
+    var badge = document.getElementById('nav-actions-badge');
+    var banner = document.getElementById('schwab-banner');
+    var bannerText = document.getElementById('schwab-banner-text');
+    var warn = !!(schwab && schwab.warn);
+    if (badge) badge.hidden = !warn;
+    if (!banner || !bannerText) return;
+
+    if (!warn || schwabBannerSnoozed()) {
+      banner.hidden = true;
+      return;
+    }
+    var hours = schwab.hours_left;
+    if (schwab.needs_login || (hours != null && hours <= 0)) {
+      bannerText.textContent =
+        'Schwab disconnected — reconnect required to resume live trades.';
+    } else {
+      bannerText.textContent =
+        'Schwab login expires in ' + formatTimeLeft(hours, schwab.warn_hours) +
+        '. Reconnect now to avoid missed trades?';
+    }
+    banner.hidden = false;
+  }
+
+  function renderSchwabActionCard(schwab) {
+    var card = document.getElementById('schwab-reconnect-card');
+    var pillEl = document.getElementById('schwab-status-pill');
+    var detail = document.getElementById('schwab-status-detail');
+    var submit = document.getElementById('schwab-submit');
+    var input = document.getElementById('schwab-callback-input');
+    if (!card || !pillEl) return;
+
+    schwab = schwab || {};
+    var warn = !!schwab.warn;
+    card.classList.toggle('urgent', warn);
+
+    var state = schwab.state || (schwab.available ? 'connected' : 'disconnected');
+    pillEl.className = 'pill';
+    if (state === 'connected') {
+      pillEl.textContent = 'Connected';
+      pillEl.classList.add('ok');
+    } else if (state === 'expiring') {
+      pillEl.textContent = 'Expiring soon';
+      pillEl.classList.add('warn');
+    } else {
+      pillEl.textContent = 'Disconnected';
+      pillEl.classList.add('bad');
+    }
+
+    var parts = [];
+    if (schwab.hours_left != null) {
+      if (schwab.hours_left > 0) {
+        parts.push('Expires in ' + formatTimeLeft(schwab.hours_left, schwab.warn_hours));
+      } else {
+        parts.push('Refresh token expired (0 hours left)');
+      }
+    } else {
+      parts.push('No Schwab credentials on file');
+    }
+    if (warn) {
+      parts.push('Reconnect now (or anytime) to renew ~7 days');
+    } else {
+      parts.push('You can reconnect early anytime to reset the clock');
+    }
+    if (detail) detail.textContent = parts.join(' · ');
+
+    if (input && submit) {
+      submit.disabled = !looksLikeSchwabCallback(input.value, schwab.redirect_uri);
+    }
+  }
+
+  async function refreshSchwabUi() {
+    try {
+      var data = await fetchJson('/api/status');
+      var schwab = data.schwab || await fetchJson('/api/schwab/auth');
+      applySchwabChrome(schwab);
+      var active = document.querySelector('.page.active');
+      if (active && active.id === 'page-actions') {
+        renderSchwabActionCard(schwab);
+      }
+      return schwab;
+    } catch (e) {
+      // Don't force the Actions badge on a transient status fetch failure
+      return lastSchwabStatus;
+    }
+  }
+
+  async function loadActions() {
+    var schwab = await refreshSchwabUi();
+    renderSchwabActionCard(schwab || lastSchwabStatus || {});
+  }
+
+  function setSchwabFeedback(msg, ok) {
+    var el = document.getElementById('schwab-feedback');
+    if (!el) return;
+    if (!msg) {
+      el.hidden = true;
+      el.textContent = '';
+      el.className = 'action-feedback';
+      return;
+    }
+    el.hidden = false;
+    el.textContent = msg;
+    el.className = 'action-feedback ' + (ok ? 'ok' : 'bad');
+  }
+
+  function openSchwabLogin() {
+    var url = (lastSchwabStatus && lastSchwabStatus.authorize_url) || '';
+    if (!url) {
+      setSchwabFeedback('Authorize URL not loaded yet — refresh and try again.', false);
+      return;
+    }
+    // Don't pass "noopener" to window.open — many browsers then return null even when
+    // the tab opened, which falsely triggers the "popup blocked" message.
+    var w = window.open(url, '_blank');
+    if (w) {
+      try { w.opener = null; } catch (e) {}
+      setSchwabFeedback('Complete login in the new tab, then paste the redirect URL here (~30s).', true);
+    } else {
+      setSchwabFeedback(
+        'Popup blocked — use Copy login link, or allow popups for this site.',
+        false
+      );
+    }
+  }
+
+  async function copySchwabLoginLink() {
+    var url = (lastSchwabStatus && lastSchwabStatus.authorize_url) || '';
+    if (!url) {
+      setSchwabFeedback('Authorize URL not loaded yet.', false);
+      return;
+    }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(url);
+        setSchwabFeedback('Login link copied — open it, then paste the redirect URL here.', true);
+      } else {
+        window.location.href = url;
+      }
+    } catch (e) {
+      window.open(url, '_blank', 'noopener,noreferrer');
+      setSchwabFeedback('Opened login link in a new tab.', true);
+    }
+  }
+
+  async function submitSchwabCallback() {
+    var input = document.getElementById('schwab-callback-input');
+    var submit = document.getElementById('schwab-submit');
+    var redirect = (lastSchwabStatus && lastSchwabStatus.redirect_uri) || 'https://127.0.0.1';
+    var url = input ? input.value.trim() : '';
+    if (!looksLikeSchwabCallback(url, redirect)) {
+      setSchwabFeedback('Paste the full https://127.0.0.1/?code=… URL from the address bar.', false);
+      return;
+    }
+    if (submit) submit.disabled = true;
+    setSchwabFeedback('Exchanging code…', true);
+    try {
+      var result = await postJson('/api/schwab/auth', { callback_url: url });
+      clearSchwabSnooze();
+      if (input) input.value = '';
+      setSchwabFeedback(result.message || 'Connected — refresh token renewed (~7 days).', true);
+      var schwab = result.schwab || await fetchJson('/api/schwab/auth');
+      applySchwabChrome(schwab);
+      renderSchwabActionCard(schwab);
+    } catch (e) {
+      setSchwabFeedback(e.message || 'Token exchange failed — open login again and paste quickly.', false);
+    } finally {
+      if (input && submit) {
+        submit.disabled = !looksLikeSchwabCallback(input.value, redirect);
+      }
+    }
+  }
+
+  (function wireSchwabActions() {
+    var openBtn = document.getElementById('schwab-open-login');
+    var copyBtn = document.getElementById('schwab-copy-link');
+    var submitBtn = document.getElementById('schwab-submit');
+    var input = document.getElementById('schwab-callback-input');
+    var yesBtn = document.getElementById('schwab-banner-yes');
+    var noBtn = document.getElementById('schwab-banner-no');
+
+    if (openBtn) openBtn.addEventListener('click', openSchwabLogin);
+    if (copyBtn) copyBtn.addEventListener('click', copySchwabLoginLink);
+    if (submitBtn) submitBtn.addEventListener('click', submitSchwabCallback);
+    if (input) {
+      input.addEventListener('input', function () {
+        var redirect = (lastSchwabStatus && lastSchwabStatus.redirect_uri) || 'https://127.0.0.1';
+        if (submitBtn) {
+          submitBtn.disabled = !looksLikeSchwabCallback(input.value, redirect);
+        }
+      });
+      input.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          submitSchwabCallback();
+        }
+      });
+    }
+    if (yesBtn) {
+      yesBtn.addEventListener('click', function () {
+        location.hash = 'actions';
+        var card = document.getElementById('schwab-reconnect-card');
+        if (card && card.scrollIntoView) {
+          setTimeout(function () { card.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 50);
+        }
+      });
+    }
+    if (noBtn) {
+      noBtn.addEventListener('click', function () {
+        var hours = (lastSchwabStatus && lastSchwabStatus.snooze_hours) || 4;
+        setSchwabSnooze(hours);
+        applySchwabChrome(lastSchwabStatus);
+      });
+    }
+  })();
 
   var refreshLog = document.getElementById('btn-refresh-log');
   if (refreshLog) refreshLog.addEventListener('click', loadLog);
@@ -334,9 +628,9 @@
           { field: 'beta', meaning: 'Volatility vs the broad market (1.0 ≈ moves with the market)', set_to: '0.0 – 1.3', why: 'Cap high-volatility names; low beta is allowed for safety and diversity' },
           { field: 'short_float', meaning: 'Share of float sold short (0.10 = 10%)', set_to: '< 10%', why: 'Avoid crowded short interest (“no enemies”) that can spike volatility' },
           { field: 'pe_ratio', meaning: 'Price-to-earnings (price per share / earnings per share)', set_to: '0.0 – 35.0', why: 'Require profitability (P/E > 0) while excluding richly priced names' },
-          { field: 'peg_ratio', meaning: 'P/E divided by expected earnings growth (growth at a reasonable price)', set_to: 'NULL or 0.0 – 2.0', why: 'Prefer growth that is not overpaying; missing PEG data is still allowed' },
+          { field: 'peg_ratio', meaning: 'P/E divided by expected earnings growth (growth at a reasonable price)', set_to: '0.0 – 2.0', why: 'Prefer growth that is not overpaying; PEG data is required' },
           { field: 'analyst_upside', meaning: 'Implied upside from current price to consensus analyst target', set_to: '> 10%', why: 'Even “safe” names should still have meaningful expected appreciation' },
-          { field: 'recommendation_mean', meaning: 'Analyst consensus score (1=Strong Buy … 5=Sell)', set_to: 'NULL or ≤ 2.0', why: 'Bias toward Buy / Strong Buy; missing recommendation is allowed' },
+          { field: 'recommendation_mean', meaning: 'Analyst consensus score (1=Strong Buy … 5=Sell)', set_to: '≤ 2.0', why: 'Bias toward Buy / Strong Buy; recommendation data is required' },
           { field: 'dividend_yield', meaning: 'Annual dividend yield in percentage points (1.0 = 1%)', set_to: '> 1%', why: 'Prefer income support for longer holds while waiting on upside' }
         ],
         disabled: [
@@ -523,8 +817,8 @@
   var RULES_FALLBACK = [
     { title: 'Dry-run safety net', set_to: 'ON — no Schwab orders', why: 'Paper-trade by default; flip TRADE_DRY_RUN only when ready for real fills' },
     { title: 'Buys and sells only in regular hours', set_to: '9:30–16:00 America/New_York', why: 'Watchlist/buys and sell-check jobs skip when the US equity session is closed' },
-    { title: 'No buy-and-sell the same day', set_to: 'Hold at least 16 hours after purchase', why: 'Avoid PDT / same-day round-trips; covers regular + extended hours buffer' },
-    { title: 'Cash floor', set_to: 'Keep ≥ $15,000 effective cash', why: 'No buy may leave cash (minus pending buys) below this floor' },
+    { title: 'No buy-and-sell the same day', set_to: 'No market sell or broker STOP_LIMIT until the next ET calendar day', why: 'FINRA day trade = same trading day (not 24h). Buy Mon 1pm / sell Tue 8am is fine; stops are deferred so a same-day fill cannot create a round trip' },
+    { title: 'Cash floor', set_to: 'config.MINIMUM_CASH (live API fills amount)', why: 'No buy may leave cash (minus pending buys) below this floor' },
     { title: 'Account size floor', set_to: 'Liquidation value ≥ $25,000', why: 'Trading is blocked entirely while account value is under this threshold' },
     { title: 'Buy only from the active filter / watchlist', set_to: "Filter 'safe'", why: 'New buys must be on the current watchlist — no random tickers' },
     { title: 'Fixed buy size', set_to: '~$1,000 per new name', why: 'Keeps position sizing consistent and cash-floor math simple' },
@@ -532,7 +826,7 @@
     { title: 'Trailing stop arms after a gain', set_to: 'Arm at +10% peak unrealized', why: 'Protect winners once they have moved enough; ignore noise before that' },
     { title: 'Trail buffer below peak', set_to: '5% on watchlist · 3% once off', why: 'Stop ratchets up with new highs; tighter once the thesis (watchlist) breaks' },
     { title: 'Hard stop vs cost', set_to: '−10% on watchlist · −5% once off', why: 'Catastrophe floor when a trail never armed, or thesis is gone' },
-    { title: 'Resting broker STOP_LIMIT', set_to: 'Limit 0.50% below stop · GOOD_TILL_CANCEL', why: 'Protective sell sits at Schwab even if the bot is offline briefly' },
+    { title: 'Resting broker STOP_LIMIT', set_to: 'Arm after next ET day · limit 0.50% below stop · GOOD_TILL_CANCEL', why: 'Protective sell sits at Schwab once past the purchase day; never armed same day so a stop fill cannot create a PDT round trip' },
     { title: 'Sell check cadence', set_to: 'Every 15 minutes (RTH)', why: 'Re-evaluate trails / hard stops while the market is open' },
     { title: 'Legacy holdings are sell-skipped', set_to: 'Only algorithm / enrolled books get auto sells', why: 'Pre-marked legacy carve-outs stay human-managed until enrolled' },
     { title: 'Buys can be paused', set_to: 'Allowed (runtime flag)', why: 'A runtime pause blocks new buys without changing the rest of the system' }
@@ -565,6 +859,7 @@
     try {
       var data = await fetchJson('/api/status');
       if (data.dashboard_rev != null) lastContentRev = data.dashboard_rev;
+      if (data.schwab) applySchwabChrome(data.schwab);
       var y = data.yahoo || {};
       var filterPayload = data.watchlist_filter || null;
       setupFilterPanel(filterPayload);
@@ -613,6 +908,107 @@
     }
   }
 
+  var positionsRows = [];
+  // Default: Total G/L [%] high → low; click any header to change.
+  var positionsSort = { key: 'open_pct', dir: 'desc' };
+  var positionsSortBound = false;
+
+  function sortPositions(rows, key, dir) {
+    var mult = dir === 'asc' ? 1 : -1;
+    var textKeys = { ticker: 1, status_label: 1, status: 1 };
+    return rows.slice().sort(function (a, b) {
+      var av = a[key];
+      var bv = b[key];
+      if (key === 'status_label') {
+        av = a.status_label || a.status || '';
+        bv = b.status_label || b.status || '';
+      }
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      if (textKeys[key]) {
+        return String(av).localeCompare(String(bv)) * mult;
+      }
+      var an = Number(av);
+      var bn = Number(bv);
+      if (isNaN(an) && isNaN(bn)) return 0;
+      if (isNaN(an)) return 1;
+      if (isNaN(bn)) return -1;
+      if (an === bn) return 0;
+      return an < bn ? -mult : mult;
+    });
+  }
+
+  function updatePositionsSortHeaders() {
+    var table = document.getElementById('positions-table');
+    if (!table) return;
+    table.querySelectorAll('th[data-sort]').forEach(function (th) {
+      var key = th.getAttribute('data-sort');
+      var active = key === positionsSort.key;
+      th.classList.toggle('sorted', active);
+      th.classList.toggle('desc', active && positionsSort.dir === 'desc');
+      th.setAttribute('aria-sort', active
+        ? (positionsSort.dir === 'asc' ? 'ascending' : 'descending')
+        : 'none');
+    });
+  }
+
+  function renderPositionsTable() {
+    var tbody = document.querySelector('#positions-table tbody');
+    if (!tbody) return;
+    updatePositionsSortHeaders();
+    var sorted = sortPositions(positionsRows, positionsSort.key, positionsSort.dir);
+    tbody.innerHTML = '';
+    sorted.forEach(function (p) {
+      var statusLabel = p.status_label || (
+        p.trail_active ? 'trail' : (p.status === 'holding' ? 'holding' : '—')
+      );
+      var statusClass = 'pos-status';
+      if (p.status === 'trail') statusClass += ' pos-status-trail';
+      else if (p.status === 'floor') statusClass += ' pos-status-floor';
+      else if (p.status === 'holding') statusClass += ' pos-status-holding';
+      else if (p.status === 'tracking') statusClass += ' pos-status-tracking';
+      else if (p.status === 'skipped' || p.status === 'not_enrolled') statusClass += ' pos-status-muted';
+      var days = p.days_held;
+      var daysText = (days === null || days === undefined || days === '') ? '—' : String(days);
+      var tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>' + escapeHtml(p.ticker || '') + '</td>' +
+        '<td class="num">' + escapeHtml(daysText) + '</td>' +
+        '<td class="num">' + (p.shares_owned != null ? p.shares_owned : '—') + '</td>' +
+        '<td class="num">' + money(p.market_value) + '</td>' +
+        '<td class="' + plClass(p.day_pct) + '">' + pct(p.day_pct) + '</td>' +
+        '<td class="' + plClass(p.open_pl) + '">' + money(p.open_pl) + '</td>' +
+        '<td class="' + plClass(p.open_pct) + '">' + pct(p.open_pct) + '</td>' +
+        '<td class="num">' + money(p.current_price) + '</td>' +
+        '<td class="' + statusClass + '">' + escapeHtml(statusLabel) + '</td>';
+      tbody.appendChild(tr);
+    });
+    if (!sorted.length) {
+      tbody.innerHTML = '<tr><td colspan="9" class="empty">No open positions in the database.</td></tr>';
+    }
+  }
+
+  function bindPositionsSort() {
+    if (positionsSortBound) return;
+    var table = document.getElementById('positions-table');
+    if (!table) return;
+    positionsSortBound = true;
+    table.querySelector('thead').addEventListener('click', function (ev) {
+      var th = ev.target.closest('th[data-sort]');
+      if (!th) return;
+      var key = th.getAttribute('data-sort');
+      if (positionsSort.key === key) {
+        positionsSort.dir = positionsSort.dir === 'desc' ? 'asc' : 'desc';
+      } else {
+        positionsSort.key = key;
+        // Percents/dollars default high→low; names A→Z
+        positionsSort.dir = (key === 'ticker' || key === 'status_label') ? 'asc' : 'desc';
+      }
+      renderPositionsTable();
+    });
+  }
+
   async function loadTrader() {
     var pills = document.getElementById('trader-pills');
     var cards = document.getElementById('trader-cards');
@@ -621,6 +1017,7 @@
     var tbody = document.querySelector('#positions-table tbody');
     var obody = document.querySelector('#orders-table tbody');
     loadPerformance();
+    bindPositionsSort();
     try {
       var data = await fetchJson('/api/portfolio');
       var t = data.totals || {};
@@ -678,11 +1075,22 @@
         } else {
           nextList.innerHTML = tasks.map(function (t) {
             var title = t.title || t.job_name || 'Task';
-            var when = t.when || (
-              t.due_now || (t.minutes_until != null && Number(t.minutes_until) <= 0)
-                ? 'now'
-                : ('in ' + t.minutes_until + ' minutes')
-            );
+            var when = t.when;
+            if (!when) {
+              var mins = t.minutes_until != null ? Number(t.minutes_until) : null;
+              if (t.due_now || (mins != null && mins <= 0)) {
+                when = 'now';
+              } else if (mins == null) {
+                when = '—';
+              } else if (mins === 1) {
+                when = 'in 1 minute';
+              } else if (mins > 60) {
+                var hrs = Math.max(1, Math.round(mins / 60));
+                when = hrs === 1 ? 'in 1 hour' : ('in ' + hrs + ' hours');
+              } else {
+                when = 'in ' + mins + ' minutes';
+              }
+            }
             return (
               '<li class="' + (t.due_now ? 'due-now' : '') + '">' +
                 '<span class="task-name">' + escapeHtml(title) + '</span>' +
@@ -693,31 +1101,8 @@
         }
       }
 
-      tbody.innerHTML = '';
-      (data.positions || []).forEach(function (p) {
-        var statusLabel = p.status_label || (
-          p.trail_active ? 'armed' : (p.status === 'holding' ? 'holding' : '—')
-        );
-        var statusClass = 'pos-status';
-        if (p.status === 'armed') statusClass += ' pos-status-armed';
-        else if (p.status === 'holding') statusClass += ' pos-status-holding';
-        else if (p.status === 'tracking') statusClass += ' pos-status-tracking';
-        else if (p.status === 'skipped' || p.status === 'not_enrolled') statusClass += ' pos-status-muted';
-        var tr = document.createElement('tr');
-        tr.innerHTML =
-          '<td>' + escapeHtml(p.ticker || '') + '</td>' +
-          '<td class="num">' + (p.shares_owned != null ? p.shares_owned : '—') + '</td>' +
-          '<td class="num">' + money(p.market_value) + '</td>' +
-          '<td class="' + plClass(p.day_pct) + '">' + pct(p.day_pct) + '</td>' +
-          '<td class="' + plClass(p.open_pl) + '">' + money(p.open_pl) + '</td>' +
-          '<td class="' + plClass(p.open_pct) + '">' + pct(p.open_pct) + '</td>' +
-          '<td class="num">' + money(p.current_price) + '</td>' +
-          '<td class="' + statusClass + '">' + escapeHtml(statusLabel) + '</td>';
-        tbody.appendChild(tr);
-      });
-      if (!(data.positions || []).length) {
-        tbody.innerHTML = '<tr><td colspan="8" class="empty">No open positions in the database.</td></tr>';
-      }
+      positionsRows = data.positions || [];
+      renderPositionsTable();
 
       obody.innerHTML = '';
       (data.pending_orders || []).forEach(function (o) {
@@ -746,7 +1131,8 @@
       pills.appendChild(pill('API error: ' + e.message, 'bad'));
       if (algoPills) algoPills.innerHTML = '';
       if (algoCards) algoCards.innerHTML = '';
-      tbody.innerHTML = '<tr><td colspan="8" class="empty">Could not load portfolio.</td></tr>';
+      positionsRows = [];
+      tbody.innerHTML = '<tr><td colspan="9" class="empty">Could not load portfolio.</td></tr>';
       obody.innerHTML = '';
     }
   }
@@ -839,9 +1225,25 @@
       return;
     }
     box.innerHTML = events.map(function (ev) {
+      var lvl = String(ev.level || 'info').toLowerCase();
+      if (lvl === 'warning') lvl = 'warn';
+      var rowClass = 'event';
+      if (lvl === 'error' || lvl === 'issue') rowClass += ' error';
+      else if (lvl === 'warn') rowClass += ' warn';
+      var lvlLabel = 'INFO';
+      if (lvl === 'error') lvlLabel = 'ERROR';
+      else if (lvl === 'issue') lvlLabel = 'ISSUE';
+      else if (lvl === 'warn') lvlLabel = 'WARN';
+      var lvlClass = '';
+      if (lvl === 'warn' || lvl === 'error' || lvl === 'issue') {
+        lvlClass = ' ' + (lvl === 'issue' ? 'error' : lvl);
+      }
       return (
-        '<div class="event' + (ev.level === 'error' ? ' error' : '') + '">' +
+        '<div class="' + rowClass + '">' +
           '<div class="ts">' + escapeHtml(ev.ts || '') + '</div>' +
+          '<div class="lvl' + lvlClass + '">' +
+            lvlLabel +
+          '</div>' +
           '<div class="cat">' + escapeHtml(logCategoryLabel(ev._cat)) + '</div>' +
           '<div>' + escapeHtml(ev.message || '') + '</div>' +
         '</div>'
@@ -902,10 +1304,12 @@
   });
 
   fromHash();
+  refreshSchwabUi();
 
   // Poll: skip when tab hidden.
   // About: always refresh (job due clocks).
   // Trader: always refresh so Price/Status stay downstream of Schwab position sync.
+  // Actions: refresh Schwab auth status / urgent card.
   // Log: only when dashboard_rev changes.
   setInterval(function () {
     if (typeof document !== 'undefined' && document.hidden) return;
@@ -915,12 +1319,17 @@
       loadAbout();
       return;
     }
-    if (active.id === 'page-actions') return;
+    if (active.id === 'page-actions') {
+      loadActions();
+      return;
+    }
     if (active.id === 'page-trader') {
       loadTrader();
+      refreshSchwabUi();
       return;
     }
     fetchJson('/api/status').then(function (data) {
+      if (data.schwab) applySchwabChrome(data.schwab);
       var rev = data.dashboard_rev;
       if (rev === lastContentRev) return;
       lastContentRev = rev;

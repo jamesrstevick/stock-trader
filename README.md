@@ -32,7 +32,7 @@ Exact values come from `config.py` and show live on the About page.
 | **About** | System overview, active filter, jobs, trading rules |
 | **Trader** | Positions, orders, algo scorecard + next tasks, performance vs S&P 500 |
 | **Log** | Trading story by default (Buy / Sell / Watchlist); Tasks pill for scheduler noise |
-| **Actions** | Placeholder for future remote controls |
+| **Actions** | **Schwab reconnect** (paste-back OAuth) and future remote controls |
 
 ## Setup
 
@@ -64,6 +64,32 @@ python main.py --yahoo-full              # Yahoo catch-up (all tickers, oldest-f
 python main.py --mark-algorithm-start    # soft reset: snapshot equity + enroll holdings
 ```
 
+### Daily backtest (research side script)
+
+Rough once-per-day stand-in for trail/hard-stop + cash rules, frozen from today's filter universe, compared to SPY across many start dates. Does not place trades or touch the live loop.
+
+```bash
+python backtest_daily.py
+python backtest_daily.py --start 2020-01-01 --stride-days 21 --cash 50000 --max-tickers 40
+```
+
+Results: console aggregate + `data/backtest_results/summary.csv` (and `equity_worst.csv`). Yahoo OHLC is cached under `data/backtest_cache/`.
+
+### Schwab reconnect (Actions)
+
+Schwab refresh tokens last ~**7 days**. Access tokens refresh automatically until then; after expiry the bot skips live trades until you log in again.
+
+From the dashboard (local or via tunnel):
+
+1. Open **Actions → Schwab reconnect** (or tap **Yes** on the warning banner).
+2. **Open Schwab login** → approve in the new tab.
+3. Schwab redirects to `https://127.0.0.1/?code=…` (page may fail — copy the full URL from the address bar within ~30 seconds).
+4. Paste into the field and **Submit**. The Pi exchanges the code and writes `~/.schwabdev/tokens.db`; the bot hot-reloads.
+
+Within `SCHWAB_AUTH_WARN_HOURS` (default **48**), a site banner asks to reconnect; **No** snoozes it for `SCHWAB_AUTH_SNOOZE_HOURS` (default **4**). The Actions nav badge stays visible while warning even if snoozed. You can reconnect early anytime to reset the 7-day clock.
+
+Protect `POST /api/schwab/auth` with **Cloudflare Access** — it can mint trading tokens.
+
 ### Cloudflare Tunnel (optional)
 
 Point a tunnel at `http://127.0.0.1:8787`, put Cloudflare Access in front, and do **not** port-forward. Bind stays `127.0.0.1`.
@@ -77,6 +103,8 @@ stock-trader/
 ├── stock_trader.py     # Core library
 ├── main.py             # Bot entry point
 ├── web_app.py          # FastAPI dashboard
+├── backtest_daily.py   # Side CLI: daily multi-start backtest vs SPY
+├── backtest/           # Backtest engine (not used by live loop)
 ├── test_functions.py   # Function-level tests
 ├── web/static/         # About / Trader / Log / Actions UI
 └── requirements.txt

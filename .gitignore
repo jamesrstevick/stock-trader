@@ -59,6 +59,10 @@ Thumbs.db
 *.log
 logs/
 
+# Backtest Yahoo OHLC cache + generated reports
+data/backtest_cache/
+data/backtest_results/
+
 # Temporary files
 *.tmp
 *.temp

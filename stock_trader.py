@@ -12,35 +12,360 @@ import pandas as pd
 import yfinance as yf
 import requests
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from typing import List, Dict, Optional, Any, Tuple
 import config
 
-# Schwab API - initialize schwabdev client
+# Schwab API - initialize schwabdev client (non-interactive; no terminal paste on import)
 SCHWAB_CLIENT = None
 SCHWAB_AVAILABLE = False
+SCHWAB_AUTH_NEEDED = False  # True when browser OAuth paste-back is required
 
-try:
-    import schwabdev
-    
-    # Initialize client with credentials from config
+
+def _schwab_tokens_db_path() -> str:
+    return os.path.expanduser(
+        getattr(config, 'SCHWAB_TOKENS_DB', '~/.schwabdev/tokens.db')
+    )
+
+
+def _schwab_refuse_interactive_auth(auth_url: str) -> str:
+    """call_on_auth for headless init — never block on input()."""
+    global SCHWAB_AUTH_NEEDED
+    SCHWAB_AUTH_NEEDED = True
+    raise RuntimeError(
+        'Schwab interactive login required (use Actions → Schwab reconnect)'
+    )
+
+
+def get_schwab_authorize_url() -> str:
+    """Schwab OAuth authorize URL (same as schwabdev builds)."""
+    import urllib.parse
+    client_id = getattr(config, 'SCHWAB_API_KEY', '') or ''
+    redirect = getattr(config, 'SCHWAB_REDIRECT_URI', 'https://127.0.0.1') or 'https://127.0.0.1'
+    q = urllib.parse.urlencode({
+        'client_id': client_id,
+        'redirect_uri': redirect,
+    })
+    return 'https://api.schwabapi.com/v1/oauth/authorize?' + q
+
+
+def _read_schwab_token_issued(column: str) -> Optional[datetime]:
+    """Read a *_issued timestamp from schwabdev tokens DB, or None."""
+    path = _schwab_tokens_db_path()
+    if not os.path.isfile(path):
+        return None
+    if column not in ('refresh_token_issued', 'access_token_issued'):
+        return None
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            row = conn.execute(
+                'SELECT %s FROM schwabdev LIMIT 1' % column
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return None
+        issued = datetime.fromisoformat(str(row[0]))
+        if issued.tzinfo is None:
+            issued = issued.replace(tzinfo=timezone.utc)
+        return issued
+    except Exception:
+        return None
+
+
+def _read_schwab_refresh_issued() -> Optional[datetime]:
+    """Read refresh_token_issued from schwabdev tokens DB, or None."""
+    return _read_schwab_token_issued('refresh_token_issued')
+
+
+def _read_schwab_access_issued() -> Optional[datetime]:
+    """Read access_token_issued from schwabdev tokens DB, or None."""
+    return _read_schwab_token_issued('access_token_issued')
+
+
+def maybe_log_schwab_access_refresh() -> None:
+    """Log once per new access-token issue time (Schwab API auto-refresh ~30 min)."""
+    issued = _read_schwab_access_issued()
+    if issued is None:
+        return
+    key = issued.isoformat()
+    prev = get_runtime_flag('schwab_access_refresh_logged_for')
+    if prev == key:
+        return
+    set_runtime_flag('schwab_access_refresh_logged_for', key)
+    if not prev:
+        # First observation this install — don't spam "refreshed" on cold start
+        return
+    try:
+        log_event(
+            'web',
+            'Schwab API access token refreshed',
+            detail={'access_token_issued': key},
+        )
+    except Exception:
+        pass
+
+
+def maybe_log_schwab_auth_alerts(auth: Optional[Dict[str, Any]] = None) -> None:
+    """
+    One WARN when entering the 48h window; one ISSUE when refresh is expired.
+    Each keyed to refresh_expires_at so reconnect (new expiry) can alert again later.
+    """
+    auth = auth or get_schwab_auth_status()
+    hours = auth.get('hours_left')
+    expiry_key = str(auth.get('refresh_expires_at') or 'missing')
+
+    if not auth.get('warn'):
+        return
+
+    # Expired / missing tokens → ISSUE (once per expiry identity)
+    if hours is None or hours <= 0:
+        flagged = get_runtime_flag('schwab_auth_issue_logged_for')
+        if flagged != expiry_key:
+            set_runtime_flag('schwab_auth_issue_logged_for', expiry_key)
+            msg = (
+                'Schwab API credentials expired — reconnect via Actions '
+                'before live trades can resume'
+            )
+            if hours is None:
+                msg = (
+                    'Schwab API credentials missing — reconnect via Actions '
+                    'before live trades can resume'
+                )
+            log_event('web', msg, level='issue', detail=auth)
+        return
+
+    # Inside warn window but still valid → WARN once
+    flagged_w = get_runtime_flag('schwab_auth_warn_logged_for')
+    if flagged_w != expiry_key:
+        set_runtime_flag('schwab_auth_warn_logged_for', expiry_key)
+        log_event(
+            'web',
+            'Schwab login expires in %.0f hours — reconnect via Actions' % hours,
+            level='warn',
+            detail=auth,
+        )
+
+
+def get_schwab_auth_status() -> Dict[str, Any]:
+    """
+    Dashboard / Actions status for Schwab OAuth.
+    hours_left is based on refresh_token_issued + SCHWAB_REFRESH_TOKEN_DAYS.
+
+    warn / Actions badge: only when there is no token, refresh is expired, or
+    hours_left is within SCHWAB_AUTH_WARN_HOURS — not merely because this process
+    failed to construct a Client while tokens on disk are still valid.
+    """
+    warn_hours = float(getattr(config, 'SCHWAB_AUTH_WARN_HOURS', 48))
+    snooze_hours = float(getattr(config, 'SCHWAB_AUTH_SNOOZE_HOURS', 4))
+    refresh_days = float(getattr(config, 'SCHWAB_REFRESH_TOKEN_DAYS', 7))
+    redirect = getattr(config, 'SCHWAB_REDIRECT_URI', 'https://127.0.0.1')
+    issued = _read_schwab_refresh_issued()
+    now = datetime.now(timezone.utc)
+    expires_at = None  # type: Optional[datetime]
+    hours_left = None  # type: Optional[float]
+    if issued is not None:
+        expires_at = issued + timedelta(days=refresh_days)
+        hours_left = (expires_at - now).total_seconds() / 3600.0
+
+    token_missing = issued is None
+    expired = hours_left is not None and hours_left <= 0
+    in_warn_window = hours_left is not None and 0 < hours_left <= warn_hours
+
+    # Badge / banner / urgent card — clock only (plus never-authenticated)
+    warn = bool(token_missing or expired or in_warn_window)
+
+    # Human login required when refresh is dead / missing (not when Client just needs re-init)
+    needs_login = bool(token_missing or expired or SCHWAB_AUTH_NEEDED)
+    if hours_left is not None and hours_left > 0:
+        # Valid refresh on disk: clear sticky needs_login from a prior failed init
+        needs_login = False
+
+    if token_missing or expired:
+        state = 'disconnected'
+    elif in_warn_window:
+        state = 'expiring'
+    else:
+        state = 'connected'
+
+    return {
+        'available': bool(SCHWAB_AVAILABLE),
+        'needs_login': needs_login,
+        'warn': warn,
+        'state': state,
+        'refresh_issued_at': issued.isoformat() if issued else None,
+        'refresh_expires_at': expires_at.isoformat() if expires_at else None,
+        'hours_left': hours_left,
+        'warn_hours': warn_hours,
+        'snooze_hours': snooze_hours,
+        'redirect_uri': redirect,
+        'authorize_url': get_schwab_authorize_url(),
+        'tokens_db': _schwab_tokens_db_path(),
+    }
+
+
+def initialize_schwab_client(interactive: bool = False) -> bool:
+    """
+    Initialize or re-initialize the Schwab API client.
+    interactive=False (default): refuse browser/input OAuth — set SCHWAB_AUTH_NEEDED.
+    interactive=True: allow schwabdev default paste flow (local terminal only).
+    """
+    global SCHWAB_CLIENT, SCHWAB_AVAILABLE, SCHWAB_AUTH_NEEDED
+
+    try:
+        import schwabdev
+    except ImportError:
+        print("Error: schwabdev library not installed. Install with: pip install schwabdev")
+        SCHWAB_CLIENT = None
+        SCHWAB_AVAILABLE = False
+        SCHWAB_AUTH_NEEDED = True
+        return False
+
+    call_on_auth = None if interactive else _schwab_refuse_interactive_auth
     try:
         SCHWAB_CLIENT = schwabdev.Client(
             config.SCHWAB_API_KEY,
             config.SCHWAB_API_SECRET,
-            config.SCHWAB_REDIRECT_URI
+            config.SCHWAB_REDIRECT_URI,
+            tokens_db=_schwab_tokens_db_path(),
+            call_on_auth=call_on_auth,
         )
         SCHWAB_AVAILABLE = True
+        SCHWAB_AUTH_NEEDED = False
         print("Schwab API client initialized successfully.")
+        return True
     except Exception as e:
-        print(f"Warning: Could not initialize Schwab client: {e}")
-        print("You may need to authenticate. The client will handle OAuth on first API call.")
+        SCHWAB_CLIENT = None
         SCHWAB_AVAILABLE = False
-        
+        msg = str(e).lower()
+        # Only mark login needed for real interactive-OAuth failures (not every "auth" substring)
+        if 'interactive login required' in msg:
+            SCHWAB_AUTH_NEEDED = True
+        print(f"Warning: Could not initialize Schwab client: {e}")
+        return False
+
+
+def complete_schwab_oauth(callback_url: str) -> Dict[str, Any]:
+    """
+    Exchange a pasted Schwab redirect URL (…?code=…) for tokens and re-init the client.
+    Forces a new refresh token even if one is still valid (early reconnect).
+    """
+    global SCHWAB_CLIENT, SCHWAB_AVAILABLE, SCHWAB_AUTH_NEEDED
+
+    raw = (callback_url or '').strip()
+    if not raw:
+        return {'ok': False, 'error': 'callback_url required'}
+
+    redirect = getattr(config, 'SCHWAB_REDIRECT_URI', 'https://127.0.0.1') or 'https://127.0.0.1'
+    import urllib.parse
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme:
+        # Full redirect URL
+        if not raw.lower().startswith(redirect.lower()):
+            return {
+                'ok': False,
+                'error': (
+                    'Callback URL must start with configured redirect URI '
+                    '(%s)' % redirect
+                ),
+            }
+        code = urllib.parse.parse_qs(parsed.query).get('code', [None])[0]
+        if not code:
+            return {'ok': False, 'error': 'No code= parameter in callback URL'}
+    else:
+        # Bare authorization code
+        code = urllib.parse.unquote(raw)
+        if len(code) < 10:
+            return {'ok': False, 'error': 'Paste the full redirect URL including code='}
+
+    try:
+        import schwabdev
+    except ImportError:
+        return {'ok': False, 'error': 'schwabdev not installed'}
+
+    provided = {'url': raw}
+    consumed = {'done': False}
+
+    def _provide_callback(auth_url: str) -> str:
+        # One-shot: auth code is single-use (~30s TTL)
+        if consumed['done']:
+            raise RuntimeError('Authorization code already used')
+        consumed['done'] = True
+        return provided['url']
+
+    try:
+        client = schwabdev.Client(
+            config.SCHWAB_API_KEY,
+            config.SCHWAB_API_SECRET,
+            config.SCHWAB_REDIRECT_URI,
+            tokens_db=_schwab_tokens_db_path(),
+            call_on_auth=_provide_callback,
+        )
+        # Early reconnect: force a new refresh token if init did not already run OAuth
+        # (init only prompts when tokens are missing / refresh nearly expired).
+        if not consumed['done']:
+            client.tokens.update_tokens(force_refresh_token=True)
+        if not client.tokens.access_token or not client.tokens.refresh_token:
+            return {
+                'ok': False,
+                'error': (
+                    'Token exchange failed — code may have expired (~30s). '
+                    'Open Schwab login again and paste quickly.'
+                ),
+            }
+        SCHWAB_CLIENT = client
+        SCHWAB_AVAILABLE = True
+        SCHWAB_AUTH_NEEDED = False
+        status = get_schwab_auth_status()
+        try:
+            log_event(
+                'web',
+                'Schwab API refresh OK — credentials renewed (~7 days)',
+                detail={
+                    'refresh_expires_at': status.get('refresh_expires_at'),
+                    'hours_left': status.get('hours_left'),
+                },
+            )
+            # Allow future warn/issue logs for the new expiry window
+            try:
+                set_runtime_flag('schwab_auth_warn_logged_for', '')
+                set_runtime_flag('schwab_auth_issue_logged_for', '')
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return {
+            'ok': True,
+            'schwab': status,
+            'message': 'Connected — refresh token renewed (~7 days)',
+        }
+    except Exception as e:
+        SCHWAB_CLIENT = None
+        SCHWAB_AVAILABLE = False
+        SCHWAB_AUTH_NEEDED = True
+        err = str(e)
+        # Do not echo authorization codes
+        if 'code=' in err.lower():
+            err = 'Token exchange failed — open Schwab login again and paste quickly.'
+        return {'ok': False, 'error': err}
+
+
+def maybe_reinit_schwab_client() -> bool:
+    """If Schwab is down, try a non-interactive re-init (e.g. after dashboard OAuth)."""
+    if SCHWAB_AVAILABLE and SCHWAB_CLIENT is not None:
+        return True
+    return initialize_schwab_client(interactive=False)
+
+
+try:
+    import schwabdev  # noqa: F401 — availability check
+    initialize_schwab_client(interactive=False)
 except ImportError:
     print("Warning: schwabdev library not installed. Install with: pip install schwabdev")
     SCHWAB_AVAILABLE = False
+    SCHWAB_AUTH_NEEDED = True
 
 
 # ============================================================================
@@ -715,6 +1040,13 @@ def log_event(
     """Append a structured event for the web Log page (and print a one-liner)."""
     ts = datetime.now().isoformat(timespec='seconds')
     cat = normalize_log_category(category)
+    lvl = (level or 'info').strip().lower()
+    if lvl in ('warning', 'warn'):
+        lvl = 'warn'
+    elif lvl == 'issue':
+        lvl = 'issue'
+    elif lvl not in ('info', 'error', 'warn', 'issue'):
+        lvl = 'info'
     detail_out = dict(detail) if isinstance(detail, dict) else {}
     if category and normalize_log_category(category) == 'task' and category != 'task':
         detail_out.setdefault('source', str(category))
@@ -729,7 +1061,7 @@ def log_event(
             INSERT INTO event_log (ts, level, category, message, detail_json)
             VALUES (?, ?, ?, ?, ?)
             ''',
-            (ts, level, cat, message, detail_json)
+            (ts, lvl, cat, message, detail_json)
         )
         conn.commit()
         conn.close()
@@ -747,7 +1079,7 @@ def log_event(
                 INSERT INTO event_log (ts, level, category, message, detail_json)
                 VALUES (?, ?, ?, ?, ?)
                 ''',
-                (ts, level, cat, message, detail_json)
+                (ts, lvl, cat, message, detail_json)
             )
             conn.commit()
             conn.close()
@@ -759,7 +1091,14 @@ def log_event(
             print(f"(event_log write failed: {e})")
     except Exception as e:
         print(f"(event_log write failed: {e})")
-    print(f"[{ts}] {cat}: {message}")
+    if lvl == 'warn':
+        print(f"[{ts}] WARN/{cat}: {message}")
+    elif lvl == 'issue':
+        print(f"[{ts}] ISSUE/{cat}: {message}")
+    elif lvl == 'error':
+        print(f"[{ts}] ERROR/{cat}: {message}")
+    else:
+        print(f"[{ts}] {cat}: {message}")
 
 
 def get_runtime_flag(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -2033,37 +2372,6 @@ def run_trader(once: bool = True) -> None:
 # Streaming Data Functions (Schwab API - Real-time)
 # ============================================================================
 
-def initialize_schwab_client():
-    """
-    Initialize or re-initialize the Schwab API client.
-    Can be called to re-authenticate if needed.
-    
-    Returns:
-        True if client initialized successfully, False otherwise
-    """
-    global SCHWAB_CLIENT, SCHWAB_AVAILABLE
-    
-    try:
-        import schwabdev
-        
-        SCHWAB_CLIENT = schwabdev.Client(
-            config.SCHWAB_API_KEY,
-            config.SCHWAB_API_SECRET,
-            config.SCHWAB_REDIRECT_URI
-        )
-        SCHWAB_AVAILABLE = True
-        print("Schwab API client initialized successfully.")
-        return True
-    except ImportError:
-        print("Error: schwabdev library not installed. Install with: pip install schwabdev")
-        SCHWAB_AVAILABLE = False
-        return False
-    except Exception as e:
-        print(f"Error initializing Schwab client: {e}")
-        SCHWAB_AVAILABLE = False
-        return False
-
-
 def setup_streaming(tickers: List[str]):
     """
     Initialize Schwab streaming for selected tickers.
@@ -2866,9 +3174,9 @@ def safe_filter_stocks(
     - Stability: Beta between 0.0 and 1.3 (cap volatility; low beta allowed)
     - No enemies: Low short interest (< 10%)
     - Value: Profitable with reasonable P/E ratio (0.0 to 35.0)
-    - Growth at Reasonable Price: PEG ratio between 0.0 and 2.0 (includes stocks without PEG data)
+    - Growth at Reasonable Price: PEG ratio between 0.0 and 2.0 (PEG data required)
     - Upside: Analysts see growth potential (> 10%)
-    - Analyst Recommendation: Mean recommendation <= 2.0 (Buy/Hold ratings)
+    - Analyst Recommendation: Mean recommendation <= 2.0 (Buy/Strong Buy; recommendation required)
     - Uptrend: (disabled) 50-day MA above 200-day MA — commented out as noisy
     - Dividend: Dividend yield > 1% (for longer holds)
     
@@ -2913,16 +3221,19 @@ def safe_filter_stocks(
         AND pe_ratio > ?
         AND pe_ratio < ?
         
-        -- 5. The "Growth at Reasonable Price" Rule (PEG Ratio)
-        AND (peg_ratio IS NULL OR (peg_ratio > ? AND peg_ratio < ?))
+        -- 5. The "Growth at Reasonable Price" Rule (PEG Ratio; NULL not allowed)
+        AND peg_ratio IS NOT NULL
+        AND peg_ratio > ?
+        AND peg_ratio < ?
         
         -- 6. The "Upside" Rule (Still want growth!)
         AND current_price > 0
         AND target_price > 0
         AND ((target_price - current_price) / current_price) > ?
         
-        -- 7. The "Analyst Recommendation" Rule (Buy/Hold ratings)
-        AND (recommendation_mean IS NULL OR recommendation_mean <= ?)
+        -- 7. The "Analyst Recommendation" Rule (Buy/Strong Buy; NULL not allowed)
+        AND recommendation_mean IS NOT NULL
+        AND recommendation_mean <= ?
         
         -- 8. The "Uptrend" Rule (50-day MA above 200-day MA) — disabled (noisy)
         -- AND fifty_day_average IS NOT NULL
@@ -3683,21 +3994,32 @@ def trade_dry_run_enabled() -> bool:
     return bool(getattr(config, 'TRADE_DRY_RUN', True))
 
 
+def minimum_cash() -> float:
+    """Cash floor from config.MINIMUM_CASH — change that setting only."""
+    return float(config.MINIMUM_CASH)
+
+
 def schwab_order_submit_allowed() -> bool:
     """True only when TRADE_DRY_RUN is False — place/cancel/replace on Schwab."""
     return not trade_dry_run_enabled()
 
 
-def is_trading_allowed(account_data: Optional[Dict[str, Any]] = None, trade_amount_dollars: float = 0.0) -> Tuple[bool, str]:
+def is_trading_allowed(
+    account_data: Optional[Dict[str, Any]] = None,
+    trade_amount_dollars: float = 0.0,
+    extra_reserved_dollars: float = 0.0,
+) -> Tuple[bool, str]:
     """
     Safety check to determine if trading is allowed based on account information.
-    Both liquidation value and cash floor must pass. Cash check: we must not drop below MINIMUM_CASH
-    after the trade, so effective_cash - trade_amount_dollars must be >= MINIMUM_CASH.
+    Both liquidation value and cash floor must pass. Cash check: we must not drop below
+    minimum_cash() after the trade, so effective_cash - trade_amount_dollars must be >= floor.
     
     Args:
         account_data: Optional account data dict. If None, will fetch it automatically.
         trade_amount_dollars: If placing a buy, pass the order amount so we block if the trade would
-            take effective cash below MINIMUM_CASH. Use 0 for "can I trade at all?".
+            take effective cash below the cash floor. Use 0 for "can I trade at all?".
+        extra_reserved_dollars: Additional dollars already committed this pass (proposed buys not
+            yet in pending_orders). Counted like pending against the cash floor.
     
     Returns:
         Tuple of (is_allowed: bool, reason: str)
@@ -3714,11 +4036,12 @@ def is_trading_allowed(account_data: Optional[Dict[str, Any]] = None, trade_amou
     if liquidation_value < min_liquidation:
         return False, f"Liquidation value (${liquidation_value:,.2f}) is below minimum (${min_liquidation:,.2f}); trading blocked."
     
-    # Effective cash = Schwab cash minus pending (unfilled) buy orders. Must not drop below MINIMUM_CASH after this trade.
+    # Effective cash = Schwab cash minus pending (unfilled) buy orders (+ this-pass reserves).
+    # Must not drop below cash floor after this trade.
     cash = account_data.get('cash', 0.0)
-    pending_total = get_pending_orders_total_dollars()
+    pending_total = get_pending_orders_total_dollars() + float(extra_reserved_dollars or 0.0)
     effective_cash = cash - pending_total
-    min_cash = getattr(config, 'MINIMUM_CASH', 15000.0)
+    min_cash = minimum_cash()
     cash_after_trade = effective_cash - trade_amount_dollars
     if cash_after_trade < min_cash:
         if trade_amount_dollars > 0:
@@ -4487,10 +4810,25 @@ def ensure_broker_stop_limit(
     Place or replace resting STOP_LIMIT as needed.
 
     Returns dict with keys: action (placed|replaced|unchanged|skipped|failed), order_id, ...
+    Never arms on the same ET calendar day as purchase (avoids PDT via stop fills).
     """
     qty = int(quantity)
     stop = round(float(stop_price), 2)
     limit = stop_limit_price_from_stop(stop)
+
+    hold_ok, hold_reason = is_min_hold_met(ticker)
+    if not hold_ok:
+        # Cancel any same-day resting stop so it cannot fill into a day trade.
+        try:
+            cancel_position_broker_stop(ticker)
+        except Exception as e:
+            print(f"Warning: cancel deferred stop for {ticker}: {e}")
+        return {
+            'action': 'skipped',
+            'reason': 'stop deferred — %s' % hold_reason,
+            'stop_price': stop,
+            'limit_price': limit,
+        }
 
     # Already through stop → sell_now path should handle; don't place invalid stop
     if spot_price is not None and float(spot_price) <= stop:
@@ -5296,6 +5634,49 @@ def execute_sell(
         clear_position_stop_order(ticker)
 
 
+def _parse_schwab_orders_payload(orders_data: Any) -> List[Dict[str, Any]]:
+    """Normalize Schwab orders JSON (list or wrapped dict) into a list of order dicts."""
+    if isinstance(orders_data, list):
+        return orders_data
+    if isinstance(orders_data, dict):
+        orders = orders_data.get('orders', orders_data.get('orderList', []))
+        if orders:
+            return orders
+        for value in orders_data.values():
+            if isinstance(value, list) and value and isinstance(value[0], dict):
+                if 'status' in value[0] or 'orderId' in value[0]:
+                    return value
+    return []
+
+
+def _open_orders_from_schwab_orders(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Filter Schwab orders to open/working legs: ticker, quantity, order_id."""
+    open_statuses = {
+        'OPEN', 'WORKING', 'QUEUED', 'ACCEPTED', 'AWAITING_PARENT_ORDER',
+        'AWAITING_CONDITION', 'AWAITING_STOP_CONDITION',
+        'AWAITING_MANUAL_REVIEW', 'AWAITING_UR_OUT', 'PENDING_ACTIVATION',
+        'PENDING_CANCEL', 'PENDING_REPLACE',
+    }
+    open_orders = []
+    for order in orders:
+        if order.get('status', '') not in open_statuses:
+            continue
+        order_id = order.get('orderId') or order.get('order_id')
+        if order_id is not None:
+            order_id = str(order_id)
+        for leg in order.get('orderLegCollection', []) or []:
+            instrument = leg.get('instrument', {}) or {}
+            ticker = instrument.get('symbol', '')
+            quantity = int(leg.get('quantity', 0) or 0)
+            if ticker and quantity > 0:
+                open_orders.append({
+                    'ticker': ticker,
+                    'quantity': quantity,
+                    'order_id': order_id,
+                })
+    return open_orders
+
+
 def get_open_orders(account_hash: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Get all open orders from Schwab API.
@@ -5330,179 +5711,26 @@ def get_open_orders(account_hash: Optional[str] = None) -> List[Dict[str, Any]]:
                 print("Error: Could not get account hash.")
                 return []
         
-        # Get orders from Schwab API
-        # account_orders requires fromEnteredTime and toEnteredTime parameters
-        # Use date range: 90 days ago to tomorrow (extended to ensure we catch orders placed today)
-        # Add 1 day to end date to ensure the range is inclusive and catches orders placed today
-        to_date = datetime.now() + timedelta(days=1)  # Add 1 day to ensure today is included
-        from_date = datetime.now() - timedelta(days=90)
-        
-        # Try account_orders_all first (might not require dates)
-        response = None
-        try:
-            # Try account_orders_all without parameters first
-            response = SCHWAB_CLIENT.account_orders_all()
-            if response.status_code == 200:
-                # Success! Use this response
-                pass
-            else:
-                # If it requires dates, try with dates
-                response = None
-        except (AttributeError, TypeError):
-            # Method doesn't exist or requires parameters, continue to try account_orders
-            pass
-        
-        # If account_orders_all didn't work, try account_orders with dates
-        if not response or response.status_code != 200:
-            # Format dates - try different formats that Schwab API might accept
-            from datetime import timezone
-            
-            # Try multiple date formats
-            date_formats = [
-                # Format 1: Epoch seconds (Unix timestamp)
-                (int(from_date.replace(tzinfo=timezone.utc).timestamp()), 
-                 int(to_date.replace(tzinfo=timezone.utc).timestamp())),
-                # Format 2: ISO format with timezone
-                (from_date.replace(tzinfo=timezone.utc).isoformat(),
-                 to_date.replace(tzinfo=timezone.utc).isoformat()),
-                # Format 3: ISO format without timezone
-                (from_date.strftime('%Y-%m-%dT%H:%M:%S'),
-                 to_date.strftime('%Y-%m-%dT%H:%M:%S')),
-            ]
-            
-            last_error = None
-            
-            for fmt_idx, (from_entered_time, to_entered_time) in enumerate(date_formats):
-                try:
-                    # Try account_orders method with current date format
-                    response = SCHWAB_CLIENT.account_orders(account_hash, from_entered_time, to_entered_time)
-                    
-                    # If we get a response (even if error), check status
-                    if response.status_code == 200:
-                        break  # Success!
-                    elif response.status_code == 400:
-                        # Bad format, try next format
-                        error_data = response.json() if hasattr(response, 'json') else {}
-                        last_error = error_data.get('message', f'Status {response.status_code}')
-                        continue
-                    else:
-                        # Other error, break and handle
-                        break
-                except Exception as e:
-                    last_error = str(e)
-                    continue
-            
-            if not response:
-                print("Error: Could not find orders method in schwabdev client.")
-                return []
-        
-        if response.status_code == 200:
-            orders_data = response.json()
-            
-            # Handle different response formats
-            if isinstance(orders_data, list):
-                orders = orders_data
-            elif isinstance(orders_data, dict):
-                # Might be wrapped in a key like 'orders' or 'orderList'
-                orders = orders_data.get('orders', orders_data.get('orderList', []))
-                # Also check for other possible keys
-                if not orders:
-                    # Check all keys for lists that might contain orders
-                    for key, value in orders_data.items():
-                        if isinstance(value, list) and len(value) > 0:
-                            # Check if first item looks like an order (has 'status' or 'orderId')
-                            if isinstance(value[0], dict) and ('status' in value[0] or 'orderId' in value[0]):
-                                orders = value
-                                break
-            else:
-                orders = []
-            
-            # Filter for open/working orders (exclude filled, canceled, rejected)
-            # Include 'OPEN' status (shown in Schwab UI)
-            open_statuses = ['OPEN', 'WORKING', 'QUEUED', 'ACCEPTED', 'AWAITING_PARENT_ORDER', 
-                           'AWAITING_CONDITION', 'AWAITING_STOP_CONDITION', 
-                           'AWAITING_MANUAL_REVIEW', 'AWAITING_UR_OUT', 'PENDING_ACTIVATION',
-                           'PENDING_CANCEL', 'PENDING_REPLACE']
-            
-            open_orders = []
-            for order in orders:
-                status = order.get('status', '')
-                if status in open_statuses:
-                    order_id = order.get('orderId') or order.get('order_id')
-                    if order_id is not None:
-                        order_id = str(order_id)
-                    # Extract ticker and quantity from order legs
-                    order_legs = order.get('orderLegCollection', [])
-                    if order_legs:
-                        for leg in order_legs:
-                            instrument = leg.get('instrument', {})
-                            ticker = instrument.get('symbol', '')
-                            quantity = int(leg.get('quantity', 0))
-                            if ticker and quantity > 0:
-                                open_orders.append({
-                                    'ticker': ticker,
-                                    'quantity': quantity,
-                                    'order_id': order_id
-                                })
-            
-            # If no orders found at all, try with a much wider date range (1 year) as fallback
-            if not orders and response.status_code == 200:
-                from_date_wide = to_date - timedelta(days=365)
-                from_entered_time_wide = from_date_wide.replace(tzinfo=timezone.utc).isoformat()
-                to_entered_time_wide = to_date.replace(tzinfo=timezone.utc).isoformat()
-                
-                try:
-                    response_wide = SCHWAB_CLIENT.account_orders(account_hash, from_entered_time_wide, to_entered_time_wide)
-                    if response_wide.status_code == 200:
-                        orders_data_wide = response_wide.json()
-                        if isinstance(orders_data_wide, list):
-                            orders = orders_data_wide
-                        elif isinstance(orders_data_wide, dict):
-                            orders = orders_data_wide.get('orders', orders_data_wide.get('orderList', []))
-                        
-                        if orders:
-                            # Re-filter for open orders
-                            open_orders = []
-                            for order in orders:
-                                status = order.get('status', '')
-                                if status in open_statuses:
-                                    order_id = order.get('orderId') or order.get('order_id')
-                                    if order_id is not None:
-                                        order_id = str(order_id)
-                                    order_legs = order.get('orderLegCollection', [])
-                                    if order_legs:
-                                        for leg in order_legs:
-                                            instrument = leg.get('instrument', {})
-                                            ticker = instrument.get('symbol', '')
-                                            quantity = int(leg.get('quantity', 0))
-                                            if ticker and quantity > 0:
-                                                open_orders.append({
-                                                    'ticker': ticker,
-                                                    'quantity': quantity,
-                                                    'order_id': order_id
-                                                })
-                except Exception:
-                    pass  # Silently fail fallback
-            
-            return open_orders
-        else:
-            # If all formats failed, try account_orders_all without dates as last resort
-            if response.status_code == 400:
-                try:
-                    # Try account_orders_all without dates (might return all orders)
-                    response_all = SCHWAB_CLIENT.account_orders_all()
-                    if response_all.status_code == 200:
-                        response = response_all
-                    else:
-                        print(f"Error retrieving orders: Status {response_all.status_code}")
-                        return []
-                except Exception as e:
-                    print(f"Error retrieving orders: {e}")
-                    return []
-            else:
-                print(f"Error retrieving orders: Status {response.status_code}")
-                print(f"Response: {response.text}")
-                return []
+        # schwabdev accepts datetime objects and converts them; both account_orders*
+        # methods require fromEnteredTime / toEnteredTime (no zero-arg form).
+        to_date = datetime.now(timezone.utc) + timedelta(days=1)
+        from_date = datetime.now(timezone.utc) - timedelta(days=90)
+        response = SCHWAB_CLIENT.account_orders(account_hash, from_date, to_date)
+
+        if response.status_code != 200:
+            print(f"Error retrieving orders: Status {response.status_code}")
+            print(f"Response: {response.text}")
+            return []
+
+        orders = _parse_schwab_orders_payload(response.json())
+        if not orders:
+            # Wider window for older resting GTC stops
+            from_date_wide = to_date - timedelta(days=365)
+            response_wide = SCHWAB_CLIENT.account_orders(account_hash, from_date_wide, to_date)
+            if response_wide.status_code == 200:
+                orders = _parse_schwab_orders_payload(response_wide.json())
+
+        return _open_orders_from_schwab_orders(orders)
             
     except Exception as e:
         print(f"Error getting open orders: {e}")
@@ -5692,6 +5920,48 @@ def _parse_purchased_at(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _as_market_datetime(dt: datetime) -> datetime:
+    """Interpret dt in MARKET_TIMEZONE (naive values treated as already in that zone)."""
+    tz = _market_tz()
+    if tz is None:
+        return dt
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=tz)
+    return dt.astimezone(tz)
+
+
+def get_purchase_market_date(ticker: str) -> Optional[date]:
+    """
+    Purchase calendar date in MARKET_TIMEZONE (ET).
+
+    Prefer date_purchased (Schwab trade date) when it is a bare date; otherwise
+    convert purchased_at / datetime to the ET calendar day. FINRA day trades
+    use this calendar trading day, not a rolling 24-hour window.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT purchased_at, date_purchased FROM positions WHERE ticker = ?",
+        (ticker,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    purchased_at, date_purchased = row[0], row[1]
+    # Bare YYYY-MM-DD is the trade date — use directly (no local-midnight skew).
+    if date_purchased and len(str(date_purchased).strip()) >= 10:
+        raw = str(date_purchased).strip()
+        try:
+            return datetime.strptime(raw[:10], '%Y-%m-%d').date()
+        except ValueError:
+            pass
+    purchased = _parse_purchased_at(purchased_at) or _parse_purchased_at(date_purchased)
+    if not purchased:
+        return None
+    return _as_market_datetime(purchased).date()
+
+
 def hold_hours_elapsed(ticker: str) -> Optional[float]:
     """Hours since purchased_at (or date_purchased). None if unknown."""
     conn = get_connection()
@@ -5707,18 +5977,51 @@ def hold_hours_elapsed(ticker: str) -> Optional[float]:
     purchased = _parse_purchased_at(row[0]) or _parse_purchased_at(row[1])
     if not purchased:
         return None
-    return (datetime.now() - purchased).total_seconds() / 3600.0
+    now = _now_market()
+    purch = _as_market_datetime(purchased)
+    if purch.tzinfo is not None and now.tzinfo is None:
+        now = now.replace(tzinfo=purch.tzinfo)
+    elif purch.tzinfo is None and now.tzinfo is not None:
+        purch = purch.replace(tzinfo=now.tzinfo)
+    return (now - purch).total_seconds() / 3600.0
+
+
+def hours_until_exit_allowed(ticker: str) -> Optional[float]:
+    """Hours until next ET calendar day after purchase (when exits/stops unlock)."""
+    purch = get_purchase_market_date(ticker)
+    if purch is None:
+        return None
+    now = _now_market()
+    unlock_day = purch + timedelta(days=1)
+    tz = _market_tz()
+    unlock = datetime(unlock_day.year, unlock_day.month, unlock_day.day, 0, 0, 0)
+    if tz is not None:
+        unlock = unlock.replace(tzinfo=tz)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=tz)
+    secs = (unlock - now).total_seconds()
+    return max(0.0, secs / 3600.0)
 
 
 def is_min_hold_met(ticker: str) -> Tuple[bool, str]:
-    """Whether MINIMUM_HOLD_HOURS has elapsed for ticker."""
-    min_hours = float(getattr(config, 'MINIMUM_HOLD_HOURS', 16))
-    hours = hold_hours_elapsed(ticker)
-    if hours is None:
+    """
+    Whether market sells and broker STOP_LIMITs are allowed for ticker.
+
+    Hard rule: no exit/stop on the same ET calendar day as purchase (FINRA day
+    trade = same trading day). Buy Mon 1pm / sell Tue 8am is allowed.
+    """
+    purch = get_purchase_market_date(ticker)
+    if purch is None:
         return False, "unknown purchase time"
-    if hours < min_hours:
-        return False, f"min hold: {min_hours - hours:.1f}h remaining ({hours:.1f}h held)"
-    return True, f"hold ok ({hours:.1f}h)"
+    today = _now_market().date()
+    if today <= purch:
+        left = hours_until_exit_allowed(ticker)
+        left_s = f", ~{left:.1f}h until next ET day" if left is not None else ""
+        return False, (
+            f"same trading day as purchase ({purch.isoformat()} ET){left_s}; "
+            f"exits/stops deferred until next ET calendar day"
+        )
+    return True, f"hold ok (purchased {purch.isoformat()} ET; today {today.isoformat()} ET)"
 
 
 def ticker_on_watchlist(ticker: str) -> bool:
@@ -6768,7 +7071,7 @@ def _update_position_trail_state(
 def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """
     Propose $ORDER_AMOUNT_DOLLARS buys from top of ranked watchlist.
-    Skips owned / pending / rebuy-debounce names; stops when cash floors block.
+    Skips owned / pending / rebuy-debounce names; keeps proposing until cash floors block.
     Warns if cash can fund a buy but no watchlist name is eligible (loosen filter).
 
     Args:
@@ -6776,6 +7079,8 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
                 DB watchlist. Dry-run passes the filter result to simulate a refresh.
     """
     order_amount = float(getattr(config, 'ORDER_AMOUNT_DOLLARS', 1000.0))
+    # Rank #1–N by analyst upside: skip reasons here are worth a dashboard WARN.
+    warn_top_n = int(getattr(config, 'BUY_WARN_TOP_N', 5))
     if ranked is None:
         ranked = get_watchlist_ranked()
     owned = get_owned_tickers()
@@ -6784,13 +7089,19 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     account = get_account_info() or {}
     saw_buy = False
     stopped_on_cash = False
+    # Dollars committed by buy proposals earlier in this pass (not yet in pending_orders).
+    reserved_dollars = 0.0
 
-    for ticker in ranked:
+    for rank_i, ticker in enumerate(ranked):
+        rank = rank_i + 1
+        top = rank <= max(1, warn_top_n)
+
         if ticker in owned:
             proposals.append({
                 'action': 'skip_buy',
                 'ticker': ticker,
                 'reason': 'already owned',
+                'rank': rank,
             })
             continue
         if ticker in pending:
@@ -6798,6 +7109,7 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
                 'action': 'skip_buy',
                 'ticker': ticker,
                 'reason': 'pending buy order',
+                'rank': rank,
             })
             continue
 
@@ -6807,7 +7119,19 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
                 'action': 'skip_buy',
                 'ticker': ticker,
                 'reason': 'no live Schwab price',
+                'rank': rank,
             })
+            if top:
+                proposals.append({
+                    'action': 'warning',
+                    'ticker': ticker,
+                    'reason': (
+                        f"#{rank} watchlist {ticker} has no live Schwab price — "
+                        f"cannot buy top analyst-upside name"
+                    ),
+                    'rank': rank,
+                    'hint': 'schwab_price',
+                })
             continue
 
         ok_rebuy, rebuy_reason = rebuy_allowed(ticker, price)
@@ -6817,22 +7141,54 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
                 'ticker': ticker,
                 'reason': rebuy_reason,
                 'price': price,
+                'rank': rank,
             })
+            if top:
+                proposals.append({
+                    'action': 'warning',
+                    'ticker': ticker,
+                    'reason': (
+                        f"#{rank} watchlist {ticker} blocked by rebuy debounce "
+                        f"(@ ${price:.2f}) — {rebuy_reason}. "
+                        f"Still high by analyst upside; leave rule as-is or clear "
+                        f"rebuy_guards if you intentionally want back in sooner."
+                    ),
+                    'price': price,
+                    'rank': rank,
+                    'hint': 'rebuy_debounce',
+                })
             continue
 
         quantity = int(order_amount / price)
         if quantity < 1:
+            reason = f'price ${price:.2f} -> 0 shares for ${order_amount:.0f}'
             proposals.append({
                 'action': 'skip_buy',
                 'ticker': ticker,
-                'reason': f'price ${price:.2f} -> 0 shares for ${order_amount:.0f}',
+                'reason': reason,
                 'price': price,
+                'rank': rank,
             })
+            if top:
+                proposals.append({
+                    'action': 'warning',
+                    'ticker': ticker,
+                    'reason': (
+                        f"#{rank} watchlist {ticker} too expensive for "
+                        f"${order_amount:.0f} order size (@ ${price:.2f}) — "
+                        f"raise ORDER_AMOUNT_DOLLARS or skip this name"
+                    ),
+                    'price': price,
+                    'rank': rank,
+                    'hint': 'order_size',
+                })
             continue
 
         trade_dollars = quantity * price
         allowed, reason = is_trading_allowed(
-            account_data=account, trade_amount_dollars=trade_dollars
+            account_data=account,
+            trade_amount_dollars=trade_dollars,
+            extra_reserved_dollars=reserved_dollars,
         )
         if not allowed:
             proposals.append({
@@ -6842,6 +7198,7 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
                 'price': price,
                 'quantity': quantity,
                 'dollars': trade_dollars,
+                'rank': rank,
             })
             stopped_on_cash = True
             # Cash/liquidation floor: stop walking the list for further buys
@@ -6850,14 +7207,18 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         proposals.append({
             'action': 'buy',
             'ticker': ticker,
-            'reason': f'top watchlist, ${order_amount:.0f} size, ranked by analyst upside',
+            'reason': (
+                f'#{rank} watchlist, ${order_amount:.0f} size, ranked by analyst upside'
+            ),
             'price': price,
             'quantity': quantity,
             'dollars': trade_dollars,
+            'rank': rank,
         })
         saw_buy = True
-        # Only one new buy per pass while we wait for cash to refill for the next $1k
-        break
+        reserved_dollars += trade_dollars
+        # Treat as owned for the rest of this pass so we don't double-buy the same name
+        owned.add(ticker)
 
     # Cash available for a full-size buy, but nothing eligible left on the watchlist
     if not saw_buy and not stopped_on_cash:
@@ -6866,7 +7227,7 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         )
         if can_fund:
             msg = (
-                f"WARNING: enough cash for a ${order_amount:.0f} buy, but no eligible "
+                f"Enough cash for a ${order_amount:.0f} buy, but no eligible "
                 f"watchlist names left (owned/pending/rebuy-debounce/no Schwab price). "
                 f"Consider loosening the '{getattr(config, 'WATCHLIST_FILTER_NAME', 'safe')}' filter "
                 f"or checking Schwab connectivity."
@@ -6876,10 +7237,11 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
                 'action': 'warning',
                 'ticker': None,
                 'reason': msg,
+                'hint': 'no_eligible_buys',
             })
         elif not ranked:
             msg = (
-                f"WARNING: watchlist is empty. "
+                f"Watchlist is empty. "
                 f"Filter '{getattr(config, 'WATCHLIST_FILTER_NAME', 'safe')}' may be too tight "
                 f"or Yahoo data needs a refresh. ({fund_reason})"
             )
@@ -6888,9 +7250,33 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
                 'action': 'warning',
                 'ticker': None,
                 'reason': msg,
+                'hint': 'empty_watchlist',
             })
 
     return proposals
+
+
+def emit_trade_pass_warnings(
+    proposals: List[Dict[str, Any]],
+    category: str = 'buy',
+) -> None:
+    """Write proposal warnings to event_log (level=warn) for the dashboard Log."""
+    for p in proposals or []:
+        if p.get('action') != 'warning':
+            continue
+        msg = str(p.get('reason') or '').strip()
+        if not msg:
+            continue
+        # Avoid double "WARNING:" prefix in the UI tag era
+        if msg.upper().startswith('WARNING:'):
+            msg = msg[8:].strip()
+        detail = {
+            'hint': p.get('hint'),
+            'ticker': p.get('ticker'),
+            'rank': p.get('rank'),
+            'price': p.get('price'),
+        }
+        log_event(category, msg, level='warn', detail=detail)
 
 
 def propose_sells() -> List[Dict[str, Any]]:
@@ -6898,6 +7284,7 @@ def propose_sells() -> List[Dict[str, Any]]:
     Propose actions for open positions (picks up current holdings as-is):
     - sell_now: market sell immediately (trail/hard stop already breached)
     - place_stop_limit: protective stop-limit at computed stop price (not yet hit)
+    - defer_stop_limit: would place stop but same ET purchase day (PDT) — wait until next day
     - skip_sell: would sell but min-hold blocks
     Trail: peak +10% activate, 5% buffer on-list / 3% off-list (ratchet up only).
     Hard stop: -10% on-list / -5% off-list (also used as stop-limit while in work mode).
@@ -6997,8 +7384,20 @@ def propose_sells() -> List[Dict[str, Any]]:
         # Immediate market sell if price already at/through the stop
         if state['breached']:
             if not hold_ok:
-                proposals.append(dict(base, action='skip_sell',
-                                      reason=f'{stop_kind} stop hit but {hold_reason}'))
+                reason = f'{stop_kind} stop hit but {hold_reason}'
+                proposals.append(dict(base, action='skip_sell', reason=reason))
+                proposals.append({
+                    'action': 'warning',
+                    'ticker': ticker,
+                    'reason': (
+                        f"{ticker} stop breached ({stop_kind} @ ${stop_price:.2f}) but "
+                        f"same-day PDT rule blocks the market sell — {hold_reason}. "
+                        f"Broker STOP_LIMIT is not armed until the next ET calendar day."
+                    ),
+                    'hint': 'min_hold_blocks_exit',
+                    'stop_price': stop_price,
+                    'stop_kind': stop_kind,
+                })
             else:
                 exit_info = describe_sell_exit(stop_kind, active)
                 proposals.append(dict(
@@ -7012,6 +7411,17 @@ def propose_sells() -> List[Dict[str, Any]]:
                         f'{"off" if not on_wl else "on"} watchlist — market sell now'
                     ),
                 ))
+            continue
+
+        # Same ET calendar day as purchase: never arm broker stop (PDT).
+        if not hold_ok:
+            proposals.append(dict(
+                base,
+                action='defer_stop_limit',
+                reason=(
+                    f'defer stop-limit @ ${stop_price:.2f} until next ET day — {hold_reason}'
+                ),
+            ))
             continue
 
         # Not hit yet: place / refresh stop-limit below market
@@ -7083,7 +7493,7 @@ def print_trade_proposals(proposals: Optional[Dict[str, List[Dict[str, Any]]]] =
 
 
 def run_buy_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
-    """Propose buys and optionally execute the first actionable buy."""
+    """Propose buys and optionally execute each actionable buy (until cash floors block)."""
     if dry_run is None:
         dry_run = trade_dry_run_enabled()
     sync = refresh_schwab_positions_if_needed(force=True)
@@ -7100,7 +7510,11 @@ def run_buy_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
             'reason': msg,
         }]
     proposals = propose_buys()
+    emit_trade_pass_warnings(proposals, category='buy')
     for p in proposals:
+        if p.get('action') == 'warning':
+            print(f"  ⚠️  {p.get('reason')}")
+            continue
         print(f"  [{p.get('action')}] {p.get('ticker')}: {p.get('reason')}")
         if p.get('action') == 'buy' and not dry_run:
             execute_buy(p['ticker'], int(p['quantity']))
@@ -7144,7 +7558,11 @@ def run_sell_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
             'reason': msg,
         }]
     proposals = propose_sells()
+    emit_trade_pass_warnings(proposals, category='sell')
     for p in proposals:
+        if p.get('action') == 'warning':
+            print(f"  ⚠️  {p.get('reason')}")
+            continue
         print(f"  [{p.get('action')}] {p.get('ticker')}: {p.get('reason')}")
         ticker = p.get('ticker')
         if p.get('action') == 'sell_now':
@@ -7169,6 +7587,30 @@ def run_sell_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
                 qty,
                 note=p.get('reason'),
                 exit_kind=exit_kind,
+            )
+        elif p.get('action') == 'defer_stop_limit':
+            # Same-day purchase: cancel any resting stop; do not arm until next ET day.
+            msg = (
+                f"STOP deferred for {ticker} (PDT same-day rule) — {p.get('reason')}"
+            )
+            print(f"    ({msg})")
+            if not dry_run:
+                try:
+                    cancel_position_broker_stop(ticker)
+                except Exception as e:
+                    print(f"  Warning: cancel deferred stop for {ticker}: {e}")
+            log_event(
+                'sell',
+                msg,
+                detail={
+                    'ticker': ticker,
+                    'quantity': p.get('quantity'),
+                    'stop_price': p.get('stop_price'),
+                    'reason': p.get('reason'),
+                    'phase': 'deferred',
+                    'order_type': 'STOP_LIMIT',
+                    'dry_run': bool(dry_run),
+                },
             )
         elif p.get('action') == 'place_stop_limit' and dry_run:
             # Forced dry-run while live mode may be on — log explicitly.
@@ -7266,7 +7708,7 @@ def dry_run_system() -> Dict[str, Any]:
     pending = get_pending_orders_total_dollars()
     cash = float(account.get('cash') or 0.0)
     effective_cash = cash - pending
-    min_cash = float(getattr(config, 'MINIMUM_CASH', 15000.0))
+    min_cash = minimum_cash()
     order_amount = float(getattr(config, 'ORDER_AMOUNT_DOLLARS', 1000.0))
     # Cash that can go to new buys while staying at/above the cash floor
     spendable = max(0.0, effective_cash - min_cash)
@@ -7458,6 +7900,7 @@ def dry_run_system() -> Dict[str, Any]:
     report['sells'] = sells
     sell_now = [s for s in sells if s.get('action') == 'sell_now']
     place_stop = [s for s in sells if s.get('action') == 'place_stop_limit']
+    defer_stop = [s for s in sells if s.get('action') == 'defer_stop_limit']
     skipped = [s for s in sells if s.get('action') == 'skip_sell']
 
     print(f"\n  Immediate MARKET SELLS ({len(sell_now)}):")
@@ -7478,6 +7921,12 @@ def dry_run_system() -> Dict[str, Any]:
             f"cost ${p.get('purchase'):.2f})"
         )
 
+    print(f"\n  STOP-LIMIT deferred until next ET day ({len(defer_stop)}):")
+    if not defer_stop:
+        print("    (none)")
+    for p in defer_stop:
+        print(f"    [{p.get('ticker')}] {p.get('reason')}")
+
     legacy_skips = [
         s for s in skipped
         if 'holdout' in (s.get('reason') or '')
@@ -7488,7 +7937,7 @@ def dry_run_system() -> Dict[str, Any]:
         for p in legacy_skips:
             print(f"    [{p.get('ticker')}] book={p.get('book')} — {p.get('reason')}")
     if other_skips:
-        print(f"\n  Blocked by min-hold / data ({len(other_skips)}):")
+        print(f"\n  Blocked by same-day PDT / data ({len(other_skips)}):")
         for p in other_skips:
             print(f"    [{p.get('ticker')}] {p.get('reason')}")
 
@@ -7502,6 +7951,7 @@ def dry_run_system() -> Dict[str, Any]:
     print(f"  Buys to place: {len(actionable_buys)}")
     print(f"  Market sells now: {len(sell_now)}")
     print(f"  Stop-limits to place: {len(place_stop)}")
+    print(f"  Stop-limits deferred (same day): {len(defer_stop)}")
     print("\nActive mode: run_trader(once=False); RTH jobs reset once at each market open.")
     print("Dry-run complete.\n")
 
@@ -7565,6 +8015,12 @@ def run_schwab_sync_job() -> bool:
     interval = _schwab_sync_interval_days()
     mark_job_started(JOB_SCHWAB_SYNC, interval)
     try:
+        # Pick up tokens written by dashboard OAuth without restarting the loop
+        if not SCHWAB_AVAILABLE:
+            maybe_reinit_schwab_client()
+        auth = get_schwab_auth_status()
+        maybe_log_schwab_auth_alerts(auth)
+        maybe_log_schwab_access_refresh()
         print("Schwab account sync (pending orders + positions)...")
         result = sync_schwab_account(force_positions=True)
         cleared = int(result.get('pending_cleared') or 0)
@@ -7597,11 +8053,17 @@ def run_sell_check_job() -> bool:
         sells = run_sell_pass()
         n_now = len([s for s in (sells or []) if s.get('action') == 'sell_now'])
         n_stop = len([s for s in (sells or []) if s.get('action') == 'place_stop_limit'])
+        n_defer = len([s for s in (sells or []) if s.get('action') == 'defer_stop_limit'])
         log_event(
             'task',
-            f"Sell check finished: sell_now={n_now}, stop_limit={n_stop} "
+            f"Sell check finished: sell_now={n_now}, stop_limit={n_stop}, "
+            f"defer_stop={n_defer} "
             f"({'dry-run' if trade_dry_run_enabled() else 'live'})",
-            detail={'sell_now': n_now, 'place_stop_limit': n_stop},
+            detail={
+                'sell_now': n_now,
+                'place_stop_limit': n_stop,
+                'defer_stop_limit': n_defer,
+            },
         )
         record_account_snapshot(note='sell_check')
         mark_job_completed(JOB_SELL_CHECK)
@@ -7712,8 +8174,8 @@ def _watchlist_filter_catalog() -> Dict[str, Dict[str, Any]]:
             {
                 'field': 'peg_ratio',
                 'meaning': 'P/E divided by expected earnings growth (growth at a reasonable price)',
-                'set_to': 'NULL or 0.0 – 2.0',
-                'why': 'Prefer growth that is not overpaying; missing PEG data is still allowed',
+                'set_to': '0.0 – 2.0',
+                'why': 'Prefer growth that is not overpaying; PEG data is required',
             },
             {
                 'field': 'analyst_upside',
@@ -7724,8 +8186,8 @@ def _watchlist_filter_catalog() -> Dict[str, Dict[str, Any]]:
             {
                 'field': 'recommendation_mean',
                 'meaning': 'Analyst consensus score (1=Strong Buy … 5=Sell)',
-                'set_to': 'NULL or ≤ 2.0',
-                'why': 'Bias toward Buy / Strong Buy; missing recommendation is allowed',
+                'set_to': '≤ 2.0',
+                'why': 'Bias toward Buy / Strong Buy; recommendation data is required',
             },
             {
                 'field': 'dividend_yield',
@@ -7839,8 +8301,7 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
     Values are pulled live from config so the UI stays in sync.
     """
     dry = trade_dry_run_enabled()
-    hold_h = float(getattr(config, 'MINIMUM_HOLD_HOURS', 16))
-    min_cash = float(getattr(config, 'MINIMUM_CASH', 15000.0))
+    min_cash = minimum_cash()
     min_liq = float(getattr(config, 'MINIMUM_LIQUIDATION_VALUE', 25000.0))
     order_amt = float(getattr(config, 'ORDER_AMOUNT_DOLLARS', 1000.0))
     filter_name = str(getattr(config, 'WATCHLIST_FILTER_NAME', 'safe'))
@@ -7883,8 +8344,11 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
         {
             'id': 'no_day_trade',
             'title': 'No buy-and-sell the same day',
-            'set_to': 'Hold at least %.0f hours after purchase' % hold_h,
-            'why': 'Avoid PDT / same-day round-trips; covers regular + extended hours buffer',
+            'set_to': 'No market sell or broker STOP_LIMIT until the next ET calendar day',
+            'why': (
+                'FINRA day trade = same trading day (not 24h). Buy Mon 1pm / sell Tue 8am '
+                'is fine; stops are deferred so a same-day fill cannot create a round trip'
+            ),
         },
         {
             'id': 'cash_floor',
@@ -7937,10 +8401,15 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
         {
             'id': 'broker_stop',
             'title': 'Resting broker STOP_LIMIT',
-            'set_to': 'Limit %.2f%% below stop · %s' % (
-                slip, str(getattr(config, 'STOP_ORDER_DURATION', 'GOOD_TILL_CANCEL'))
+            'set_to': (
+                'Arm after next ET day · limit %.2f%% below stop · %s' % (
+                    slip, str(getattr(config, 'STOP_ORDER_DURATION', 'GOOD_TILL_CANCEL'))
+                )
             ),
-            'why': 'Protective sell sits at Schwab even if the bot is offline briefly',
+            'why': (
+                'Protective sell sits at Schwab once past the purchase day; never armed '
+                'same day so a stop fill cannot create a PDT round trip'
+            ),
         },
         {
             'id': 'sell_cadence',
@@ -7997,13 +8466,14 @@ def get_next_scheduled_tasks() -> List[Dict[str, Any]]:
         title = _JOB_DISPLAY_NAMES.get(job_name, job_name.replace('_', ' ').title())
         if minutes <= 0:
             when = 'now'
-            label = '%s now' % title
         elif minutes == 1:
             when = 'in 1 minute'
-            label = '%s in 1 minute' % title
+        elif minutes > 60:
+            hours = max(1, int(round(minutes / 60.0)))
+            when = 'in 1 hour' if hours == 1 else 'in %d hours' % hours
         else:
             when = 'in %d minutes' % minutes
-            label = '%s in %d minutes' % (title, minutes)
+        label = '%s %s' % (title, when) if when != 'now' else '%s now' % title
         items.append({
             'job_name': job_name,
             'title': title,
@@ -8056,6 +8526,7 @@ def get_dashboard_status() -> Dict[str, Any]:
         'yahoo': get_yahoo_staleness_summary(),
         'watchlist_filter': get_watchlist_filter_dashboard(),
         'trading_rules': get_trading_rules_dashboard(),
+        'schwab': get_schwab_auth_status(),
     }
 
 
@@ -8082,15 +8553,28 @@ def _dashboard_stop_display_price(
     return None
 
 
+def _dashboard_days_held(
+    date_purchased: Optional[str],
+    purchased_at: Optional[str] = None,
+) -> Optional[int]:
+    """Whole days owned for display — prefer Schwab date_purchased over purchased_at."""
+    purchased = _parse_purchased_at(date_purchased) or _parse_purchased_at(purchased_at)
+    if purchased is None:
+        return None
+    return max(0, (datetime.now().date() - purchased.date()).days)
+
+
 def _dashboard_position_status(
     ticker: str,
     book: Optional[str],
     stop_display_price: Optional[float],
+    trail_active: bool = False,
 ) -> Dict[str, Any]:
     """
     Trader Status column:
     - holding: min-hold window (market sells blocked)
-    - armed: protective stop tracked (show trigger price)
+    - trail: trailing stop armed (peak reached activate %)
+    - floor: hard-stop only (never reached trail activate yet) — shown in red in UI
     - tracking: sell-managed but no stop level yet
     - skipped / not enrolled: outside algorithm book
     """
@@ -8111,17 +8595,13 @@ def _dashboard_position_status(
         }
 
     hold_ok, _hold_reason = is_min_hold_met(ticker)
-    min_hours = float(getattr(config, 'MINIMUM_HOLD_HOURS', 16))
-    hours = hold_hours_elapsed(ticker)
-    left = None  # type: Optional[float]
-    if hours is not None:
-        left = max(0.0, min_hours - float(hours))
+    left = hours_until_exit_allowed(ticker) if not hold_ok else 0.0
 
     if not hold_ok:
-        if left is not None:
-            label = 'holding · %.0fh left' % left
+        if left is not None and left > 0:
+            label = 'holding · next ET day (%.0fh)' % left
         else:
-            label = 'holding'
+            label = 'holding · until next ET day'
         return {
             'status': 'holding',
             'status_label': label,
@@ -8130,9 +8610,17 @@ def _dashboard_position_status(
         }
 
     if stop_display_price is not None:
+        px = float(stop_display_price)
+        if trail_active:
+            return {
+                'status': 'trail',
+                'status_label': 'trail $%.2f' % px,
+                'min_hold_met': True,
+                'hold_hours_left': 0.0,
+            }
         return {
-            'status': 'armed',
-            'status_label': 'armed at $%.2f' % float(stop_display_price),
+            'status': 'floor',
+            'status_label': 'floor $%.2f' % px,
             'min_hold_met': True,
             'hold_hours_left': 0.0,
         }
@@ -8164,6 +8652,7 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
         c in pos_cols
         for c in ('stop_order_id', 'stop_order_price', 'stop_limit_price', 'stop_order_qty')
     )
+    have_purchased_at = 'purchased_at' in pos_cols
     select_cols = [
         'ticker', 'date_purchased', 'shares_owned', 'average_price', 'market_value',
         'current_day_profit_loss', 'long_open_profit_loss',
@@ -8173,6 +8662,8 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
             'ticker', 'date_purchased', 'shares_owned', 'average_price', 'market_value',
             'current_day_profit_loss', 'day_pct', 'long_open_profit_loss', 'open_pct',
         ]
+    if have_purchased_at:
+        select_cols = select_cols + ['purchased_at']
     if have_trail:
         select_cols = select_cols + ['peak_gain_pct', 'stop_gain_pct', 'trail_active']
     if have_broker_stop:
@@ -8223,10 +8714,19 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
                 current_price = None
         stop_display = _dashboard_stop_display_price(stop_order_price, stop_g, avg)
         book = get_position_book(ticker) or 'untagged'
-        status_info = _dashboard_position_status(ticker, book, stop_display)
+        trail_on = bool(trail) if trail is not None else False
+        status_info = _dashboard_position_status(
+            ticker, book, stop_display, trail_active=trail_on,
+        )
+        purchased_at = d.get('purchased_at') if have_purchased_at else None
+        days_held = _dashboard_days_held(
+            date_purchased if isinstance(date_purchased, str) else None,
+            purchased_at if isinstance(purchased_at, str) else None,
+        )
         positions.append({
             'ticker': ticker,
             'date_purchased': date_purchased,
+            'days_held': days_held,
             'shares_owned': int(shares) if shares is not None else 0,
             'average_price': avg,
             'current_price': current_price,
@@ -8238,7 +8738,7 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
             'open_pct': open_pct,
             'peak_gain_pct': peak,
             'stop_gain_pct': stop_g,
-            'trail_active': bool(trail) if trail is not None else False,
+            'trail_active': trail_on,
             'book': book,
             'stop_order_id': d.get('stop_order_id') if have_broker_stop else None,
             'stop_order_price': stop_order_price,

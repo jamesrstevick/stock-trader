@@ -81,6 +81,30 @@ def api_status():
     return st.get_dashboard_status()
 
 
+@app.get('/api/schwab/auth')
+def api_schwab_auth_get():
+    """Schwab OAuth status + authorize URL for Actions → Schwab reconnect."""
+    return st.get_schwab_auth_status()
+
+
+@app.post('/api/schwab/auth')
+def api_schwab_auth_post(body: dict):
+    """
+    Complete Schwab OAuth paste-back.
+    Body: { "callback_url": "https://127.0.0.1/?code=..." }
+    Privileged — protect with Cloudflare Access on the tunnel.
+    """
+    callback_url = (body or {}).get('callback_url')
+    if not callback_url or not isinstance(callback_url, str):
+        return JSONResponse(
+            {'ok': False, 'error': 'callback_url required'},
+            status_code=400,
+        )
+    result = st.complete_schwab_oauth(callback_url.strip())
+    status = 200 if result.get('ok') else 400
+    return JSONResponse(result, status_code=status)
+
+
 @app.get('/api/portfolio')
 def api_portfolio():
     return st.get_dashboard_portfolio()

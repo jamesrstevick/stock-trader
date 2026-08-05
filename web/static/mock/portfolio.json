@@ -13,6 +13,7 @@
     {
       "ticker": "DELL",
       "date_purchased": "2026-07-01",
+      "days_held": 33,
       "shares_owned": 8,
       "average_price": 120.5,
       "current_price": 131.25,
@@ -26,14 +27,15 @@
       "book": "algorithm",
       "stop_order_price": 124.72,
       "stop_display_price": 124.72,
-      "status": "armed",
-      "status_label": "armed at $124.72",
+      "status": "trail",
+      "status_label": "trail $124.72",
       "min_hold_met": true,
       "hold_hours_left": 0.0
     },
     {
       "ticker": "MET",
       "date_purchased": "2026-08-04",
+      "days_held": 0,
       "shares_owned": 12,
       "average_price": 78.0,
       "current_price": 75.0,
@@ -48,7 +50,7 @@
       "stop_order_price": 70.2,
       "stop_display_price": 70.2,
       "status": "holding",
-      "status_label": "holding · 10h left",
+      "status_label": "holding · next ET day (10h)",
       "min_hold_met": false,
       "hold_hours_left": 10.0
     }

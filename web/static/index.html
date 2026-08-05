@@ -12,6 +12,15 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
+  <div id="schwab-banner" class="schwab-banner" hidden role="status" aria-live="polite">
+    <div class="schwab-banner-inner">
+      <p class="schwab-banner-text" id="schwab-banner-text"></p>
+      <div class="schwab-banner-actions">
+        <button type="button" class="btn-primary" id="schwab-banner-yes">Yes</button>
+        <button type="button" class="btn-ghost" id="schwab-banner-no">No</button>
+      </div>
+    </div>
+  </div>
   <div class="shell">
     <nav class="side" aria-label="Primary">
       <p class="brand">Jame Trader</p>
@@ -20,7 +29,10 @@
         <button type="button" data-page="about" class="active">About</button>
         <button type="button" data-page="trader">Trader</button>
         <button type="button" data-page="log">Log</button>
-        <button type="button" data-page="actions">Actions</button>
+        <button type="button" data-page="actions" id="nav-actions">
+          Actions
+          <span class="nav-badge" id="nav-actions-badge" hidden aria-label="Attention needed">!</span>
+        </button>
       </div>
     </nav>
 
@@ -137,17 +149,18 @@
         <div class="panel">
           <h2>Positions</h2>
           <div class="scroll-x">
-            <table class="data" id="positions-table">
+            <table class="data sortable" id="positions-table">
               <thead>
                 <tr>
-                  <th>Ticker</th>
-                  <th class="num">Shares</th>
-                  <th class="num">Mkt value</th>
-                  <th class="num">Day G/L</th>
-                  <th class="num">G/L [$]</th>
-                  <th class="num">G/L [%]</th>
-                  <th class="num">Price</th>
-                  <th>Status</th>
+                  <th data-sort="ticker">Ticker</th>
+                  <th class="num" data-sort="days_held">Days held</th>
+                  <th class="num" data-sort="shares_owned">Shares</th>
+                  <th class="num" data-sort="market_value">Mkt value</th>
+                  <th class="num" data-sort="day_pct">Day G/L</th>
+                  <th class="num" data-sort="open_pl">G/L [$]</th>
+                  <th class="num" data-sort="open_pct">G/L [%]</th>
+                  <th class="num" data-sort="current_price">Price</th>
+                  <th data-sort="status_label">Status</th>
                 </tr>
               </thead>
               <tbody></tbody>
@@ -188,11 +201,36 @@
 
       <section id="page-actions" class="page">
         <h1>Actions</h1>
-        <p class="lead">Remote controls will live here later (dry-run, Yahoo catch-up, pause buys).</p>
-        <div class="actions-blank">
-          <h2>Coming soon</h2>
-          <p>No action buttons in v1 — layout reserved for safe, whitelisted commands.</p>
-        </div>
+        <p class="lead">Remote controls for the always-on bot. More actions will land here later.</p>
+
+        <article class="action-card" id="schwab-reconnect-card">
+          <div class="action-card-head">
+            <h2>Schwab reconnect</h2>
+            <span class="pill" id="schwab-status-pill">Checking…</span>
+          </div>
+          <p class="action-card-desc" id="schwab-status-detail">
+            Open Schwab login, approve, then paste the redirect URL here so the bot can renew its API session (~7 days).
+          </p>
+          <ol class="action-steps">
+            <li>Press <strong>Open Schwab login</strong> (new tab).</li>
+            <li>Log in and approve the app.</li>
+            <li>You land on <code>https://127.0.0.1/?code=…</code> (page may fail — that is OK).</li>
+            <li>Copy the full address-bar URL and paste below within ~30 seconds.</li>
+          </ol>
+          <div class="action-row">
+            <button type="button" class="btn-primary" id="schwab-open-login">Open Schwab login</button>
+            <button type="button" class="btn-ghost" id="schwab-copy-link">Copy login link</button>
+          </div>
+          <label class="action-field">
+            <span>Paste redirect URL</span>
+            <input type="url" id="schwab-callback-input" autocomplete="off" spellcheck="false"
+              placeholder="https://127.0.0.1/?code=…" />
+          </label>
+          <div class="action-row">
+            <button type="button" class="btn-primary" id="schwab-submit" disabled>Submit</button>
+          </div>
+          <p class="action-feedback" id="schwab-feedback" hidden></p>
+        </article>
       </section>
     </main>
   </div>

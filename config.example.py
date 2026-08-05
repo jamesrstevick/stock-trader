@@ -8,6 +8,14 @@ config.py is gitignored — never commit real keys.
 SCHWAB_API_KEY = "your_api_key_here"
 SCHWAB_API_SECRET = "your_api_secret_here"
 SCHWAB_REDIRECT_URI = "https://127.0.0.1"
+# schwabdev token DB (shared by bot + dashboard OAuth paste-back)
+SCHWAB_TOKENS_DB = "~/.schwabdev/tokens.db"
+# Refresh token lifetime (Schwab / schwabdev); full browser login required after this.
+SCHWAB_REFRESH_TOKEN_DAYS = 7
+# Dashboard banner + Actions urgent highlight when refresh expires within this many hours.
+SCHWAB_AUTH_WARN_HOURS = 48
+# Banner "No" snooze duration (hours); client-side localStorage.
+SCHWAB_AUTH_SNOOZE_HOURS = 4
 
 # Database Configuration
 DATABASE_PATH = "market_data.db"
@@ -37,13 +45,14 @@ DEBUG = False
 
 # Trading Safety Rules
 MINIMUM_LIQUIDATION_VALUE = 25000.0
-MINIMUM_CASH = 15000.0
+MINIMUM_CASH = 10000.0  # Cash floor; live value is config.py → minimum_cash()
 
 ORDER_AMOUNT_DOLLARS = 1000.0
 WATCHLIST_JOB_INTERVAL_MINUTES = 30
 WATCHLIST_JOB_INTERVAL_HOURS = 1
 
 # Sell / risk management
+# Legacy (unused). No sell/STOP_LIMIT until next ET calendar day after purchase.
 MINIMUM_HOLD_HOURS = 16
 SELL_CHECK_INTERVAL_MINUTES = 15
 SCHWAB_SYNC_INTERVAL_MINUTES = 5

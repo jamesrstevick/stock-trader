@@ -78,8 +78,8 @@
           {
             "field": "peg_ratio",
             "meaning": "P/E divided by expected earnings growth (growth at a reasonable price)",
-            "set_to": "NULL or 0.0 – 2.0",
-            "why": "Prefer growth that is not overpaying; missing PEG data is still allowed"
+            "set_to": "0.0 – 2.0",
+            "why": "Prefer growth that is not overpaying; PEG data is required"
           },
           {
             "field": "analyst_upside",
@@ -90,8 +90,8 @@
           {
             "field": "recommendation_mean",
             "meaning": "Analyst consensus score (1=Strong Buy … 5=Sell)",
-            "set_to": "NULL or ≤ 2.0",
-            "why": "Bias toward Buy / Strong Buy; missing recommendation is allowed"
+            "set_to": "≤ 2.0",
+            "why": "Bias toward Buy / Strong Buy; recommendation data is required"
           },
           {
             "field": "dividend_yield",
@@ -188,8 +188,8 @@
         {
           "field": "peg_ratio",
           "meaning": "P/E divided by expected earnings growth (growth at a reasonable price)",
-          "set_to": "NULL or 0.0 – 2.0",
-          "why": "Prefer growth that is not overpaying; missing PEG data is still allowed"
+          "set_to": "0.0 – 2.0",
+          "why": "Prefer growth that is not overpaying; PEG data is required"
         },
         {
           "field": "analyst_upside",
@@ -200,8 +200,8 @@
         {
           "field": "recommendation_mean",
           "meaning": "Analyst consensus score (1=Strong Buy … 5=Sell)",
-          "set_to": "NULL or ≤ 2.0",
-          "why": "Bias toward Buy / Strong Buy; missing recommendation is allowed"
+          "set_to": "≤ 2.0",
+          "why": "Bias toward Buy / Strong Buy; recommendation data is required"
         },
         {
           "field": "dividend_yield",
@@ -238,13 +238,13 @@
       {
         "id": "no_day_trade",
         "title": "No buy-and-sell the same day",
-        "set_to": "Hold at least 16 hours after purchase",
-        "why": "Avoid PDT / same-day round-trips; covers regular + extended hours buffer"
+        "set_to": "No market sell or broker STOP_LIMIT until the next ET calendar day",
+        "why": "FINRA day trade = same trading day (not 24h). Buy Mon 1pm / sell Tue 8am is fine; stops are deferred so a same-day fill cannot create a round trip"
       },
       {
         "id": "cash_floor",
         "title": "Cash floor",
-        "set_to": "Keep ≥ $15,000 effective cash",
+        "set_to": "config.MINIMUM_CASH (live API fills amount)",
         "why": "No buy may leave cash (minus pending buys) below this floor"
       },
       {
@@ -292,8 +292,8 @@
       {
         "id": "broker_stop",
         "title": "Resting broker STOP_LIMIT",
-        "set_to": "Limit 0.50% below stop · GOOD_TILL_CANCEL",
-        "why": "Protective sell sits at Schwab even if the bot is offline briefly"
+        "set_to": "Arm after next ET day · limit 0.50% below stop · GOOD_TILL_CANCEL",
+        "why": "Protective sell sits at Schwab once past the purchase day; never armed same day so a stop fill cannot create a PDT round trip"
       },
       {
         "id": "sell_cadence",
@@ -314,5 +314,19 @@
         "why": "A runtime pause blocks new buys without changing the rest of the system"
       }
     ]
+  },
+  "schwab": {
+    "available": true,
+    "needs_login": false,
+    "warn": true,
+    "state": "expiring",
+    "refresh_issued_at": "2026-08-03T18:28:49+00:00",
+    "refresh_expires_at": "2026-08-10T18:28:49+00:00",
+    "hours_left": 36.5,
+    "warn_hours": 48,
+    "snooze_hours": 4,
+    "redirect_uri": "https://127.0.0.1",
+    "authorize_url": "https://api.schwabapi.com/v1/oauth/authorize?client_id=mock&redirect_uri=https%3A%2F%2F127.0.0.1",
+    "tokens_db": "~/.schwabdev/tokens.db"
   }
 }

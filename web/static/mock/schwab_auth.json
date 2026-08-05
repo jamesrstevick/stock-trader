@@ -1,0 +1,14 @@
+{
+  "available": true,
+  "needs_login": false,
+  "warn": true,
+  "state": "expiring",
+  "refresh_issued_at": "2026-08-03T18:28:49+00:00",
+  "refresh_expires_at": "2026-08-10T18:28:49+00:00",
+  "hours_left": 36.5,
+  "warn_hours": 48,
+  "snooze_hours": 4,
+  "redirect_uri": "https://127.0.0.1",
+  "authorize_url": "https://api.schwabapi.com/v1/oauth/authorize?client_id=mock&redirect_uri=https%3A%2F%2F127.0.0.1",
+  "tokens_db": "~/.schwabdev/tokens.db"
+}
