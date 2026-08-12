@@ -101,7 +101,7 @@ $tunnelEnabled = -not $NoTunnel
 if ($tunnelEnabled) {
     $cloudflared = Find-Cloudflared
     if (-not $cloudflared) {
-        Write-HostLog 'cloudflared not found — tunnel skipped. Install it or use -NoTunnel.'
+        Write-HostLog 'cloudflared not found  - tunnel skipped. Install it or use -NoTunnel.'
         $tunnelEnabled = $false
     }
 }
@@ -209,7 +209,7 @@ function Note-ChildExit {
     }
     $delay = [Math]::Min(60, [Math]::Pow(2, [Math]::Min(5, [int]$script:crashStreak[$Name])))
     $script:nextStart[$Name] = (Get-Date).AddSeconds($delay)
-    Write-HostLog ("{0} exited (code {1}) — restart in {2}s" -f $Name, $code, $delay)
+    Write-HostLog ("{0} exited (code {1})  - restart in {2}s" -f $Name, $code, $delay)
 }
 
 function Stop-AllChildren {
@@ -288,14 +288,14 @@ function Invoke-HostCommand {
             Invoke-PipInstall
             $shaAfter = (Get-GitSnapshot).sha
             if ($shaAfter -eq $shaBefore) {
-                $message = 'Already up to date ({0}) — restarting processes' -f $shaAfter
+                $message = 'Already up to date ({0})  - restarting processes' -f $shaAfter
             } else {
-                $message = 'Updated {0} → {1} — restarting processes' -f $shaBefore, $shaAfter
+                $message = 'Updated {0} -> {1}  - restarting processes' -f $shaBefore, $shaAfter
             }
             $supHashAfter = $null
             try { $supHashAfter = (Get-FileHash -Path $PSCommandPath -Algorithm SHA256).Hash } catch {}
             if ($supHashBefore -and $supHashAfter -and ($supHashBefore -ne $supHashAfter)) {
-                Write-HostLog 'supervisor.ps1 changed — re-exec after restarting children'
+                Write-HostLog 'supervisor.ps1 changed  - re-exec after restarting children'
                 Restart-AllChildren
                 $script:lastCommand = @{
                     id = [string]$Cmd.id
@@ -366,7 +366,7 @@ try {
         Start-Sleep -Seconds 2
     }
 } finally {
-    Write-HostLog 'Supervisor stopping — killing children'
+    Write-HostLog 'Supervisor stopping  - killing children'
     Stop-AllChildren
     if (Test-Path $StatusPath) {
         Remove-Item $StatusPath -Force -ErrorAction SilentlyContinue
