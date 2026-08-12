@@ -6,8 +6,10 @@ Contains all trading functions organized by category.
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
+import threading
 import pandas as pd
 import yfinance as yf
 import requests
@@ -16,23 +18,41 @@ from datetime import datetime, date, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from typing import List, Dict, Optional, Any, Tuple
 import config
+import user_context as uc
 
-# Schwab API - initialize schwabdev client (non-interactive; no terminal paste on import)
+# Schwab API — per-user clients; module globals mirror the current user context
 SCHWAB_CLIENT = None
 SCHWAB_AVAILABLE = False
 SCHWAB_AUTH_NEEDED = False  # True when browser OAuth paste-back is required
+_SCHWAB_CLIENTS = {}  # type: Dict[int, Any]
+_SCHWAB_AVAILABLE = {}  # type: Dict[int, bool]
+_SCHWAB_AUTH_NEEDED = {}  # type: Dict[int, bool]
 
 
-def _schwab_tokens_db_path() -> str:
-    return os.path.expanduser(
-        getattr(config, 'SCHWAB_TOKENS_DB', '~/.schwabdev/tokens.db')
-    )
+def _uid() -> int:
+    """Current trading / dashboard user id (defaults to first user if unset)."""
+    return uc.require_user_id()
+
+
+def _schwab_tokens_db_path(user_id: Optional[int] = None) -> str:
+    uid = int(user_id) if user_id is not None else _uid()
+    return uc.tokens_db_for_user(uid)
+
+
+def _sync_schwab_globals(user_id: Optional[int] = None) -> None:
+    """Point SCHWAB_* module globals at the given (or current) user."""
+    global SCHWAB_CLIENT, SCHWAB_AVAILABLE, SCHWAB_AUTH_NEEDED
+    uid = int(user_id) if user_id is not None else _uid()
+    SCHWAB_CLIENT = _SCHWAB_CLIENTS.get(uid)
+    SCHWAB_AVAILABLE = bool(_SCHWAB_AVAILABLE.get(uid, False))
+    SCHWAB_AUTH_NEEDED = bool(_SCHWAB_AUTH_NEEDED.get(uid, False))
 
 
 def _schwab_refuse_interactive_auth(auth_url: str) -> str:
     """call_on_auth for headless init — never block on input()."""
-    global SCHWAB_AUTH_NEEDED
-    SCHWAB_AUTH_NEEDED = True
+    uid = _uid()
+    _SCHWAB_AUTH_NEEDED[uid] = True
+    _sync_schwab_globals(uid)
     raise RuntimeError(
         'Schwab interactive login required (use Actions → Schwab reconnect)'
     )
@@ -114,6 +134,8 @@ def maybe_log_schwab_auth_alerts(auth: Optional[Dict[str, Any]] = None) -> None:
     Each keyed to refresh_expires_at so reconnect (new expiry) can alert again later.
     """
     auth = auth or get_schwab_auth_status()
+    if not isinstance(auth, dict):
+        return
     hours = auth.get('hours_left')
     expiry_key = str(auth.get('refresh_expires_at') or 'missing')
 
@@ -177,8 +199,10 @@ def get_schwab_auth_status() -> Dict[str, Any]:
     # Badge / banner / urgent card — clock only (plus never-authenticated)
     warn = bool(token_missing or expired or in_warn_window)
 
+    uid_for_auth = _uid()
+    auth_needed = bool(_SCHWAB_AUTH_NEEDED.get(uid_for_auth, SCHWAB_AUTH_NEEDED))
     # Human login required when refresh is dead / missing (not when Client just needs re-init)
-    needs_login = bool(token_missing or expired or SCHWAB_AUTH_NEEDED)
+    needs_login = bool(token_missing or expired or auth_needed)
     if hours_left is not None and hours_left > 0:
         # Valid refresh on disk: clear sticky needs_login from a prior failed init
         needs_login = False
@@ -190,8 +214,10 @@ def get_schwab_auth_status() -> Dict[str, Any]:
     else:
         state = 'connected'
 
+    uid = _uid()
+    _sync_schwab_globals(uid)
     return {
-        'available': bool(SCHWAB_AVAILABLE),
+        'available': bool(_SCHWAB_AVAILABLE.get(uid, SCHWAB_AVAILABLE)),
         'needs_login': needs_login,
         'warn': warn,
         'state': state,
@@ -202,123 +228,302 @@ def get_schwab_auth_status() -> Dict[str, Any]:
         'snooze_hours': snooze_hours,
         'redirect_uri': redirect,
         'authorize_url': get_schwab_authorize_url(),
-        'tokens_db': _schwab_tokens_db_path(),
+        'tokens_db': _schwab_tokens_db_path(uid),
+        'user_id': uid,
     }
 
 
-def initialize_schwab_client(interactive: bool = False) -> bool:
+def _schwab_tokens_row_present(tokens_path: str) -> bool:
+    """True when tokens_*.db has a schwabdev row (avoid schwabdev empty-DB auth spam)."""
+    if not tokens_path or not os.path.isfile(tokens_path):
+        return False
+    try:
+        conn = sqlite3.connect(tokens_path, timeout=2.0)
+        try:
+            row = conn.execute('SELECT 1 FROM schwabdev LIMIT 1').fetchone()
+        finally:
+            conn.close()
+        return row is not None
+    except Exception:
+        return False
+
+
+def initialize_schwab_client(interactive: bool = False, user_id: Optional[int] = None) -> bool:
     """
-    Initialize or re-initialize the Schwab API client.
+    Initialize or re-initialize the Schwab API client for a user.
     interactive=False (default): refuse browser/input OAuth — set SCHWAB_AUTH_NEEDED.
     interactive=True: allow schwabdev default paste flow (local terminal only).
     """
-    global SCHWAB_CLIENT, SCHWAB_AVAILABLE, SCHWAB_AUTH_NEEDED
-
+    uid = int(user_id) if user_id is not None else _uid()
     try:
         import schwabdev
     except ImportError:
         print("Error: schwabdev library not installed. Install with: pip install schwabdev")
-        SCHWAB_CLIENT = None
-        SCHWAB_AVAILABLE = False
-        SCHWAB_AUTH_NEEDED = True
+        _SCHWAB_CLIENTS[uid] = None
+        _SCHWAB_AVAILABLE[uid] = False
+        _SCHWAB_AUTH_NEEDED[uid] = True
+        _sync_schwab_globals(uid)
         return False
 
     call_on_auth = None if interactive else _schwab_refuse_interactive_auth
+    tokens_path = _schwab_tokens_db_path(uid)
     try:
-        SCHWAB_CLIENT = schwabdev.Client(
-            config.SCHWAB_API_KEY,
-            config.SCHWAB_API_SECRET,
-            config.SCHWAB_REDIRECT_URI,
-            tokens_db=_schwab_tokens_db_path(),
-            call_on_auth=call_on_auth,
-        )
-        SCHWAB_AVAILABLE = True
-        SCHWAB_AUTH_NEEDED = False
-        print("Schwab API client initialized successfully.")
-        return True
-    except Exception as e:
-        SCHWAB_CLIENT = None
-        SCHWAB_AVAILABLE = False
-        msg = str(e).lower()
-        # Only mark login needed for real interactive-OAuth failures (not every "auth" substring)
-        if 'interactive login required' in msg:
-            SCHWAB_AUTH_NEEDED = True
-        print(f"Warning: Could not initialize Schwab client: {e}")
+        os.makedirs(os.path.dirname(tokens_path) or '.', exist_ok=True)
+    except Exception:
+        pass
+    # Headless: do not construct Client on an empty token DB — schwabdev prints
+    # "Could not load tokens" / "refresh token has expired" and starts auth noise.
+    if not interactive and not _schwab_tokens_row_present(tokens_path):
+        _SCHWAB_CLIENTS[uid] = None
+        _SCHWAB_AVAILABLE[uid] = False
+        _SCHWAB_AUTH_NEEDED[uid] = True
+        _sync_schwab_globals(uid)
+        try:
+            uname = None
+            for u in uc.list_active_users():
+                if int(u['id']) == uid:
+                    uname = u.get('username') or str(uid)
+                    break
+            print_loop_status(
+                'No Schwab tokens for %s — reconnect in dashboard'
+                % (uname or ('user %s' % uid))
+            )
+        except Exception:
+            pass
         return False
-
-
-def complete_schwab_oauth(callback_url: str) -> Dict[str, Any]:
-    """
-    Exchange a pasted Schwab redirect URL (…?code=…) for tokens and re-init the client.
-    Forces a new refresh token even if one is still valid (early reconnect).
-    """
-    global SCHWAB_CLIENT, SCHWAB_AVAILABLE, SCHWAB_AUTH_NEEDED
-
-    raw = (callback_url or '').strip()
-    if not raw:
-        return {'ok': False, 'error': 'callback_url required'}
-
-    redirect = getattr(config, 'SCHWAB_REDIRECT_URI', 'https://127.0.0.1') or 'https://127.0.0.1'
-    import urllib.parse
-    parsed = urllib.parse.urlparse(raw)
-    if parsed.scheme:
-        # Full redirect URL
-        if not raw.lower().startswith(redirect.lower()):
-            return {
-                'ok': False,
-                'error': (
-                    'Callback URL must start with configured redirect URI '
-                    '(%s)' % redirect
-                ),
-            }
-        code = urllib.parse.parse_qs(parsed.query).get('code', [None])[0]
-        if not code:
-            return {'ok': False, 'error': 'No code= parameter in callback URL'}
-    else:
-        # Bare authorization code
-        code = urllib.parse.unquote(raw)
-        if len(code) < 10:
-            return {'ok': False, 'error': 'Paste the full redirect URL including code='}
-
-    try:
-        import schwabdev
-    except ImportError:
-        return {'ok': False, 'error': 'schwabdev not installed'}
-
-    provided = {'url': raw}
-    consumed = {'done': False}
-
-    def _provide_callback(auth_url: str) -> str:
-        # One-shot: auth code is single-use (~30s TTL)
-        if consumed['done']:
-            raise RuntimeError('Authorization code already used')
-        consumed['done'] = True
-        return provided['url']
-
     try:
         client = schwabdev.Client(
             config.SCHWAB_API_KEY,
             config.SCHWAB_API_SECRET,
             config.SCHWAB_REDIRECT_URI,
-            tokens_db=_schwab_tokens_db_path(),
-            call_on_auth=_provide_callback,
+            tokens_db=tokens_path,
+            call_on_auth=call_on_auth,
         )
-        # Early reconnect: force a new refresh token if init did not already run OAuth
-        # (init only prompts when tokens are missing / refresh nearly expired).
-        if not consumed['done']:
-            client.tokens.update_tokens(force_refresh_token=True)
-        if not client.tokens.access_token or not client.tokens.refresh_token:
+        _SCHWAB_CLIENTS[uid] = client
+        _SCHWAB_AVAILABLE[uid] = True
+        _SCHWAB_AUTH_NEEDED[uid] = False
+        _sync_schwab_globals(uid)
+        print("Schwab API client initialized for user_id=%s." % uid)
+        return True
+    except Exception as e:
+        _SCHWAB_CLIENTS[uid] = None
+        _SCHWAB_AVAILABLE[uid] = False
+        msg = str(e).lower()
+        if 'interactive login required' in msg:
+            _SCHWAB_AUTH_NEEDED[uid] = True
+        _sync_schwab_globals(uid)
+        print(f"Warning: Could not initialize Schwab client: {e}")
+        return False
+
+
+def _parse_schwab_oauth_callback(callback_url: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Parse pasted redirect URL or raw code.
+    Returns (code, error). error is set when parsing fails.
+    """
+    import urllib.parse
+    raw = (callback_url or '').strip()
+    if not raw:
+        return None, 'callback_url required'
+    redirect = getattr(config, 'SCHWAB_REDIRECT_URI', 'https://127.0.0.1') or 'https://127.0.0.1'
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme:
+        if not raw.lower().startswith(redirect.lower()):
+            return None, (
+                'Callback URL must start with configured redirect URI (%s)' % redirect
+            )
+        code = urllib.parse.parse_qs(parsed.query).get('code', [None])[0]
+        if not code:
+            return None, 'No code= parameter in callback URL'
+        return code, None
+    code = urllib.parse.unquote(raw)
+    if len(code) < 10:
+        return None, 'Paste the full redirect URL including code='
+    return code, None
+
+
+def _exchange_schwab_authorization_code(code: str) -> Dict[str, Any]:
+    """
+    Exchange a one-time OAuth authorization code for access/refresh tokens.
+    Raises RuntimeError with a user-facing message on failure.
+    """
+    import base64
+    import urllib.parse
+    # Schwab sometimes returns the code still percent-encoded in odd pastes
+    code = urllib.parse.unquote(str(code or '').strip())
+    if not code:
+        raise RuntimeError('Missing authorization code')
+    redirect = getattr(config, 'SCHWAB_REDIRECT_URI', 'https://127.0.0.1') or 'https://127.0.0.1'
+    headers = {
+        'Authorization': 'Basic '
+        + base64.b64encode(
+            ('%s:%s' % (config.SCHWAB_API_KEY, config.SCHWAB_API_SECRET)).encode('utf-8')
+        ).decode('utf-8'),
+        'Content-Type': 'application/x-www-form-urlencoded',
+    }
+    data = {
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': redirect,
+    }
+    try:
+        resp = requests.post(
+            'https://api.schwabapi.com/v1/oauth/token',
+            headers=headers,
+            data=data,
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        raise RuntimeError('Network error talking to Schwab: %s' % e)
+    if not resp.ok:
+        body = (resp.text or '').lower()
+        if 'invalid_grant' in body or 'expired' in body or 'revoked' in body:
+            raise RuntimeError(
+                'Authorization code invalid or expired (~30s). '
+                'Open Schwab login again and paste the full address-bar URL quickly.'
+            )
+        raise RuntimeError(
+            'Schwab token exchange failed (HTTP %s). Check app key/secret and try again.'
+            % resp.status_code
+        )
+    try:
+        payload = resp.json()
+    except Exception:
+        raise RuntimeError('Schwab token response was not JSON')
+    if not isinstance(payload, dict):
+        raise RuntimeError('Schwab token response was not an object')
+    if not payload.get('access_token') or not payload.get('refresh_token'):
+        raise RuntimeError('Schwab token response missing access_token/refresh_token')
+    return payload
+
+
+def _persist_schwab_token_response(tokens_path: str, token_dictionary: Dict[str, Any]) -> None:
+    """Write schwabdev-compatible tokens.db row from an OAuth token JSON payload."""
+    now = datetime.now(timezone.utc)
+    access = str(token_dictionary.get('access_token') or '')
+    refresh = str(token_dictionary.get('refresh_token') or '')
+    id_token = str(token_dictionary.get('id_token') or '')
+    expires_in = int(token_dictionary.get('expires_in') or 1800)
+    token_type = str(token_dictionary.get('token_type') or 'Bearer')
+    scope = str(token_dictionary.get('scope') or 'api')
+    try:
+        os.makedirs(os.path.dirname(tokens_path) or '.', exist_ok=True)
+    except Exception:
+        pass
+    conn = sqlite3.connect(tokens_path, timeout=30)
+    try:
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS schwabdev (
+                access_token_issued TEXT NOT NULL,
+                refresh_token_issued TEXT NOT NULL,
+                access_token TEXT NOT NULL,
+                refresh_token TEXT NOT NULL,
+                id_token TEXT NOT NULL,
+                expires_in INTEGER,
+                token_type TEXT,
+                scope TEXT
+            )
+            '''
+        )
+        conn.execute('DELETE FROM schwabdev')
+        conn.execute(
+            '''
+            INSERT INTO schwabdev (
+                access_token_issued, refresh_token_issued,
+                access_token, refresh_token, id_token,
+                expires_in, token_type, scope
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                now.isoformat(),
+                now.isoformat(),
+                access,
+                refresh,
+                id_token,
+                expires_in,
+                token_type,
+                scope,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def complete_schwab_oauth(
+    callback_url: str,
+    user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Exchange a pasted Schwab redirect URL (…?code=…) for tokens and re-init the client.
+    Forces a new refresh token even if one is still valid (early reconnect).
+    Tokens are written to the current (or given) user's token DB only.
+
+    Exchanges the code ourselves first — schwabdev 3.x crashes with
+    "'bool' object has no attribute 'get'" when the code is expired/invalid.
+    """
+    uid = int(user_id) if user_id is not None else _uid()
+    with uc.use_user(uid):
+        code, parse_err = _parse_schwab_oauth_callback(callback_url)
+        if parse_err:
+            return {'ok': False, 'error': parse_err}
+
+        tokens_path = _schwab_tokens_db_path(uid)
+        try:
+            token_payload = _exchange_schwab_authorization_code(code)
+            _persist_schwab_token_response(tokens_path, token_payload)
+        except Exception as e:
+            _SCHWAB_CLIENTS[uid] = None
+            _SCHWAB_AVAILABLE[uid] = False
+            _SCHWAB_AUTH_NEEDED[uid] = True
+            _sync_schwab_globals(uid)
+            err = str(e)
+            # schwabdev legacy path (if still hit elsewhere)
+            if (
+                "has no attribute 'get'" in err
+                or ("bool" in err and "get" in err)
+            ):
+                err = (
+                    'Authorization code invalid or expired (~30s). '
+                    'Open Schwab login again and paste the full address-bar URL quickly.'
+                )
+            return {'ok': False, 'error': err}
+
+        # Load Client from the fresh tokens.db (no interactive auth callback)
+        if not initialize_schwab_client(interactive=False, user_id=uid):
+            _SCHWAB_AUTH_NEEDED[uid] = True
+            _sync_schwab_globals(uid)
             return {
                 'ok': False,
                 'error': (
-                    'Token exchange failed — code may have expired (~30s). '
-                    'Open Schwab login again and paste quickly.'
+                    'Tokens saved but client failed to initialize — '
+                    'restart the dashboard / trader loop and try again.'
                 ),
             }
-        SCHWAB_CLIENT = client
-        SCHWAB_AVAILABLE = True
-        SCHWAB_AUTH_NEEDED = False
         status = get_schwab_auth_status()
+        if not isinstance(status, dict):
+            status = {}
+        # Return to the browser first in spirit: never let logging/flags block the
+        # HTTP response when market_data.db is locked by main.py --loop.
+        account_snap = None
+        try:
+            acct = get_account_info() or {}
+            if account_info_usable(acct):
+                account_snap = {
+                    'cash': float(acct.get('cash') or 0.0),
+                    'liquidation_value': float(acct.get('liquidation_value') or 0.0),
+                }
+        except Exception:
+            account_snap = None
+        result = {
+            'ok': True,
+            'schwab': status,
+            'message': 'Connected — refresh token renewed (~7 days)',
+            'account': account_snap,
+            'bounds': compute_setup_bounds(account_snap) if account_snap else None,
+            'onboarding_stage': get_onboarding_stage(),
+        }
         try:
             log_event(
                 'web',
@@ -328,53 +533,114 @@ def complete_schwab_oauth(callback_url: str) -> Dict[str, Any]:
                     'hours_left': status.get('hours_left'),
                 },
             )
-            # Allow future warn/issue logs for the new expiry window
-            try:
-                set_runtime_flag('schwab_auth_warn_logged_for', '')
-                set_runtime_flag('schwab_auth_issue_logged_for', '')
-            except Exception:
-                pass
         except Exception:
             pass
-        return {
-            'ok': True,
-            'schwab': status,
-            'message': 'Connected — refresh token renewed (~7 days)',
-        }
-    except Exception as e:
-        SCHWAB_CLIENT = None
-        SCHWAB_AVAILABLE = False
-        SCHWAB_AUTH_NEEDED = True
-        err = str(e)
-        # Do not echo authorization codes
-        if 'code=' in err.lower():
-            err = 'Token exchange failed — open Schwab login again and paste quickly.'
-        return {'ok': False, 'error': err}
+        try:
+            set_runtime_flag(
+                'schwab_auth_warn_logged_for', '',
+                timeout=1.0, busy_timeout_ms=500, retries=1,
+            )
+            set_runtime_flag(
+                'schwab_auth_issue_logged_for', '',
+                timeout=1.0, busy_timeout_ms=500, retries=1,
+            )
+        except Exception:
+            pass
+        return result
 
 
-def maybe_reinit_schwab_client() -> bool:
-    """If Schwab is down, try a non-interactive re-init (e.g. after dashboard OAuth)."""
-    if SCHWAB_AVAILABLE and SCHWAB_CLIENT is not None:
+def maybe_reinit_schwab_client(user_id: Optional[int] = None) -> bool:
+    """If Schwab is down for this user, try a non-interactive re-init."""
+    uid = int(user_id) if user_id is not None else _uid()
+    if _SCHWAB_AVAILABLE.get(uid) and _SCHWAB_CLIENTS.get(uid) is not None:
+        _sync_schwab_globals(uid)
         return True
-    return initialize_schwab_client(interactive=False)
-
-
-try:
-    import schwabdev  # noqa: F401 — availability check
-    initialize_schwab_client(interactive=False)
-except ImportError:
-    print("Warning: schwabdev library not installed. Install with: pip install schwabdev")
-    SCHWAB_AVAILABLE = False
-    SCHWAB_AUTH_NEEDED = True
+    return initialize_schwab_client(interactive=False, user_id=uid)
 
 
 # ============================================================================
 # Database Functions
 # ============================================================================
 
-def init_database():
-    """Create database tables if they don't exist."""
-    conn = sqlite3.connect(config.DATABASE_PATH)
+_DATABASE_READY = False
+_DB_INIT_LOCK = threading.Lock()
+
+
+def mark_database_ready_if_present() -> bool:
+    """
+    If market_data.db already has core tables, mark init complete without DDL.
+    Used when full init_database cannot get a write lock (trader loop busy).
+    """
+    global _DATABASE_READY
+    if _DATABASE_READY:
+        return True
+    try:
+        conn = sqlite3.connect(config.DATABASE_PATH, timeout=1.0)
+        try:
+            uc.configure_connection(conn, busy_timeout_ms=1000)
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='positions'"
+            ).fetchone()
+        finally:
+            conn.close()
+        if row:
+            _DATABASE_READY = True
+            print(
+                'Database already present at %s (skipped locked full init)'
+                % config.DATABASE_PATH
+            )
+            try:
+                _ensure_fundamentals_side_db()
+            except Exception as e2:
+                print('Warning: fundamentals side DB setup: %s' % e2)
+            return True
+    except Exception as e:
+        print('Warning: mark_database_ready_if_present: %s' % e)
+    return False
+
+
+def init_database(
+    timeout: float = 60.0,
+    busy_timeout_ms: int = 60000,
+    init_schwab: bool = True,
+):
+    """Create database tables if they don't exist (once per process)."""
+    global _DATABASE_READY
+    if _DATABASE_READY:
+        return
+    with _DB_INIT_LOCK:
+        if _DATABASE_READY:
+            return
+        try:
+            _init_database_unlocked(
+                timeout=timeout,
+                busy_timeout_ms=busy_timeout_ms,
+                init_schwab=init_schwab,
+            )
+        except sqlite3.OperationalError as e:
+            if 'locked' in str(e).lower() and mark_database_ready_if_present():
+                if init_schwab:
+                    try:
+                        _ensure_schwab_initialized_once()
+                    except Exception as e2:
+                        print('Warning: Schwab client init: %s' % e2)
+                return
+            raise
+
+
+def _init_database_unlocked(
+    timeout: float = 60.0,
+    busy_timeout_ms: int = 60000,
+    init_schwab: bool = True,
+):
+    """Inner init — caller must hold _DB_INIT_LOCK and check _DATABASE_READY."""
+    global _DATABASE_READY
+    conn = sqlite3.connect(config.DATABASE_PATH, timeout=float(timeout))
+    uc.configure_connection(conn, busy_timeout_ms=int(busy_timeout_ms))
+    try:
+        conn.execute('PRAGMA busy_timeout=%d' % int(busy_timeout_ms))
+    except Exception:
+        pass
     cursor = conn.cursor()
     
     # Create fundamentals table (1 row per stock)
@@ -529,58 +795,59 @@ def init_database():
         'last_updated': 'TEXT'
     }
     
-    # Dynamically discover additional numeric fields from yfinance
+    # Dynamically discover additional numeric fields from yfinance (skip if schema rich)
     try:
-        sample_stock = yf.Ticker('AAPL')
-        sample_info = sample_stock.info
-        if sample_info:
-            def camel_to_snake(name):
-                import re
-                # Handle names starting with numbers (e.g., "52WeekChange" -> "week_52_change")
-                if name and name[0].isdigit():
-                    match = re.match(r'^(\d+)([A-Z].*)', name)
-                    if match:
-                        number_part = match.group(1)
-                        rest = match.group(2)
-                        # Convert rest to snake_case and append number
-                        s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', rest)
-                        s2 = re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
-                        return f'week_{number_part}_{s2}' if 'week' in s2.lower() else f'{s2}_{number_part}'
-                # Normal camelCase conversion
-                s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
-                return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
-            
-            # Fields we've already captured
-            captured_fields = {
-                'trailingPE', 'marketCap', 'sector', 'averageVolume', 'beta', 'shortPercentOfFloat',
-                'currentPrice', 'targetMeanPrice', 'forwardPE', 'pegRatio', 'priceToBook',
-                'priceToSalesTrailing12Months', 'enterpriseToRevenue', 'enterpriseToEbitda',
-                'debtToEquity', 'currentRatio', 'quickRatio', 'totalCash', 'totalDebt',
-                'totalRevenue', 'grossProfits', 'freeCashflow', 'operatingCashflow',
-                'revenueGrowth', 'earningsGrowth', 'earningsQuarterlyGrowth', 'profitMargins',
-                'grossMargins', 'operatingMargins', 'dividendRate', 'dividendYield',
-                'previousClose', 'fiftyTwoWeekHigh', '52WeekHigh', 'fiftyTwoWeekLow', '52WeekLow',
-                'fiftyTwoWeekChange', '52WeekChange',  # 52-week change
-                'fullTimeEmployees', 'heldPercentInstitutions', 'fiftyDayAverage',
-                'twoHundredDayAverage', 'recommendationMean', 'numberOfAnalystOpinions',
-                'targetHighPrice', 'targetLowPrice', 'sharesOutstanding', 'floatShares',
-                'sharesShort', 'shortRatio', 'bookValue', 'enterpriseValue', 'ebitda',
-                'returnOnAssets', 'returnOnEquity', 'payoutRatio', 'averageVolume10days',
-                'heldPercentInsiders'
-            }
-            
-            # Add any other numeric fields
-            for key, value in sample_info.items():
-                if key not in captured_fields:
-                    if isinstance(value, (int, float)) and value is not None:
-                        snake_key = camel_to_snake(key)
-                        # Ensure column name doesn't start with a number (SQL requirement)
-                        if snake_key and snake_key[0].isdigit():
-                            snake_key = 'field_' + snake_key
-                        # Determine type (INTEGER for int, REAL for float)
-                        col_type = 'INTEGER' if isinstance(value, int) else 'REAL'
-                        if snake_key not in required_columns:
-                            required_columns[snake_key] = col_type
+        if len(existing_columns) < 40:
+            sample_stock = yf.Ticker('AAPL')
+            sample_info = sample_stock.info
+            if sample_info:
+                def camel_to_snake(name):
+                    import re
+                    # Handle names starting with numbers (e.g., "52WeekChange" -> "week_52_change")
+                    if name and name[0].isdigit():
+                        match = re.match(r'^(\d+)([A-Z].*)', name)
+                        if match:
+                            number_part = match.group(1)
+                            rest = match.group(2)
+                            # Convert rest to snake_case and append number
+                            s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', rest)
+                            s2 = re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+                            return f'week_{number_part}_{s2}' if 'week' in s2.lower() else f'{s2}_{number_part}'
+                    # Normal camelCase conversion
+                    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+                    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+                
+                # Fields we've already captured
+                captured_fields = {
+                    'trailingPE', 'marketCap', 'sector', 'averageVolume', 'beta', 'shortPercentOfFloat',
+                    'currentPrice', 'targetMeanPrice', 'forwardPE', 'pegRatio', 'priceToBook',
+                    'priceToSalesTrailing12Months', 'enterpriseToRevenue', 'enterpriseToEbitda',
+                    'debtToEquity', 'currentRatio', 'quickRatio', 'totalCash', 'totalDebt',
+                    'totalRevenue', 'grossProfits', 'freeCashflow', 'operatingCashflow',
+                    'revenueGrowth', 'earningsGrowth', 'earningsQuarterlyGrowth', 'profitMargins',
+                    'grossMargins', 'operatingMargins', 'dividendRate', 'dividendYield',
+                    'previousClose', 'fiftyTwoWeekHigh', '52WeekHigh', 'fiftyTwoWeekLow', '52WeekLow',
+                    'fiftyTwoWeekChange', '52WeekChange',  # 52-week change
+                    'fullTimeEmployees', 'heldPercentInstitutions', 'fiftyDayAverage',
+                    'twoHundredDayAverage', 'recommendationMean', 'numberOfAnalystOpinions',
+                    'targetHighPrice', 'targetLowPrice', 'sharesOutstanding', 'floatShares',
+                    'sharesShort', 'shortRatio', 'bookValue', 'enterpriseValue', 'ebitda',
+                    'returnOnAssets', 'returnOnEquity', 'payoutRatio', 'averageVolume10days',
+                    'heldPercentInsiders'
+                }
+                
+                # Add any other numeric fields
+                for key, value in sample_info.items():
+                    if key not in captured_fields:
+                        if isinstance(value, (int, float)) and value is not None:
+                            snake_key = camel_to_snake(key)
+                            # Ensure column name doesn't start with a number (SQL requirement)
+                            if snake_key and snake_key[0].isdigit():
+                                snake_key = 'field_' + snake_key
+                            # Determine type (INTEGER for int, REAL for float)
+                            col_type = 'INTEGER' if isinstance(value, int) else 'REAL'
+                            if snake_key not in required_columns:
+                                required_columns[snake_key] = col_type
     except Exception as e:
         print(f"Warning: Could not discover additional fields from yfinance: {e}")
     
@@ -909,10 +1176,54 @@ def init_database():
         )
     ''')
     _ensure_column(cursor, 'position_book', 'origin', 'TEXT')
-    
+
+    # Multi-user: auth tables, user_id columns, migrate legacy rows → owner (jame)
+    # Commit first so migration/bootstrap nested connections do not self-deadlock.
     conn.commit()
-    conn.close()
+    try:
+        from multi_user_migrate import run_multi_user_migration
+        run_multi_user_migration(conn)
+    except Exception as e:
+        print('Warning: multi-user migration: %s' % e)
+        try:
+            conn.commit()
+        except Exception:
+            pass
+
+    try:
+        conn.commit()
+    except Exception:
+        pass
+    try:
+        conn.close()
+    except Exception:
+        pass
+    try:
+        _ensure_fundamentals_side_db()
+    except Exception as e:
+        print('Warning: fundamentals side DB setup: %s' % e)
+    _DATABASE_READY = True
     print(f"Database initialized at {config.DATABASE_PATH}")
+    print('Fundamentals DB: %s' % fundamentals_db_path())
+    if init_schwab:
+        _ensure_schwab_initialized_once()
+
+
+_SCHWAB_BOOTSTRAPPED = False
+
+
+def _ensure_schwab_initialized_once() -> None:
+    global _SCHWAB_BOOTSTRAPPED
+    if _SCHWAB_BOOTSTRAPPED:
+        return
+    _SCHWAB_BOOTSTRAPPED = True
+    try:
+        import schwabdev  # noqa: F401
+        initialize_schwab_client(interactive=False)
+    except ImportError:
+        print("Warning: schwabdev library not installed. Install with: pip install schwabdev")
+    except Exception as e:
+        print("Warning: Schwab client init: %s" % e)
 
 
 def _ensure_column(cursor, table: str, column: str, decl: str) -> None:
@@ -923,9 +1234,245 @@ def _ensure_column(cursor, table: str, column: str, decl: str) -> None:
         cursor.execute('ALTER TABLE %s ADD COLUMN %s %s' % (table, column, decl))
 
 
-def get_connection():
-    """Return a database connection."""
-    return sqlite3.connect(config.DATABASE_PATH)
+def get_connection(timeout: float = 60.0, busy_timeout_ms: int = 60000):
+    """Return a database connection (auto-scopes per-user tables to current user)."""
+    import sql_user_scope
+    return sql_user_scope.connect(
+        config.DATABASE_PATH,
+        timeout=timeout,
+        busy_timeout_ms=busy_timeout_ms,
+    )
+
+
+def fundamentals_db_path() -> str:
+    """Path to the Yahoo fundamentals side database."""
+    override = getattr(config, 'FUNDAMENTALS_DATABASE_PATH', None)
+    if override:
+        return str(override)
+    main = os.path.abspath(getattr(config, 'DATABASE_PATH', 'market_data.db'))
+    root, ext = os.path.splitext(main)
+    if root.endswith('market_data'):
+        return root[: -len('market_data')] + 'market_fundamentals' + (ext or '.db')
+    return root + '_fundamentals' + (ext or '.db')
+
+
+def get_fundamentals_connection(
+    timeout: float = 60.0,
+    busy_timeout_ms: int = 60000,
+) -> sqlite3.Connection:
+    """Connection to Yahoo fundamentals DB (shared, not user-scoped)."""
+    path = fundamentals_db_path()
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent)
+    conn = sqlite3.connect(path, timeout=float(timeout))
+    uc.configure_connection(conn, busy_timeout_ms=int(busy_timeout_ms))
+    return conn
+
+
+def _db_is_locked(exc: BaseException) -> bool:
+    """True when SQLite is contending with another writer (expected under --loop)."""
+    return 'locked' in str(exc).lower()
+
+
+_LOOP_LOCK_FP = None  # type: Optional[Any]
+
+
+def trader_loop_lock_path() -> str:
+    """Path for the exclusive --loop lock file (next to market_data.db)."""
+    main = os.path.abspath(getattr(config, 'DATABASE_PATH', 'market_data.db'))
+    return os.path.join(os.path.dirname(main) or '.', 'trader_loop.lock')
+
+
+def acquire_trader_loop_lock() -> bool:
+    """
+    Ensure only one python main.py --loop runs at a time.
+    Keeps the lock file open for the process lifetime.
+    """
+    global _LOOP_LOCK_FP
+    if _LOOP_LOCK_FP is not None:
+        return True
+    path = trader_loop_lock_path()
+    parent = os.path.dirname(path)
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent)
+    fp = open(path, 'a+')
+    try:
+        fp.seek(0)
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError, OverflowError):
+        try:
+            existing = fp.read().strip()
+        except Exception:
+            existing = ''
+        fp.close()
+        print_loop_status(
+            'Another trader loop is already running%s — exit'
+            % ((' (pid %s)' % existing) if existing else '')
+        )
+        return False
+    try:
+        fp.seek(0)
+        fp.truncate()
+        fp.write(str(os.getpid()))
+        fp.flush()
+    except Exception:
+        pass
+    _LOOP_LOCK_FP = fp
+
+    def _release():
+        global _LOOP_LOCK_FP
+        f = _LOOP_LOCK_FP
+        _LOOP_LOCK_FP = None
+        if not f:
+            return
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            f.close()
+        except Exception:
+            pass
+
+    import atexit
+    atexit.register(_release)
+    return True
+
+
+# When a due job fails (lock / transient), pull the next loop wake forward.
+_EARLY_WAKE_AT = None  # type: Optional[datetime]
+
+
+def request_early_wake(seconds: Optional[float] = None, reason: str = '') -> None:
+    """Ask run_trader to wake sooner than the normal next-due schedule."""
+    global _EARLY_WAKE_AT
+    if seconds is None:
+        seconds = float(getattr(config, 'JOB_RETRY_SOON_SECONDS', 30))
+    at = datetime.now() + timedelta(seconds=max(5.0, float(seconds)))
+    if _EARLY_WAKE_AT is None or at < _EARLY_WAKE_AT:
+        _EARLY_WAKE_AT = at
+    if reason:
+        print_loop_status('Retry soon (%.0fs): %s' % (float(seconds), reason))
+
+
+def take_early_wake(next_wake: Optional[datetime]) -> Optional[datetime]:
+    """Merge any requested early wake into next_wake; clear the request."""
+    global _EARLY_WAKE_AT
+    early = _EARLY_WAKE_AT
+    _EARLY_WAKE_AT = None
+    if early is None:
+        return next_wake
+    if next_wake is None or early < next_wake:
+        return early
+    return next_wake
+
+
+def _ensure_fundamentals_side_db() -> None:
+    """
+    Create market_fundamentals.db and one-time copy rows from legacy
+    market_data.fundamentals when the side DB is empty.
+    """
+    fund_path = os.path.abspath(fundamentals_db_path())
+    main_path = os.path.abspath(config.DATABASE_PATH)
+    parent = os.path.dirname(fund_path)
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent)
+
+    if not os.path.isfile(main_path):
+        # Brand-new install: create empty fundamentals schema on the side DB.
+        fconn = get_fundamentals_connection()
+        try:
+            fconn.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS fundamentals (
+                    ticker TEXT PRIMARY KEY,
+                    pe_ratio REAL,
+                    market_cap INTEGER,
+                    sector TEXT,
+                    avg_volume INTEGER,
+                    beta REAL,
+                    short_float REAL,
+                    current_price REAL,
+                    target_price REAL,
+                    last_updated TEXT
+                )
+                '''
+            )
+            fconn.commit()
+        finally:
+            fconn.close()
+        return
+
+    conn = sqlite3.connect(main_path, timeout=120.0)
+    try:
+        uc.configure_connection(conn, busy_timeout_ms=120000)
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='fundamentals'"
+        ).fetchone()
+        if not row or not row[0]:
+            return
+        conn.execute('ATTACH DATABASE ? AS funddb', (fund_path,))
+        create_sql = re.sub(
+            r'CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?["\']?fundamentals["\']?',
+            'CREATE TABLE IF NOT EXISTS funddb.fundamentals',
+            str(row[0]),
+            count=1,
+            flags=re.I,
+        )
+        conn.execute(create_sql)
+        main_cols = list(conn.execute('PRAGMA table_info(fundamentals)'))
+        fund_cols = {
+            r[1] for r in conn.execute('PRAGMA funddb.table_info(fundamentals)')
+        }
+        for r in main_cols:
+            name, decl = r[1], r[2]
+            if name not in fund_cols:
+                try:
+                    conn.execute(
+                        'ALTER TABLE funddb.fundamentals ADD COLUMN %s %s'
+                        % (name, decl or 'TEXT')
+                    )
+                except sqlite3.OperationalError:
+                    pass
+        fund_n = int(
+            conn.execute('SELECT COUNT(*) FROM funddb.fundamentals').fetchone()[0]
+            or 0
+        )
+        if fund_n == 0:
+            main_n = int(
+                conn.execute('SELECT COUNT(*) FROM main.fundamentals').fetchone()[0]
+                or 0
+            )
+            if main_n > 0:
+                col_names = [r[1] for r in main_cols]
+                cols = ', '.join(col_names)
+                conn.execute(
+                    'INSERT INTO funddb.fundamentals (%s) SELECT %s FROM main.fundamentals'
+                    % (cols, cols)
+                )
+                print(
+                    'Migrated %d fundamentals row(s) -> %s'
+                    % (main_n, fund_path)
+                )
+        conn.commit()
+        try:
+            conn.execute('DETACH DATABASE funddb')
+        except Exception:
+            pass
+    finally:
+        conn.close()
 
 
 # ============================================================================
@@ -933,20 +1480,24 @@ def get_connection():
 # ============================================================================
 
 _FILE_LOGGING_READY = False
+# When True, stdout still goes to the log file but not the terminal (loop mode).
+_CONSOLE_QUIET = False
 
 
 class _TeeStream(object):
     """Write to the original stream and a log file."""
 
-    def __init__(self, primary, log_file):
+    def __init__(self, primary, log_file, respect_quiet=False):
         self._primary = primary
         self._log_file = log_file
+        self._respect_quiet = bool(respect_quiet)
 
     def write(self, data):
-        try:
-            self._primary.write(data)
-        except Exception:
-            pass
+        if not (self._respect_quiet and _CONSOLE_QUIET):
+            try:
+                self._primary.write(data)
+            except Exception:
+                pass
         try:
             self._log_file.write(data)
             self._log_file.flush()
@@ -969,6 +1520,38 @@ class _TeeStream(object):
             return self._primary.isatty()
         except Exception:
             return False
+
+
+def set_console_quiet(quiet: bool = True) -> None:
+    """Mute verbose terminal stdout (log file still receives everything)."""
+    global _CONSOLE_QUIET
+    _CONSOLE_QUIET = bool(quiet)
+
+
+def print_loop_status(msg: str) -> None:
+    """
+    Short progress line that always reaches the terminal, even in quiet mode.
+    Also appended to the log file / tee.
+    """
+    text = str(msg)
+    if not text.endswith('\n'):
+        text = text + '\n'
+    # Bypass quiet tee for the live console
+    try:
+        out = getattr(sys, '__stdout__', None) or sys.stdout
+        if isinstance(out, _TeeStream):
+            out = out._primary
+        out.write(text)
+        out.flush()
+    except Exception:
+        pass
+    # Ensure log file gets it when stdout is teed + quiet
+    try:
+        if isinstance(sys.stdout, _TeeStream):
+            sys.stdout._log_file.write(text)
+            sys.stdout._log_file.flush()
+    except Exception:
+        pass
 
 
 def setup_file_logging(log_path: Optional[str] = None) -> str:
@@ -997,12 +1580,13 @@ def setup_file_logging(log_path: Optional[str] = None) -> str:
         handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
         logger.addHandler(handler)
 
-    # Tee print() output (open in append mode; RotatingFileHandler also writes)
+    # Tee print() output (open in append mode; RotatingFileHandler also writes).
+    # stdout respects console-quiet; stderr always shows (crashes / tracebacks).
     tee_fp = open(log_path, 'a', encoding='utf-8')
     if not isinstance(sys.stdout, _TeeStream):
-        sys.stdout = _TeeStream(sys.stdout, tee_fp)
+        sys.stdout = _TeeStream(sys.stdout, tee_fp, respect_quiet=True)
     if not isinstance(sys.stderr, _TeeStream):
-        sys.stderr = _TeeStream(sys.stderr, tee_fp)
+        sys.stderr = _TeeStream(sys.stderr, tee_fp, respect_quiet=False)
 
     _FILE_LOGGING_READY = True
     return log_path
@@ -1053,42 +1637,39 @@ def log_event(
     detail_json = json.dumps(detail_out) if detail_out else (
         json.dumps(detail) if detail is not None else None
     )
-    try:
-        conn = get_connection()
+    # Prefer in-context user only — never call require_user_id() here (DB lookup
+    # can block web_app startup for ~60s while the trader loop holds a write lock).
+    uid = uc.current_user_id()
+
+    def _insert(conn):
         cursor = conn.cursor()
-        cursor.execute(
-            '''
-            INSERT INTO event_log (ts, level, category, message, detail_json)
-            VALUES (?, ?, ?, ?, ?)
-            ''',
-            (ts, lvl, cat, message, detail_json)
-        )
+        try:
+            cursor.execute(
+                '''
+                INSERT INTO event_log (ts, level, category, message, detail_json, user_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''',
+                (ts, lvl, cat, message, detail_json, uid),
+            )
+        except sqlite3.OperationalError:
+            cursor.execute(
+                '''
+                INSERT INTO event_log (ts, level, category, message, detail_json)
+                VALUES (?, ?, ?, ?, ?)
+                ''',
+                (ts, lvl, cat, message, detail_json),
+            )
+
+    try:
+        # Fail fast when the trader loop holds the DB; console/file still get the line.
+        conn = get_connection(timeout=2.0, busy_timeout_ms=2000)
+        _insert(conn)
         conn.commit()
         conn.close()
         try:
             bump_dashboard_rev()
         except Exception:
             pass
-    except sqlite3.OperationalError:
-        try:
-            init_database()
-            conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                '''
-                INSERT INTO event_log (ts, level, category, message, detail_json)
-                VALUES (?, ?, ?, ?, ?)
-                ''',
-                (ts, lvl, cat, message, detail_json)
-            )
-            conn.commit()
-            conn.close()
-            try:
-                bump_dashboard_rev()
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"(event_log write failed: {e})")
     except Exception as e:
         print(f"(event_log write failed: {e})")
     if lvl == 'warn':
@@ -1102,11 +1683,21 @@ def log_event(
 
 
 def get_runtime_flag(key: str, default: Optional[str] = None) -> Optional[str]:
+    scoped = uc.scoped_flag_key(key)
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT value FROM runtime_flags WHERE key = ?', (key,))
+        cursor.execute('SELECT value FROM runtime_flags WHERE key = ?', (scoped,))
         row = cursor.fetchone()
+        # Legacy unscoped keys: only the migrated owner (jame) may inherit them.
+        # Other users must not pick up e.g. algorithm_start from the shared key.
+        if row is None and scoped != key:
+            uid = uc.current_user_id()
+            owner = uc.get_user_by_username('jame') or {}
+            owner_id = owner.get('id')
+            if uid is not None and owner_id is not None and int(uid) == int(owner_id):
+                cursor.execute('SELECT value FROM runtime_flags WHERE key = ?', (key,))
+                row = cursor.fetchone()
         conn.close()
         if row is None:
             return default
@@ -1115,16 +1706,51 @@ def get_runtime_flag(key: str, default: Optional[str] = None) -> Optional[str]:
         return default
 
 
-def set_runtime_flag(key: str, value: str) -> None:
-    init_database()
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        'INSERT OR REPLACE INTO runtime_flags (key, value, updated_at) VALUES (?, ?, ?)',
-        (key, value, datetime.now().isoformat(timespec='seconds'))
-    )
-    conn.commit()
-    conn.close()
+def set_runtime_flag(
+    key: str,
+    value: str,
+    timeout: float = 5.0,
+    busy_timeout_ms: int = 5000,
+    retries: int = 4,
+) -> bool:
+    """
+    Persist a runtime flag. Returns True on success.
+
+    Defaults fail within a few seconds so web handlers (e.g. Schwab OAuth)
+    are not stuck for minutes when the trader loop holds market_data.db.
+    """
+    if not _DATABASE_READY:
+        try:
+            init_database()
+        except Exception as e:
+            print('Warning: set_runtime_flag init_database failed: %s' % e)
+            return False
+    scoped = uc.scoped_flag_key(key)
+    last_err = None  # type: Optional[Exception]
+    attempts = max(1, int(retries))
+    for attempt in range(attempts):
+        try:
+            conn = get_connection(
+                timeout=float(timeout),
+                busy_timeout_ms=int(busy_timeout_ms),
+            )
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    'INSERT OR REPLACE INTO runtime_flags (key, value, updated_at) VALUES (?, ?, ?)',
+                    (scoped, value, datetime.now().isoformat(timespec='seconds'))
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            return True
+        except sqlite3.OperationalError as e:
+            last_err = e
+            if 'locked' not in str(e).lower():
+                raise
+            time.sleep(0.05 * (attempt + 1))
+    print('Warning: set_runtime_flag(%s) failed after retries: %s' % (scoped, last_err))
+    return False
 
 
 def bump_dashboard_rev() -> int:
@@ -1579,16 +2205,8 @@ def populate_database(batch_size: Optional[int] = None) -> bool:
     """
     Fetch and store Yahoo fundamentals for a batch of tickers (oldest / missing first).
 
-    Normal mode (run_trader / refresh_market_data): ~YAHOO_BATCH_SIZE per hour.
-    Manual full catch-up: populate_database(batch_size=0) processes all due tickers oldest-first.
-    Tickers with last_updated == today are always skipped.
-
-    Crash / resume / throttle:
-    - Commits every 10 tickers; success sets fundamentals.last_updated (date)
-    - Rate-limit / transient / empty-info: wait + retry; then end-of-batch retry
-    - Deferred failures keep old last_updated (stay at front of next hour's batch)
-    - Invalid symbols get last_updated touched so they rotate out of the queue
-    - KeyboardInterrupt / fatal errors return False so the job stays due
+    Writes go to FUNDAMENTALS_DATABASE_PATH. Each ticker is a short open→write→commit→close
+    so Yahoo network/sleep never holds a trading-DB or fundamentals write lock.
 
     Returns:
         True if this batch finished; False if aborted early.
@@ -1604,31 +2222,37 @@ def populate_database(batch_size: Optional[int] = None) -> bool:
     if not _job or _job.get('status') != 'running':
         mark_job_started(JOB_REFRESH_MARKET_DATA, interval_days)
 
-    conn = get_connection()
-    cursor = conn.cursor()
+    # Short read: pick batch, then release the connection before any Yahoo I/O.
+    conn = get_fundamentals_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(fundamentals)")
+        existing_columns = [row[1] for row in cursor.fetchall()]
+        if 'last_updated' not in existing_columns:
+            print("Adding missing 'last_updated' column to fundamentals DB...")
+            try:
+                cursor.execute(
+                    'ALTER TABLE fundamentals ADD COLUMN last_updated TEXT'
+                )
+                conn.commit()
+                print("✓ Added last_updated column")
+            except sqlite3.OperationalError as e:
+                print(f"Warning: Could not add last_updated column: {e}")
 
-    cursor.execute("PRAGMA table_info(fundamentals)")
-    existing_columns = [row[1] for row in cursor.fetchall()]
-    if 'last_updated' not in existing_columns:
-        print("Adding missing 'last_updated' column to database...")
-        try:
-            cursor.execute('ALTER TABLE fundamentals ADD COLUMN last_updated TEXT')
-            conn.commit()
-            print("✓ Added last_updated column")
-        except sqlite3.OperationalError as e:
-            print(f"Warning: Could not add last_updated column: {e}")
+        tickers = get_all_tickers()
+        total_tickers = len(tickers)
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        batch, overdue_before, stale_stats = _select_yahoo_refresh_batch(
+            cursor, tickers, current_date, batch_size, max_age_days
+        )
+    finally:
+        conn.close()
 
-    tickers = get_all_tickers()
-    total_tickers = len(tickers)
-    current_date = datetime.now().strftime('%Y-%m-%d')
-
-    batch, overdue_before, stale_stats = _select_yahoo_refresh_batch(
-        cursor, tickers, current_date, batch_size, max_age_days
-    )
     batch_n = len(batch)
     fetch_sleep = float(getattr(config, 'YAHOO_FETCH_SLEEP_SECONDS', 2))
 
     print(f"Universe: {total_tickers} tickers")
+    print('Fundamentals DB: %s' % fundamentals_db_path())
     print(
         f"Staleness SLA: max {max_age_days}d — "
         f"{stale_stats['within_sla']} within SLA, "
@@ -1663,7 +2287,7 @@ def populate_database(batch_size: Optional[int] = None) -> bool:
         print(f"Estimated time: ~{est_min / 60:.1f} hours at {fetch_sleep:.0f}s/ticker")
     else:
         print(f"Estimated time: ~{est_min:.1f} min at {fetch_sleep:.0f}s/ticker")
-    print("Commits every 10 tickers. Ctrl+C saves and exits.\n")
+    print("One short DB write per ticker (no lock across Yahoo waits). Ctrl+C saves.\n")
     update_job_progress(
         JOB_REFRESH_MARKET_DATA,
         f"batch {batch_n}: overdue={stale_stats['overdue']}/{total_tickers}"
@@ -1672,7 +2296,6 @@ def populate_database(batch_size: Optional[int] = None) -> bool:
     if batch_n == 0:
         print("Nothing to fetch.")
         update_job_progress(JOB_REFRESH_MARKET_DATA, "batch empty")
-        conn.close()
         return True
 
     successful = 0
@@ -1691,6 +2314,19 @@ def populate_database(batch_size: Optional[int] = None) -> bool:
     throttle_slow_until = 0.0
 
     start_time = time.time()
+
+    def _write_one(ticker: str, data: Optional[Dict[str, Any]], touch_only: bool) -> None:
+        """Short transaction: open → write → commit → close."""
+        wconn = get_fundamentals_connection(timeout=30.0, busy_timeout_ms=30000)
+        try:
+            wcur = wconn.cursor()
+            if touch_only:
+                _touch_fundamentals_updated(wcur, ticker, current_date)
+            else:
+                _store_fundamentals_row(wcur, ticker, data or {}, current_date)
+            wconn.commit()
+        finally:
+            wconn.close()
 
     def _process_one(ticker: str, index: int, total: int) -> str:
         """Fetch+store one ticker. Returns 'ok' | 'invalid' | 'retry_later'."""
@@ -1716,7 +2352,7 @@ def populate_database(batch_size: Optional[int] = None) -> bool:
             fetch_sleep = max(fetch_sleep, post_throttle_sleep)
 
         if err is None and data is not None:
-            _store_fundamentals_row(cursor, ticker, data, current_date)
+            _write_one(ticker, data, touch_only=False)
             successful += 1
             print("✓ Processed")
             return 'ok'
@@ -1726,8 +2362,7 @@ def populate_database(batch_size: Optional[int] = None) -> bool:
             print(f"deferred after retries ({err})")
             return 'retry_later'
 
-        # Permanent / empty symbol: touch last_updated so it leaves the front of the queue
-        _touch_fundamentals_updated(cursor, ticker, current_date)
+        _write_one(ticker, None, touch_only=True)
         skipped += 1
         invalid_tickers.append(ticker)
         print(f"skipped ({err or 'no data'}) — marked attempted")
@@ -1741,23 +2376,21 @@ def populate_database(batch_size: Optional[int] = None) -> bool:
                     retry_later.append(ticker)
             except KeyboardInterrupt:
                 print(f"\n\n⚠️  Process interrupted by user.")
-                conn.commit()
                 note = (
                     f"interrupted at {ticker} ({i}/{batch_n}); "
                     f"ok={successful} fail={failed}"
                 )
                 print(f"Saved progress: {note}")
                 update_job_progress(JOB_REFRESH_MARKET_DATA, note)
-                conn.close()
                 return False
             except Exception as e:
                 print(f"Error processing {ticker}: {e} — continuing")
                 failed += 1
                 retry_later.append(ticker)
-                conn.commit()
+                if _db_is_locked(e):
+                    request_early_wake(reason='Yahoo write locked')
 
             if i % 10 == 0:
-                conn.commit()
                 elapsed = time.time() - start_time
                 avg_time_per_fetch = elapsed / max(fetches_done, 1)
                 remaining = (batch_n - i) * avg_time_per_fetch
@@ -1766,7 +2399,7 @@ def populate_database(batch_size: Optional[int] = None) -> bool:
                     f"deferred={len(retry_later)}; last={ticker}"
                 )
                 update_job_progress(JOB_REFRESH_MARKET_DATA, note)
-                print(f"\n📊 Progress: {i}/{batch_n} ({i * 100 / batch_n:.1f}%) - ✓ Saved batch")
+                print(f"\n📊 Progress: {i}/{batch_n} ({i * 100 / batch_n:.1f}%)")
                 print(
                     f"   Successful: {successful}, Skipped (invalid): {skipped}, "
                     f"Failed/deferred: {failed}"
@@ -1786,16 +2419,12 @@ def populate_database(batch_size: Optional[int] = None) -> bool:
                     status = _process_one(ticker, j, len(retry_later))
                     if status == 'retry_later':
                         still_failed.append(ticker)
-                    if j % 10 == 0:
-                        conn.commit()
                 except KeyboardInterrupt:
                     print(f"\n\n⚠️  Interrupted during retry pass.")
-                    conn.commit()
                     update_job_progress(
                         JOB_REFRESH_MARKET_DATA,
                         f"interrupted retry at {ticker}; ok={successful}"
                     )
-                    conn.close()
                     return False
                 except Exception as e:
                     print(f"Retry error {ticker}: {e}")
@@ -1807,11 +2436,14 @@ def populate_database(batch_size: Optional[int] = None) -> bool:
                     f"Examples: {still_failed[:10]}"
                 )
 
-        conn.commit()
+        rconn = get_fundamentals_connection()
+        try:
+            _, overdue_after, stale_after = _select_yahoo_refresh_batch(
+                rconn.cursor(), tickers, current_date, 0, max_age_days
+            )
+        finally:
+            rconn.close()
 
-        _, overdue_after, stale_after = _select_yahoo_refresh_batch(
-            cursor, tickers, current_date, 0, max_age_days
-        )
         total_time = time.time() - start_time
         print(f"\n{'=' * 60}")
         print("Yahoo batch complete")
@@ -1858,28 +2490,19 @@ def populate_database(batch_size: Optional[int] = None) -> bool:
                 'skipped_today': stale_stats.get('skipped_today', 0),
             },
         )
-        conn.close()
         return True
 
     except Exception as e:
         print(f"\n⚠️  Fatal error during population: {e}")
-        print("Committing progress before exiting...")
-        try:
-            conn.commit()
-        except Exception:
-            pass
         print(f"Saved {successful} tickers before error. Re-run to resume.")
         update_job_progress(
             JOB_REFRESH_MARKET_DATA,
             f"fatal: {e}; ok={successful}"
         )
         log_event('yahoo', f"Yahoo batch fatal error: {e}", level='error')
+        if _db_is_locked(e):
+            request_early_wake(reason='Yahoo batch locked')
         return False
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
 
 
 # ============================================================================
@@ -1891,12 +2514,43 @@ JOB_WATCHLIST_AND_BUYS = 'watchlist_and_buys'
 JOB_SELL_CHECK = 'sell_check'
 JOB_SCHWAB_SYNC = 'schwab_sync'
 
+# Short console / Next Tasks labels
+_JOB_DISPLAY_NAMES = {
+    'refresh_market_data': 'Yahoo refresh',
+    'schwab_sync': 'Schwab sync',
+    'watchlist_and_buys': 'Watchlist & buys',
+    'sell_check': 'Sell check',
+}
+
+# Relative-quiet status lines (what the loop is doing)
+_JOB_STATUS_PHRASES = {
+    'refresh_market_data': 'Refreshing Yahoo market data',
+    'schwab_sync': 'Updating Schwab',
+    'watchlist_and_buys': 'Updating watchlist & buys',
+    'sell_check': 'Running sell check',
+}
+
 # Only these jobs require the US cash equity regular session.
 JOBS_REQUIRE_MARKET_OPEN = frozenset({
     JOB_WATCHLIST_AND_BUYS,
     JOB_SELL_CHECK,
     JOB_SCHWAB_SYNC,
 })
+
+# Steady-state phase offsets (seconds after interval anchor / market open).
+# Jobs stay periodic but do not need to fire in the same loop pass.
+JOB_PHASE_OFFSET_SECONDS = {
+    JOB_SCHWAB_SYNC: 0,
+    JOB_SELL_CHECK: 120,
+    JOB_WATCHLIST_AND_BUYS: 420,
+}
+
+# Soft-failure retry backoff (seconds). Includes phase so retries desynchronize.
+JOB_RETRY_BACKOFF_SECONDS = {
+    JOB_SCHWAB_SYNC: 45,
+    JOB_SELL_CHECK: 150,
+    JOB_WATCHLIST_AND_BUYS: 210,
+}
 
 # Rank matches by analyst upside; missing prices sort last under DESC.
 _ANALYST_UPSIDE_ORDER_BY = (
@@ -1907,6 +2561,7 @@ _ANALYST_UPSIDE_ORDER_BY = (
 
 def get_job_run(job_name: str) -> Optional[Dict[str, Any]]:
     """Return job_runs row for job_name, or None if missing."""
+    job_name = uc.scoped_job_name(job_name)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
@@ -1930,18 +2585,19 @@ def get_job_run(job_name: str) -> Optional[Dict[str, Any]]:
 
 def mark_job_started(job_name: str, interval_days: float) -> None:
     """Upsert job row and set status=running with last_started now."""
+    job_name = uc.scoped_job_name(job_name)
     now = datetime.now().isoformat()
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         '''
         INSERT INTO job_runs (job_name, interval_days, last_started, last_completed, status, progress_note)
-        VALUES (?, ?, ?, NULL, 'running', NULL)
+        VALUES (?, ?, ?, NULL, 'running', 'started')
         ON CONFLICT(job_name) DO UPDATE SET
             interval_days = excluded.interval_days,
             last_started = excluded.last_started,
             status = 'running',
-            progress_note = COALESCE(job_runs.progress_note, '')
+            progress_note = 'started'
         ''',
         (job_name, float(interval_days), now)
     )
@@ -1949,8 +2605,42 @@ def mark_job_started(job_name: str, interval_days: float) -> None:
     conn.close()
 
 
+def reclaim_stale_running_job(
+    job_name: str,
+    max_minutes: Optional[float] = None,
+) -> bool:
+    """
+    If a job was left status=running too long (crash / hung lock), mark it failed
+    so the loop can start a fresh attempt. Returns True when reclaimed.
+    """
+    if max_minutes is None:
+        max_minutes = float(getattr(config, 'STALE_JOB_RUNNING_MINUTES', 5))
+    row = get_job_run(job_name)
+    if not row or str(row.get('status') or '') != 'running':
+        return False
+    started_s = row.get('last_started')
+    if not started_s:
+        return False
+    try:
+        started = datetime.fromisoformat(str(started_s))
+    except (TypeError, ValueError):
+        return False
+    age_min = (datetime.now() - started).total_seconds() / 60.0
+    if age_min < float(max_minutes):
+        return False
+    note = 'stale running (%.0f min) — reclaimed' % age_min
+    mark_job_failed(job_name, note)
+    print_loop_status('Reclaimed stuck job %s after %.0f min' % (job_name, age_min))
+    try:
+        log_event('task', note, level='warn', detail={'job_name': job_name})
+    except Exception:
+        pass
+    return True
+
+
 def update_job_progress(job_name: str, note: str) -> None:
     """Save a short progress note (resume visibility); does not change due/completed."""
+    job_name = uc.scoped_job_name(job_name)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
@@ -1963,6 +2653,7 @@ def update_job_progress(job_name: str, note: str) -> None:
 
 def mark_job_completed(job_name: str) -> None:
     """Set last_completed now and status=idle (only call after full success)."""
+    job_name = uc.scoped_job_name(job_name)
     now = datetime.now().isoformat()
     conn = get_connection()
     cursor = conn.cursor()
@@ -1980,6 +2671,7 @@ def mark_job_completed(job_name: str) -> None:
 
 def mark_job_failed(job_name: str, note: Optional[str] = None) -> None:
     """Set status=failed; leave last_completed unchanged so the job stays due."""
+    job_name = uc.scoped_job_name(job_name)
     conn = get_connection()
     cursor = conn.cursor()
     if note is not None:
@@ -2123,10 +2815,66 @@ def _force_job_due(job_name: str) -> None:
     conn.close()
 
 
+def _set_job_next_due_in(
+    job_name: str,
+    interval_days: float,
+    due_in_seconds: float,
+    note: str = 'staggered',
+) -> None:
+    """
+    Schedule job due after due_in_seconds by backdating last_completed.
+    Clears mid-cycle 'failed/running' immediacy so is_job_due waits.
+    """
+    job_name = uc.scoped_job_name(job_name)
+    due_in_seconds = max(0.0, float(due_in_seconds))
+    interval_sec = max(1.0, float(interval_days) * 86400.0)
+    completed = datetime.now() - timedelta(seconds=interval_sec - due_in_seconds)
+    completed_s = completed.isoformat(timespec='seconds')
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        INSERT INTO job_runs
+            (job_name, interval_days, last_started, last_completed, status, progress_note)
+        VALUES (?, ?, ?, ?, 'idle', ?)
+        ON CONFLICT(job_name) DO UPDATE SET
+            interval_days = excluded.interval_days,
+            last_started = excluded.last_started,
+            last_completed = excluded.last_completed,
+            status = 'idle',
+            progress_note = excluded.progress_note
+        ''',
+        (job_name, float(interval_days), completed_s, completed_s, note),
+    )
+    conn.commit()
+    conn.close()
+
+
+def defer_failed_job(job_name: str, interval_days: float) -> float:
+    """
+    After a soft failure, push next attempt out by job backoff (not 30s hammer).
+    Returns backoff seconds used.
+    """
+    base = job_name.split(':', 1)[-1] if ':' in job_name else job_name
+    # Prefer unscoped name for lookup
+    bare = base
+    for known in (
+        JOB_SCHWAB_SYNC, JOB_SELL_CHECK, JOB_WATCHLIST_AND_BUYS, JOB_REFRESH_MARKET_DATA,
+    ):
+        if job_name.endswith(known) or job_name == known:
+            bare = known
+            break
+    backoff = float(JOB_RETRY_BACKOFF_SECONDS.get(bare, 60))
+    _set_job_next_due_in(
+        bare, interval_days, backoff, note='retry deferred %.0fs' % backoff,
+    )
+    return backoff
+
+
 def maybe_reset_jobs_at_market_open() -> bool:
     """
-    Once per RTH session day: when the market is open, force watchlist+buys and
-    sell_check due so they run at/near the open and restart their intervals.
+    Once per RTH session day: stagger RTH jobs after the open (phase offsets)
+    so sync / sell / watchlist do not all fire in one pass.
     Returns True if a reset was applied this call.
     """
     if not is_us_equity_market_open():
@@ -2135,13 +2883,24 @@ def maybe_reset_jobs_at_market_open() -> bool:
     if get_runtime_flag('rth_session_started') == today:
         return False
     set_runtime_flag('rth_session_started', today)
+    intervals = {
+        JOB_SCHWAB_SYNC: _schwab_sync_interval_days(),
+        JOB_SELL_CHECK: _sell_check_interval_days(),
+        JOB_WATCHLIST_AND_BUYS: _watchlist_job_interval_days(),
+    }
     for job_name in JOBS_REQUIRE_MARKET_OPEN:
-        _force_job_due(job_name)
+        phase = float(JOB_PHASE_OFFSET_SECONDS.get(job_name, 0))
+        _set_job_next_due_in(
+            job_name,
+            intervals.get(job_name, 1.0 / 24.0),
+            phase,
+            note='market open stagger +%ss' % int(phase),
+        )
     log_event(
         'task',
-        'Market open — reset watchlist/buys and sell_check cycles for %s' % today,
+        'Market open — staggered RTH job cycles for %s' % today,
     )
-    print('Market open detected — RTH jobs reset to run this cycle.')
+    print('Market open detected — RTH jobs staggered for this session.')
     return True
 
 
@@ -2285,49 +3044,59 @@ def _as_naive_local(dt: datetime) -> datetime:
     return dt.astimezone().replace(tzinfo=None)
 
 
-def run_trader(once: bool = True) -> None:
-    """
-    Parent entry: run due scheduled jobs.
-
-    Yahoo refresh may run anytime. Watchlist/buys and sell_check run only during
-    US RTH; at each session open those two jobs are forced due once to restart cycles.
-
-    Args:
-        once: If True (default), check/run due jobs once then return (batch mode).
-              If False, sleep until the next due time and loop (always-on mode).
-    """
-    setup_file_logging()
-    init_database()
-    set_runtime_flag('last_loop_wake', datetime.now().isoformat(timespec='seconds'))
-
-    jobs = get_scheduled_jobs()
-
-    sleep_chunk_seconds = 60
-
-    while True:
-        wake_ts = datetime.now().isoformat(timespec='seconds')
-        set_runtime_flag('last_loop_wake', wake_ts)
-        market_open = is_us_equity_market_open()
-        print("=" * 60)
-        print(f"run_trader (once={once}) — {wake_ts}")
-        print(
-            "US RTH: %s" % ('OPEN' if market_open else 'CLOSED')
-        )
-        print("=" * 60)
-
+def _run_trader_pass_for_user(
+    user: Dict[str, Any],
+    jobs: List[Tuple[str, Any, float]],
+    market_open: bool,
+    next_wake: Optional[datetime],
+) -> Optional[datetime]:
+    """Run due jobs for one user; return updated next_wake candidate."""
+    uid = int(user['id'])
+    uname = user.get('username') or str(uid)
+    with uc.use_user(uid):
+        _sync_schwab_globals(uid)
+        # Gate 2: no per-user jobs until algorithm_start (stops john / unset accounts).
+        if not get_algorithm_start():
+            print_loop_status(
+                '[%s] Skipping — onboard in Actions (Schwab → settings → Run)'
+                % uname
+            )
+            return next_wake
+        print_loop_status('Starting pass for %s…' % uname)
+        maybe_reinit_schwab_client(uid)
         maybe_reset_jobs_at_market_open()
-        maybe_record_daily_equity_close()
-
-        next_wake = None  # type: Optional[datetime]
+        try:
+            maybe_record_daily_equity_close()
+        except Exception as e:
+            print('maybe_record_daily_equity_close (%s): %s' % (uname, e))
 
         for job_name, job_fn, interval_days in jobs:
+            # Shared Yahoo job runs once outside per-user loop
+            if job_name == JOB_REFRESH_MARKET_DATA:
+                continue
             needs_rth = job_name in JOBS_REQUIRE_MARKET_OPEN
             label = format_job_interval(interval_days)
+            title = _JOB_DISPLAY_NAMES.get(job_name, job_name)
+            phrase = _JOB_STATUS_PHRASES.get(job_name, title)
+
+            # Unstick jobs left "running" after a crash / hung DB lock
+            reclaim_stale_running_job(job_name)
+            row = get_job_run(job_name)
+            if row and str(row.get('status') or '') == 'running':
+                # Do not re-enter — mark_job_started would reset the reclaim timer
+                print_loop_status(
+                    '[%s] %s still running — waiting to reclaim'
+                    % (uname, phrase)
+                )
+                wake_candidate = datetime.now() + timedelta(minutes=1)
+                if next_wake is None or wake_candidate < next_wake:
+                    next_wake = wake_candidate
+                continue
 
             if needs_rth and not market_open:
                 nxt_open = next_us_equity_market_open()
                 print(
-                    f"\nMarket closed — skip {job_name} "
+                    f"\n[{uname}] Market closed — skip {job_name} "
                     f"(every {label}; next open {nxt_open.isoformat()})"
                 )
                 wake_candidate = _as_naive_local(nxt_open)
@@ -2336,36 +3105,189 @@ def run_trader(once: bool = True) -> None:
                 continue
 
             if is_job_due(job_name, interval_days):
-                print(f"\nDue: {job_name} (every {label}) — running now")
+                print_loop_status('[%s] %s…' % (uname, phrase))
+                print(f"\n[{uname}] Due: {job_name} (every {label}) — running now")
                 log_event('task', f"Task started: {job_name}")
-                job_fn()
+                ok = False
+                try:
+                    ok = bool(job_fn())
+                    if ok:
+                        print_loop_status('[%s] %s done' % (uname, phrase))
+                    else:
+                        print_loop_status(
+                            '[%s] %s did not complete — deferred retry'
+                            % (uname, phrase)
+                        )
+                except Exception as e:
+                    print_loop_status('[%s] %s failed: %s' % (uname, phrase, e))
+                    print('[%s] job %s failed: %s' % (uname, job_name, e))
+                    try:
+                        mark_job_failed(job_name, str(e)[:200])
+                    except Exception:
+                        pass
+                    ok = False
+                if not ok:
+                    backoff = defer_failed_job(job_name, interval_days)
+                    print_loop_status(
+                        '[%s] %s retry in %.0fs' % (uname, phrase, backoff)
+                    )
+                    due_at = next_job_due_at(job_name, interval_days)
+                    if due_at is not None and (
+                        next_wake is None or due_at < next_wake
+                    ):
+                        next_wake = due_at
+                    else:
+                        wake_candidate = datetime.now() + timedelta(seconds=backoff)
+                        if next_wake is None or wake_candidate < next_wake:
+                            next_wake = wake_candidate
             else:
                 due_at = next_job_due_at(job_name, interval_days)
                 if due_at is not None:
                     print(
-                        f"\nNot due: {job_name} — next run at {due_at.isoformat()} "
-                        f"(every {label})"
+                        f"\n[{uname}] Not due: {job_name} — next run at "
+                        f"{due_at.isoformat()} (every {label})"
                     )
                     if next_wake is None or due_at < next_wake:
                         next_wake = due_at
                 else:
-                    print(f"\nNot due: {job_name} (every {label})")
+                    print(f"\n[{uname}] Not due: {job_name} (every {label})")
+    return next_wake
 
-        if once:
-            print("\nrun_trader batch pass complete.")
-            log_event('task', 'Trader loop pass complete')
-            return
 
-        if next_wake is None:
-            shortest = min(interval for _, _, interval in jobs)
-            next_wake = datetime.now() + timedelta(days=shortest)
-            print(f"\nNo next due time; sleeping until {next_wake.isoformat()}")
+def run_trader(once: bool = True) -> None:
+    """
+    Parent entry: run due scheduled jobs for each active user.
 
-        while datetime.now() < next_wake:
-            remaining = (next_wake - datetime.now()).total_seconds()
-            if remaining <= 0:
-                break
-            time.sleep(min(sleep_chunk_seconds, remaining))
+    Yahoo refresh runs once (shared). Watchlist/buys and sell_check run per user
+    during US RTH only.
+    """
+    setup_file_logging()
+    init_database()
+    # Global wake flag (not user-scoped)
+    prev = uc.current_user_id()
+    uc.set_current_user_id(None)
+    set_runtime_flag('last_loop_wake', datetime.now().isoformat(timespec='seconds'))
+    uc.set_current_user_id(prev)
+
+    jobs = get_scheduled_jobs()
+    sleep_chunk_seconds = 60
+
+    while True:
+        try:
+            wake_ts = datetime.now().isoformat(timespec='seconds')
+            prev = uc.current_user_id()
+            uc.set_current_user_id(None)
+            set_runtime_flag('last_loop_wake', wake_ts)
+            uc.set_current_user_id(prev)
+
+            market_open = is_us_equity_market_open()
+            print_loop_status(
+                'Loop wake %s — market %s'
+                % (wake_ts, 'OPEN' if market_open else 'CLOSED')
+            )
+            print("=" * 60)
+            print(f"run_trader (once={once}) — {wake_ts}")
+            print("US RTH: %s" % ('OPEN' if market_open else 'CLOSED'))
+            print("=" * 60)
+
+            next_wake = None  # type: Optional[datetime]
+
+            # Shared Yahoo refresh (no per-user scope needed)
+            for job_name, job_fn, interval_days in jobs:
+                if job_name != JOB_REFRESH_MARKET_DATA:
+                    continue
+                label = format_job_interval(interval_days)
+                title = _JOB_DISPLAY_NAMES.get(job_name, job_name)
+                phrase = _JOB_STATUS_PHRASES.get(job_name, title)
+                # Use first user context only for job_runs row naming (global job name)
+                users = uc.list_active_users()
+                ctx_uid = int(users[0]['id']) if users else None
+                ctx = uc.use_user(ctx_uid) if ctx_uid else _nullcontext()
+                with ctx:
+                    reclaim_stale_running_job(job_name)
+                    row = get_job_run(job_name)
+                    if row and str(row.get('status') or '') == 'running':
+                        print_loop_status(
+                            '%s still running — waiting to reclaim' % phrase
+                        )
+                        wake_candidate = datetime.now() + timedelta(minutes=1)
+                        if next_wake is None or wake_candidate < next_wake:
+                            next_wake = wake_candidate
+                        continue
+                    if is_job_due(job_name, interval_days):
+                        print_loop_status('%s…' % phrase)
+                        print(f"\nDue: {job_name} (every {label}) — running now")
+                        log_event('task', f"Task started: {job_name}")
+                        ok = False
+                        try:
+                            ok = bool(job_fn())
+                            if ok:
+                                print_loop_status('%s done' % phrase)
+                            else:
+                                print_loop_status(
+                                    '%s did not complete — will retry soon' % phrase
+                                )
+                        except Exception as e:
+                            print_loop_status('%s failed: %s' % (phrase, e))
+                            try:
+                                mark_job_failed(job_name, str(e)[:200])
+                            except Exception:
+                                pass
+                            ok = False
+                        if not ok:
+                            request_early_wake(reason='%s needs retry' % phrase)
+                    else:
+                        due_at = next_job_due_at(job_name, interval_days)
+                        if due_at is not None:
+                            print(
+                                f"\nNot due: {job_name} — next run at {due_at.isoformat()} "
+                                f"(every {label})"
+                            )
+                            if next_wake is None or due_at < next_wake:
+                                next_wake = due_at
+
+            for user in uc.list_active_users():
+                next_wake = _run_trader_pass_for_user(
+                    user, jobs, market_open, next_wake
+                )
+
+            if once:
+                print_loop_status('Trader pass complete')
+                print("\nrun_trader batch pass complete.")
+                log_event('task', 'Trader loop pass complete')
+                return
+
+            next_wake = take_early_wake(next_wake)
+            if next_wake is None:
+                shortest = min(interval for _, _, interval in jobs)
+                next_wake = datetime.now() + timedelta(days=shortest)
+                print(f"\nNo next due time; sleeping until {next_wake.isoformat()}")
+
+            print_loop_status(
+                'Sleeping until %s' % next_wake.strftime('%H:%M:%S')
+            )
+            while datetime.now() < next_wake:
+                remaining = (next_wake - datetime.now()).total_seconds()
+                if remaining <= 0:
+                    break
+                time.sleep(min(sleep_chunk_seconds, remaining))
+        except sqlite3.OperationalError as e:
+            if 'locked' not in str(e).lower():
+                raise
+            print_loop_status('Database locked — retry in 30s')
+            print('Warning: database locked in trader loop — sleeping 30s then retrying')
+            request_early_wake(30, reason='loop database locked')
+            time.sleep(30)
+            if once:
+                raise
+
+
+class _nullcontext(object):
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *args):
+        return False
 
 
 # ============================================================================
@@ -2640,7 +3562,11 @@ def query_stocks(criteria: str) -> pd.DataFrame:
     Query stocks based on SQL criteria (similar to your example).
     Returns a pandas DataFrame.
     """
-    conn = get_connection()
+    sql = criteria or ''
+    if re.search(r'\bfundamentals\b', sql, re.I):
+        conn = get_fundamentals_connection()
+    else:
+        conn = get_connection()
     try:
         df = pd.read_sql(criteria, conn)
         return df
@@ -2662,7 +3588,7 @@ def get_fundamentals(ticker: str, verbose: bool = False) -> Optional[Dict[str, A
     Returns:
         Dictionary with all fundamental data, or None if not found
     """
-    conn = get_connection()
+    conn = get_fundamentals_connection()
     cursor = conn.cursor()
     
     # Get all column names dynamically
@@ -2942,7 +3868,7 @@ def filter_stocks(criteria_dict: Dict[str, Any], limit: Optional[int] = None) ->
         criteria_dict: Filter criteria
         limit: Max tickers to return (None = all). If fewer match, returns all matches.
     """
-    conn = get_connection()
+    conn = get_fundamentals_connection()
     cursor = conn.cursor()
     
     # Build query dynamically based on criteria
@@ -3092,7 +4018,7 @@ def risky_filter_stocks(
     Returns:
         List of tickers matching all criteria, ranked by analyst upside
     """
-    conn = get_connection()
+    conn = get_fundamentals_connection()
     cursor = conn.cursor()
     
     # RISKY FILTER SQL Query
@@ -3199,7 +4125,7 @@ def safe_filter_stocks(
     Returns:
         List of tickers matching all criteria, ranked by analyst upside
     """
-    conn = get_connection()
+    conn = get_fundamentals_connection()
     cursor = conn.cursor()
     
     # SAFE FILTER SQL Query
@@ -3324,7 +4250,7 @@ def display_safe_filter_grid(filter_name: str = 'safe', tickers: Optional[List[s
         print("No tickers match the filter.")
         return
     
-    conn = get_connection()
+    conn = get_fundamentals_connection()
     cursor = conn.cursor()
     
     # Fetch all needed columns for these tickers in one query
@@ -3554,7 +4480,8 @@ def display_positions_table() -> None:
 def update_watchlist(filter_name: str = 'safe') -> Dict[str, int]:
     """
     Update watchlist based on filter results.
-    Fetches all yfinance data from fundamentals and all Schwab streaming data.
+    Fetches fundamentals + Schwab quotes with no trading-DB lock held, then
+    applies all watchlist writes in one short transaction.
     
     Args:
         filter_name: Name of filter to use ('safe' or 'risky', default: 'safe')
@@ -3562,139 +4489,165 @@ def update_watchlist(filter_name: str = 'safe') -> Dict[str, int]:
     Returns:
         Dictionary with counts: {'added': int, 'removed': int, 'updated': int, 'kept_with_shares': int}
     """
-    # Initialize database to ensure watchlist table exists
     init_database()
-    
+
+    # Phase 1 — short read of current watchlist / positions (release before network)
     conn = get_connection()
-    cursor = conn.cursor()
-    
-    # Run the specified filter
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT ticker FROM watchlist')
+        current_tickers_set = {row[0] for row in cursor.fetchall()}
+        cursor.execute('SELECT ticker FROM positions WHERE shares_owned > 0')
+        owned_tickers_set = {row[0] for row in cursor.fetchall()}
+        cursor.execute('PRAGMA table_info(watchlist)')
+        watchlist_columns = [row[1] for row in cursor.fetchall() if row[1] != 'ticker']
+        date_added_map = {}  # type: Dict[str, Any]
+        if 'date_added' in watchlist_columns:
+            cursor.execute('SELECT ticker, date_added FROM watchlist')
+            date_added_map = {row[0]: row[1] for row in cursor.fetchall() if row[1]}
+    finally:
+        conn.close()
+
+    filter_name = (filter_name or 'safe').strip()
     if filter_name == 'safe':
         filter_results = safe_filter_stocks()
     elif filter_name == 'risky':
         filter_results = risky_filter_stocks()
     else:
-        raise ValueError(f"Unknown filter: {filter_name}. Use 'safe' or 'risky'.")
-    
-    # Get current watchlist tickers
-    cursor.execute("SELECT ticker FROM watchlist")
-    current_tickers_set = {row[0] for row in cursor.fetchall()}
-    # Owned = in positions table with shares_owned > 0 (for removal/kept_with_shares logic)
-    cursor.execute("SELECT ticker FROM positions WHERE shares_owned > 0")
-    owned_tickers_set = {row[0] for row in cursor.fetchall()}
-    
+        import filter_builder as fb
+        custom = fb.get_user_custom_filter(_uid())
+        if not custom:
+            raise ValueError(
+                "Unknown filter %r — use 'safe', 'risky', or save a custom filter."
+                % filter_name
+            )
+        if (custom.get('name') or '').strip().lower() != filter_name.lower():
+            raise ValueError(
+                "Unknown filter %r — your custom filter is named %r."
+                % (filter_name, custom.get('name'))
+            )
+        filter_results = fb.list_custom_tickers(custom.get('criteria') or [])
+
     filter_tickers_set = set(filter_results)
-    
     stats = {'added': 0, 'removed': 0, 'updated': 0, 'kept_with_shares': 0}
     current_timestamp = datetime.now().isoformat()
-    current_date = datetime.now().strftime('%Y-%m-%d')
-    
-    # Get all fundamentals columns (excluding ticker)
-    cursor.execute("PRAGMA table_info(fundamentals)")
-    fundamentals_columns = [row[1] for row in cursor.fetchall() if row[1] != 'ticker']
-    
-    # Process each ticker in filter results
+
+    fconn = get_fundamentals_connection()
+    try:
+        fundamentals_columns = [
+            row[1] for row in fconn.execute('PRAGMA table_info(fundamentals)')
+            if row[1] != 'ticker'
+        ]
+    finally:
+        fconn.close()
+
+    schwab_mapping = {
+        'price': 'schwab_price', 'bid': 'schwab_bid', 'ask': 'schwab_ask', 'mark': 'schwab_mark',
+        'open': 'schwab_open', 'high': 'schwab_high', 'low': 'schwab_low',
+        'previous_close': 'schwab_previous_close',
+        'net_change': 'schwab_net_change', 'net_percent_change': 'schwab_net_percent_change',
+        'mark_change': 'schwab_mark_change', 'mark_percent_change': 'schwab_mark_percent_change',
+        'post_market_change': 'schwab_post_market_change',
+        'post_market_percent_change': 'schwab_post_market_percent_change',
+        'volume': 'schwab_volume', 'bid_size': 'schwab_bid_size', 'ask_size': 'schwab_ask_size',
+        'exchange': 'schwab_exchange', 'quote_time': 'schwab_quote_time',
+        'trade_time': 'schwab_trade_time', 'market_status': 'schwab_market_status',
+        'realtime': 'schwab_realtime',
+        'week_52_high': 'schwab_week_52_high', 'week_52_low': 'schwab_week_52_low',
+        'extended_last_price': 'schwab_extended_last_price',
+        'extended_volume': 'schwab_extended_volume', 'extended_bid': 'schwab_extended_bid',
+        'extended_ask': 'schwab_extended_ask',
+        'pe_ratio': 'schwab_pe_ratio', 'dividend_yield': 'schwab_dividend_yield',
+        'eps': 'schwab_eps', 'shares_outstanding': 'schwab_shares_outstanding',
+        'avg_10_day_volume': 'schwab_avg_10_day_volume',
+        'avg_1_year_volume': 'schwab_avg_1_year_volume',
+        'div_amount': 'schwab_div_amount', 'div_freq': 'schwab_div_freq',
+        'div_pay_amount': 'schwab_div_pay_amount',
+        'next_div_ex_date': 'schwab_next_div_ex_date',
+        'next_div_pay_date': 'schwab_next_div_pay_date',
+        'cusip': 'schwab_cusip', 'description': 'schwab_description',
+        'is_shortable': 'schwab_is_shortable', 'is_hard_to_borrow': 'schwab_is_hard_to_borrow',
+        'asset_main_type': 'schwab_asset_main_type',
+        'asset_sub_type': 'schwab_asset_sub_type', 'quote_type': 'schwab_quote_type',
+        'timestamp': 'schwab_timestamp',
+    }
+
+    # Phase 2 — network / fundamentals (no trading-DB connection open)
+    pending = []  # type: List[Tuple[str, Dict[str, Any], bool]]
     for ticker in filter_results:
-        # Get fundamentals data (non-verbose for batch processing)
         fundamentals = get_fundamentals(ticker)
         if not fundamentals:
-            print(f"Warning: No fundamentals data for {ticker}, skipping watchlist update")
+            print(
+                'Warning: No fundamentals data for %s, skipping watchlist update'
+                % ticker
+            )
             continue
-        
-        # Get Schwab streaming data
         schwab_data = get_streaming_data(ticker)
         if not schwab_data or 'error' in schwab_data:
-            print(f"Warning: Could not get Schwab data for {ticker}, continuing with fundamentals only")
+            print(
+                'Warning: Could not get Schwab data for %s, continuing with fundamentals only'
+                % ticker
+            )
             schwab_data = {}
-        
-        # Build values for INSERT/UPDATE
-        # Start with fundamentals values
-        values_dict = {}
+        values_dict = {}  # type: Dict[str, Any]
         for col in fundamentals_columns:
             values_dict[col] = fundamentals.get(col)
-        
-        # Add Schwab data (prefix with 'schwab_')
-        schwab_mapping = {
-            'price': 'schwab_price', 'bid': 'schwab_bid', 'ask': 'schwab_ask', 'mark': 'schwab_mark',
-            'open': 'schwab_open', 'high': 'schwab_high', 'low': 'schwab_low',
-            'previous_close': 'schwab_previous_close',
-            'net_change': 'schwab_net_change', 'net_percent_change': 'schwab_net_percent_change',
-            'mark_change': 'schwab_mark_change', 'mark_percent_change': 'schwab_mark_percent_change',
-            'post_market_change': 'schwab_post_market_change',
-            'post_market_percent_change': 'schwab_post_market_percent_change',
-            'volume': 'schwab_volume', 'bid_size': 'schwab_bid_size', 'ask_size': 'schwab_ask_size',
-            'exchange': 'schwab_exchange', 'quote_time': 'schwab_quote_time',
-            'trade_time': 'schwab_trade_time', 'market_status': 'schwab_market_status',
-            'realtime': 'schwab_realtime',
-            'week_52_high': 'schwab_week_52_high', 'week_52_low': 'schwab_week_52_low',
-            'extended_last_price': 'schwab_extended_last_price',
-            'extended_volume': 'schwab_extended_volume', 'extended_bid': 'schwab_extended_bid',
-            'extended_ask': 'schwab_extended_ask',
-            'pe_ratio': 'schwab_pe_ratio', 'dividend_yield': 'schwab_dividend_yield',
-            'eps': 'schwab_eps', 'shares_outstanding': 'schwab_shares_outstanding',
-            'avg_10_day_volume': 'schwab_avg_10_day_volume',
-            'avg_1_year_volume': 'schwab_avg_1_year_volume',
-            'div_amount': 'schwab_div_amount', 'div_freq': 'schwab_div_freq',
-            'div_pay_amount': 'schwab_div_pay_amount',
-            'next_div_ex_date': 'schwab_next_div_ex_date',
-            'next_div_pay_date': 'schwab_next_div_pay_date',
-            'cusip': 'schwab_cusip', 'description': 'schwab_description',
-            'is_shortable': 'schwab_is_shortable', 'is_hard_to_borrow': 'schwab_is_hard_to_borrow',
-            'asset_main_type': 'schwab_asset_main_type',
-            'asset_sub_type': 'schwab_asset_sub_type', 'quote_type': 'schwab_quote_type',
-            'timestamp': 'schwab_timestamp'
-        }
-        
         for schwab_key, db_key in schwab_mapping.items():
             values_dict[db_key] = schwab_data.get(schwab_key)
-        
-        if ticker in current_tickers_set:
-            # Update existing entry; preserve date_added only (ownership is in positions table)
-            cursor.execute("PRAGMA table_info(watchlist)")
-            watchlist_cols = [row[1] for row in cursor.fetchall()]
-            if 'date_added' in watchlist_cols:
-                cursor.execute("SELECT date_added FROM watchlist WHERE ticker = ?", (ticker,))
-                existing = cursor.fetchone()
-                if existing and existing[0]:
-                    values_dict['date_added'] = existing[0]
+        is_update = ticker in current_tickers_set
+        if is_update:
+            if ticker in date_added_map:
+                values_dict['date_added'] = date_added_map[ticker]
             values_dict['last_updated'] = current_timestamp
-            
-            # Build UPDATE from columns that exist in watchlist (exclude ownership columns)
-            cursor.execute("PRAGMA table_info(watchlist)")
-            watchlist_columns = [row[1] for row in cursor.fetchall() if row[1] != 'ticker']
-            update_cols = [c for c in values_dict.keys() if c in watchlist_columns]
-            if update_cols:
-                set_clause = ', '.join([f'{col} = ?' for col in update_cols])
-                update_values = [values_dict[col] for col in update_cols]
-                cursor.execute(f'UPDATE watchlist SET {set_clause} WHERE ticker = ?', update_values + [ticker])
-            stats['updated'] += 1
         else:
-            # Insert new entry (no ownership columns in values_dict)
             values_dict['date_added'] = current_timestamp
             values_dict['last_updated'] = current_timestamp
-            
-            cursor.execute("PRAGMA table_info(watchlist)")
-            watchlist_columns = [row[1] for row in cursor.fetchall() if row[1] != 'ticker']
-            insert_cols = ['ticker'] + watchlist_columns
-            placeholders = ', '.join(['?'] * len(insert_cols))
-            insert_values = [ticker] + [values_dict.get(col, None) for col in watchlist_columns]
-            cursor.execute(f'''
-                INSERT INTO watchlist ({', '.join(insert_cols)})
-                VALUES ({placeholders})
-            ''', insert_values)
-            stats['added'] += 1
-    
-    # Remove stocks not in filter results (only if not owned per positions table)
-    for ticker in current_tickers_set - filter_tickers_set:
-        if ticker not in owned_tickers_set:
-            cursor.execute("DELETE FROM watchlist WHERE ticker = ?", (ticker,))
+        pending.append((ticker, values_dict, is_update))
+
+    to_remove = [
+        t for t in (current_tickers_set - filter_tickers_set)
+        if t not in owned_tickers_set
+    ]
+    kept = [
+        t for t in (current_tickers_set - filter_tickers_set)
+        if t in owned_tickers_set
+    ]
+    stats['kept_with_shares'] = len(kept)
+
+    # Phase 3 — short write transaction
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        for ticker, values_dict, is_update in pending:
+            if is_update:
+                update_cols = [c for c in values_dict.keys() if c in watchlist_columns]
+                if update_cols:
+                    set_clause = ', '.join(['%s = ?' % col for col in update_cols])
+                    update_values = [values_dict[col] for col in update_cols]
+                    cursor.execute(
+                        'UPDATE watchlist SET %s WHERE ticker = ?' % set_clause,
+                        update_values + [ticker],
+                    )
+                stats['updated'] += 1
+            else:
+                insert_cols = ['ticker'] + watchlist_columns
+                placeholders = ', '.join(['?'] * len(insert_cols))
+                insert_values = [ticker] + [
+                    values_dict.get(col, None) for col in watchlist_columns
+                ]
+                cursor.execute(
+                    'INSERT INTO watchlist (%s) VALUES (%s)'
+                    % (', '.join(insert_cols), placeholders),
+                    insert_values,
+                )
+                stats['added'] += 1
+        for ticker in to_remove:
+            cursor.execute('DELETE FROM watchlist WHERE ticker = ?', (ticker,))
             stats['removed'] += 1
-        else:
-            stats['kept_with_shares'] += 1
-    
-    conn.commit()
-    conn.close()
-    
+        conn.commit()
+    finally:
+        conn.close()
+
     return stats
 
 
@@ -3857,17 +4810,120 @@ def check_sell_criteria(ticker: str, streaming_data: Dict[str, Any],
 # Trading Functions
 # ============================================================================
 
+def _placeholder_account_info(reason: str = '') -> Dict[str, Any]:
+    """
+    Unusable balances when Schwab is unavailable.
+
+    Intentionally null — never invent $10,000 (or any default) for UI / snapshots.
+    """
+    if reason:
+        print('Warning: %s Returning unavailable account info (no fabricated balances).' % reason)
+    return {
+        'ok': False,
+        'source': 'placeholder',
+        'cash': None,
+        'total_value': None,
+        'liquidation_value': None,
+        'round_trips': 0,
+        'positions': {},
+    }
+
+
+def _unavailable_account_info(reason: str = '') -> Dict[str, Any]:
+    """Unusable balances when the API responded but account data is missing."""
+    if reason:
+        print('Warning: %s' % reason)
+    return {
+        'ok': False,
+        'source': 'unavailable',
+        'cash': None,
+        'total_value': None,
+        'liquidation_value': None,
+        'round_trips': 0,
+        'positions': {},
+    }
+
+
+def _is_fabricated_balance_triplet(
+    cash: Any,
+    liquidation_value: Any,
+    total_value: Any,
+) -> bool:
+    """True for the legacy offline sentinel cash=liq=total=10000."""
+    try:
+        c = float(cash)
+        liq = float(liquidation_value)
+        tot = float(total_value)
+    except (TypeError, ValueError):
+        return False
+    return (
+        abs(c - 10000.0) < 0.01
+        and abs(liq - 10000.0) < 0.01
+        and abs(tot - 10000.0) < 0.01
+    )
+
+
+def account_info_usable(account: Optional[Dict[str, Any]]) -> bool:
+    """True when account balances look real enough to snapshot / chart."""
+    if not account:
+        return False
+    if account.get('ok') is False:
+        return False
+    if str(account.get('source') or '') in ('placeholder', 'unavailable'):
+        return False
+    if _is_fabricated_balance_triplet(
+        account.get('cash'),
+        account.get('liquidation_value'),
+        account.get('total_value'),
+    ):
+        return False
+    try:
+        liq = float(account.get('liquidation_value') or 0.0)
+        total = float(account.get('total_value') or 0.0)
+        cash = float(account.get('cash') or 0.0)
+    except (TypeError, ValueError):
+        return False
+    equity = liq if liq > 0 else total
+    # Equity is preferred; cash-only payloads still count when Schwab marked ok.
+    return equity > 0 or cash > 0
+
+
+def get_latest_account_snapshot(
+    exclude_fabricated: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Most recent persisted account snapshot for the current user (or None)."""
+    init_database()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        SELECT ts, cash, effective_cash, liquidation_value, total_value, note
+        FROM account_snapshots
+        WHERE COALESCE(liquidation_value, 0) > 0 OR COALESCE(total_value, 0) > 0
+        ORDER BY id DESC
+        LIMIT 40
+        '''
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    for ts, cash, effective, liq, total, note in rows:
+        if exclude_fabricated and _is_fabricated_balance_triplet(cash, liq, total):
+            continue
+        return {
+            'ts': ts,
+            'cash': float(cash) if cash is not None else None,
+            'effective_cash': float(effective) if effective is not None else None,
+            'liquidation_value': float(liq) if liq is not None else None,
+            'total_value': float(total) if total is not None else None,
+            'note': note,
+        }
+    return None
+
+
 def get_account_info() -> Dict[str, Any]:
     """Fetch account balance/info from Schwab API."""
     if not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
-        print("Warning: Schwab API not available. Returning placeholder account info.")
-        return {
-            'cash': 10000.0,
-            'total_value': 10000.0,
-            'liquidation_value': 10000.0,
-            'round_trips': 0,
-            'positions': {}
-        }
+        return _placeholder_account_info('Schwab API not available.')
     
     try:
         # Get linked accounts first
@@ -3884,8 +4940,7 @@ def get_account_info() -> Dict[str, Any]:
                 print(f"DEBUG: Linked accounts dict keys: {list(linked_accounts.keys())}")
         
         if not linked_accounts:
-            print("Warning: No linked accounts found.")
-            return {'cash': 0.0, 'total_value': 0.0, 'positions': {}}
+            return _unavailable_account_info('No linked accounts found.')
         
         # Handle different response formats
         if isinstance(linked_accounts, dict):
@@ -3899,12 +4954,16 @@ def get_account_info() -> Dict[str, Any]:
         if isinstance(linked_accounts, list) and len(linked_accounts) > 0:
             account_hash = linked_accounts[0].get('hashValue') or linked_accounts[0].get('accountHash') or linked_accounts[0].get('accountNumber')
         else:
-            print(f"Warning: Unexpected linked accounts format: {type(linked_accounts)}")
-            return {'cash': 0.0, 'total_value': 0.0, 'positions': {}}
+            return _unavailable_account_info(
+                'Unexpected linked accounts format: %s' % type(linked_accounts)
+            )
         
         if not account_hash:
-            print(f"Warning: Could not find account hash. First account data: {linked_accounts[0] if isinstance(linked_accounts, list) else linked_accounts}")
-            return {'cash': 0.0, 'total_value': 0.0, 'positions': {}}
+            print(
+                'Warning: Could not find account hash. First account data: %s'
+                % (linked_accounts[0] if isinstance(linked_accounts, list) else linked_accounts)
+            )
+            return _unavailable_account_info('Could not find account hash.')
         
         if config.DEBUG:
             print(f"DEBUG: Using account hash: {account_hash}")
@@ -3916,8 +4975,7 @@ def get_account_info() -> Dict[str, Any]:
         # Extract securitiesAccount (the actual account data is nested here)
         securities_account = account_data.get('securitiesAccount', {})
         if not securities_account:
-            print("Warning: No securitiesAccount found in response")
-            return {'cash': 0.0, 'total_value': 0.0, 'liquidation_value': 0.0, 'round_trips': 0, 'positions': {}}
+            return _unavailable_account_info('No securitiesAccount found in response')
         
         # Extract currentBalances (current account balances).
         # Cash is from the first linked account (account_hash). Which field is used is set in config.CASH_BALANCE_FIELD.
@@ -3960,19 +5018,24 @@ def get_account_info() -> Dict[str, Any]:
             quantity = pos.get('longQuantity', 0) - pos.get('shortQuantity', 0)
             if quantity != 0:
                 positions[symbol] = int(quantity)
-        
-        return {
+
+        result = {
+            'ok': True,
+            'source': 'schwab',
             'cash': float(cash) if cash else 0.0,
             'total_value': float(total_value) if total_value else 0.0,
             'liquidation_value': float(liquidation_value) if liquidation_value else 0.0,
             'round_trips': int(round_trips) if round_trips is not None else 0,
-            'positions': positions
+            'positions': positions,
         }
+        if not account_info_usable(result):
+            return _unavailable_account_info(
+                'Schwab returned zero equity/cash balances (token or account read failed?).'
+            )
+        return result
         
     except Exception as e:
-        print(f"Error fetching account info from Schwab: {e}")
-        print("Returning placeholder account info.")
-        return {'cash': 10000.0, 'total_value': 10000.0, 'liquidation_value': 10000.0, 'round_trips': 0, 'positions': {}}
+        return _placeholder_account_info('Error fetching account info from Schwab: %s.' % e)
 
 
 def get_pending_orders_total_dollars() -> float:
@@ -3991,12 +5054,51 @@ def get_pending_orders_total_dollars() -> float:
 
 def trade_dry_run_enabled() -> bool:
     """True = log what we would do; do not submit orders to Schwab."""
-    return bool(getattr(config, 'TRADE_DRY_RUN', True))
+    try:
+        return bool(uc.get_user_settings(_uid()).get('trade_dry_run', True))
+    except Exception:
+        return bool(getattr(config, 'TRADE_DRY_RUN', True))
 
 
 def minimum_cash() -> float:
-    """Cash floor from config.MINIMUM_CASH — change that setting only."""
+    """Cash floor — per-user setting, falling back to config.MINIMUM_CASH."""
+    try:
+        val = uc.get_user_settings(_uid()).get('minimum_cash')
+        if val is not None:
+            return float(val)
+    except Exception:
+        pass
     return float(config.MINIMUM_CASH)
+
+
+def minimum_liquidation_value() -> float:
+    """Account-value floor — per-user setting, falling back to config."""
+    try:
+        val = uc.get_user_settings(_uid()).get('minimum_liquidation_value')
+        if val is not None:
+            return float(val)
+    except Exception:
+        pass
+    return float(getattr(config, 'MINIMUM_LIQUIDATION_VALUE', 25000.0))
+
+
+def active_watchlist_filter() -> str:
+    """One active filter per user (not switched from the webpage)."""
+    try:
+        name = uc.get_user_settings(_uid()).get('active_filter') or 'safe'
+        return str(name)
+    except Exception:
+        return str(getattr(config, 'WATCHLIST_FILTER_NAME', 'safe') or 'safe')
+
+
+def order_amount_dollars() -> float:
+    try:
+        val = uc.get_user_settings(_uid()).get('order_amount_dollars')
+        if val is not None:
+            return float(val)
+    except Exception:
+        pass
+    return float(getattr(config, 'ORDER_AMOUNT_DOLLARS', 1000.0))
 
 
 def schwab_order_submit_allowed() -> bool:
@@ -4030,15 +5132,23 @@ def is_trading_allowed(
     
     if not account_data:
         return False, "Could not fetch account information"
-    
-    liquidation_value = account_data.get('liquidation_value', 0.0)
-    min_liquidation = getattr(config, 'MINIMUM_LIQUIDATION_VALUE', 25000.0)
+    if not account_info_usable(account_data):
+        return False, "Schwab account balances unavailable — reconnect or wait for sync; trading blocked."
+
+    try:
+        liquidation_value = float(account_data.get('liquidation_value') or 0.0)
+    except (TypeError, ValueError):
+        liquidation_value = 0.0
+    min_liquidation = minimum_liquidation_value()
     if liquidation_value < min_liquidation:
         return False, f"Liquidation value (${liquidation_value:,.2f}) is below minimum (${min_liquidation:,.2f}); trading blocked."
     
     # Effective cash = Schwab cash minus pending (unfilled) buy orders (+ this-pass reserves).
     # Must not drop below cash floor after this trade.
-    cash = account_data.get('cash', 0.0)
+    try:
+        cash = float(account_data.get('cash') or 0.0)
+    except (TypeError, ValueError):
+        cash = 0.0
     pending_total = get_pending_orders_total_dollars() + float(extra_reserved_dollars or 0.0)
     effective_cash = cash - pending_total
     min_cash = minimum_cash()
@@ -4098,12 +5208,13 @@ def fetch_and_sync_schwab_positions(account_hash: Optional[str] = None) -> int:
         account_hash: Optional account hash. If None, uses first linked account.
     
     Returns:
-        Number of positions synced.
+        Number of positions synced. -1 on hard failure; -2 if deferred (DB locked).
     """
     if not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
         print("Warning: Schwab API not available. Cannot sync positions.")
         return 0
-    
+
+    # Fetch Schwab once, then retry only the DB write if the trader loop holds a lock.
     try:
         if not account_hash:
             linked_accounts_response = SCHWAB_CLIENT.linked_accounts()
@@ -4118,18 +5229,49 @@ def fetch_and_sync_schwab_positions(account_hash: Optional[str] = None) -> int:
             if not account_hash:
                 print("Error: Could not get account hash.")
                 return 0
-        
+
         resp = SCHWAB_CLIENT.account_details(account_hash, fields="positions")
         if resp.status_code != 200:
             print(f"Error fetching positions: Status {resp.status_code}")
             return 0
-        
+
         account_data = resp.json()
         securities_account = account_data.get('securitiesAccount', {})
         positions_data = securities_account.get('positions', [])
-        
-        if not positions_data:
-            conn = get_connection()
+    except Exception as e:
+        print(f"Error syncing positions from Schwab: {e}")
+        return -1
+
+    for attempt in range(5):
+        try:
+            return _apply_schwab_positions_to_db(positions_data, account_hash)
+        except sqlite3.OperationalError as e:
+            if not _db_is_locked(e):
+                print(f"Error syncing positions from Schwab: {e}")
+                import traceback
+                traceback.print_exc()
+                return -1
+            time.sleep(0.2 * (attempt + 1))
+        except Exception as e:
+            print(f"Error syncing positions from Schwab: {e}")
+            import traceback
+            traceback.print_exc()
+            return -1
+    print(
+        'Warning: position sync deferred — database is locked '
+        '(trader loop busy; will retry on next refresh)'
+    )
+    return -2
+
+
+def _apply_schwab_positions_to_db(
+    positions_data: List[Dict[str, Any]],
+    account_hash: Optional[str],
+) -> int:
+    """Write a Schwab positions payload into the local positions table."""
+    if not positions_data:
+        conn = get_connection(timeout=10.0, busy_timeout_ms=8000)
+        try:
             cursor = conn.cursor()
             try:
                 cursor.execute(
@@ -4138,14 +5280,17 @@ def fetch_and_sync_schwab_positions(account_hash: Optional[str] = None) -> int:
                 for tkr, oid in cursor.fetchall():
                     if oid:
                         cancel_stop_order(str(oid), account_hash=account_hash)
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as e:
+                if _db_is_locked(e):
+                    raise
             cursor.execute("DELETE FROM positions")
             conn.commit()
+        finally:
             conn.close()
-            return 0
-        
-        conn = get_connection()
+        return 0
+
+    conn = get_connection(timeout=10.0, busy_timeout_ms=8000)
+    try:
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(positions)")
         pos_cols = [row[1] for row in cursor.fetchall()]
@@ -4201,8 +5346,9 @@ def fetch_and_sync_schwab_positions(account_hash: Optional[str] = None) -> int:
                             })
                         if oid and not str(oid).startswith('SIM'):
                             cancel_stop_order(str(oid), account_hash=account_hash)
-                except sqlite3.OperationalError:
-                    pass
+                except sqlite3.OperationalError as e:
+                    if _db_is_locked(e):
+                        raise
                 cursor.execute("DELETE FROM positions WHERE ticker = ?", (ticker,))
                 continue
             seen_tickers.add(ticker)
@@ -4294,27 +5440,34 @@ def fetch_and_sync_schwab_positions(account_hash: Optional[str] = None) -> int:
                     if oid and not str(oid).startswith('SIM'):
                         cancel_stop_order(str(oid), account_hash=account_hash)
                     cursor.execute("DELETE FROM positions WHERE ticker = ?", (tkr,))
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as e:
+            if _db_is_locked(e):
+                raise
             pass
 
         conn.commit()
-        conn.close()
-        set_runtime_flag(
-            'positions_synced_at',
-            datetime.now().isoformat(timespec='seconds'),
-        )
-        for ex in closed_exits:
-            _log_position_closed_on_sync(ex)
+        synced_count = synced
+        closed = list(closed_exits)
+    finally:
         try:
-            bump_dashboard_rev()
+            conn.close()
         except Exception:
             pass
-        return synced
-    except Exception as e:
-        print(f"Error syncing positions from Schwab: {e}")
-        import traceback
-        traceback.print_exc()
-        return -1
+
+    set_runtime_flag(
+        'positions_synced_at',
+        datetime.now().isoformat(timespec='seconds'),
+        timeout=2.0,
+        busy_timeout_ms=2000,
+        retries=2,
+    )
+    for ex in closed:
+        _log_position_closed_on_sync(ex)
+    try:
+        bump_dashboard_rev()
+    except Exception:
+        pass
+    return synced_count
 
 
 def _log_position_closed_on_sync(ex: Dict[str, Any]) -> None:
@@ -4406,6 +5559,16 @@ def refresh_schwab_positions_if_needed(
         }
 
     count = fetch_and_sync_schwab_positions()
+    if count is not None and int(count) == -2:
+        return {
+            'ok': False,
+            'synced': False,
+            'skipped': True,
+            'reason': 'database_locked',
+            'age_seconds': age,
+            'synced_at': last_s,
+            'count': 0,
+        }
     if count is not None and int(count) < 0:
         return {
             'ok': False,
@@ -6080,6 +7243,21 @@ def record_account_snapshot(note: str = '') -> None:
     """Persist cash + liquidation snapshot (cash is primary success metric)."""
     init_database()
     account = get_account_info() or {}
+    if not account_info_usable(account):
+        msg = 'Skipped account snapshot (%s): unusable Schwab balances' % (note or 'untitled')
+        print('Warning: %s' % msg)
+        try:
+            log_event('account', msg, detail={
+                'note': note,
+                'source': account.get('source'),
+                'ok': account.get('ok'),
+                'cash': account.get('cash'),
+                'liquidation_value': account.get('liquidation_value'),
+                'total_value': account.get('total_value'),
+            })
+        except Exception:
+            pass
+        return
     cash = float(account.get('cash') or 0.0)
     pending = get_pending_orders_total_dollars()
     effective = cash - pending
@@ -6102,6 +7280,35 @@ def record_account_snapshot(note: str = '') -> None:
     )
     conn.commit()
     conn.close()
+
+
+def purge_invalid_account_snapshots() -> int:
+    """
+    Remove unusable snapshot rows so charts / Cash never show fabricated balances:
+      - zero equity (failed API reads)
+      - legacy offline sentinel cash=liq=total=10000
+    """
+    init_database()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        DELETE FROM account_snapshots
+        WHERE (
+            COALESCE(liquidation_value, 0) <= 0
+            AND COALESCE(total_value, 0) <= 0
+        )
+        OR (
+            ABS(COALESCE(cash, 0) - 10000) < 0.01
+            AND ABS(COALESCE(liquidation_value, 0) - 10000) < 0.01
+            AND ABS(COALESCE(total_value, 0) - 10000) < 0.01
+        )
+        '''
+    )
+    removed = int(cursor.rowcount or 0)
+    conn.commit()
+    conn.close()
+    return removed
 
 
 # ============================================================================
@@ -6520,17 +7727,39 @@ def get_algorithm_performance() -> Dict[str, Any]:
     books = list_position_books()
     account = get_account_info() or {}
     pending = get_pending_orders_total_dollars()
-    cash = float(account.get('cash') or 0.0)
-    effective = cash - pending
-    liq = float(account.get('liquidation_value') or 0.0)
-    total = float(account.get('total_value') or liq or 0.0)
+    # Never surface fabricated placeholder balances — fall back to last real snapshot.
+    if not account_info_usable(account):
+        last = get_latest_account_snapshot() or {}
+        cash = float(last['cash']) if last.get('cash') is not None else None
+        liq = (
+            float(last['liquidation_value'])
+            if last.get('liquidation_value') is not None else None
+        )
+        total = (
+            float(last['total_value'])
+            if last.get('total_value') is not None
+            else liq
+        )
+    else:
+        cash = float(account.get('cash') or 0.0)
+        liq = float(account.get('liquidation_value') or 0.0)
+        total = float(account.get('total_value') or liq or 0.0)
+    effective = (cash - pending) if cash is not None else None
 
     start_liq = float(snap['liquidation_value']) if snap and snap.get('liquidation_value') is not None else None
     start_total = float(snap['total_value']) if snap and snap.get('total_value') is not None else None
     start_eff = float(snap['effective_cash']) if snap and snap.get('effective_cash') is not None else None
     baseline = start_liq if start_liq is not None else start_total
-    current_eq = liq if liq else total
-    equity_delta = (current_eq - baseline) if baseline is not None else None
+    current_eq = None
+    if liq is not None and float(liq) > 0:
+        current_eq = float(liq)
+    elif total is not None and float(total) > 0:
+        current_eq = float(total)
+    equity_delta = (
+        (current_eq - baseline)
+        if baseline is not None and current_eq is not None
+        else None
+    )
 
     # Trades since start — split scorecard vs excluded
     trades_since = []  # type: List[Dict[str, Any]]
@@ -6738,6 +7967,13 @@ def maybe_record_daily_equity_close() -> bool:
         return False
     try:
         record_account_snapshot(note='daily_close')
+        # record_account_snapshot may skip unusable API reads — only count if persisted
+        if not _has_daily_close_for_date(day):
+            print(
+                'Warning: daily equity close skipped for %s (unusable account info)'
+                % day.isoformat()
+            )
+            return False
         log_event('account', 'Daily equity close snapshot for %s' % day.isoformat())
         print('Recorded daily equity close snapshot for %s' % day.isoformat())
         return True
@@ -6754,24 +7990,27 @@ def get_account_equity_daily_series(
     One equity point per calendar day from account_snapshots.
 
     Preference within a day: daily_close > algorithm_start > other notes (last ts).
-    Appends a live mark for today when no daily_close exists yet.
+    Read-only — no purge / no live Schwab call (those blocked the web chart).
     """
     init_database()
     if end_day is None:
         end_day = _now_market().date()
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        '''
-        SELECT ts, cash, effective_cash, liquidation_value, total_value, note
-        FROM account_snapshots
-        WHERE substr(ts, 1, 10) >= ? AND substr(ts, 1, 10) <= ?
-        ORDER BY ts ASC
-        ''',
-        (start_day.isoformat(), end_day.isoformat()),
-    )
-    rows = cursor.fetchall()
-    conn.close()
+    # Fail fast if the trader loop holds a write lock — chart should still load.
+    conn = get_connection(timeout=3.0, busy_timeout_ms=2000)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT ts, cash, effective_cash, liquidation_value, total_value, note
+            FROM account_snapshots
+            WHERE substr(ts, 1, 10) >= ? AND substr(ts, 1, 10) <= ?
+            ORDER BY ts ASC
+            ''',
+            (start_day.isoformat(), end_day.isoformat()),
+        )
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
 
     by_day = {}  # type: Dict[str, Dict[str, Any]]
     rank = {'daily_close': 3, 'algorithm_start': 2}
@@ -6792,7 +8031,10 @@ def get_account_equity_daily_series(
                 equity = float(total)
             except (TypeError, ValueError):
                 equity = None
-        if equity is None:
+        # Ignore failed API reads persisted as $0 (would chart as -100%)
+        if equity is None or equity <= 0:
+            continue
+        if _is_fabricated_balance_triplet(cash, liq, total):
             continue
         candidate = {
             'date': day_s,
@@ -6813,35 +8055,6 @@ def get_account_equity_daily_series(
             by_day[day_s] = candidate
         elif candidate['_rank'] == prev['_rank'] and (ts or '') >= (prev.get('ts') or ''):
             by_day[day_s] = candidate
-
-    # Live mark for today (intraday / before close snapshot lands)
-    today = _now_market().date()
-    if start_day <= today <= end_day:
-        today_s = today.isoformat()
-        existing = by_day.get(today_s)
-        if existing is None or (existing.get('note') or '') != 'daily_close':
-            account = get_account_info() or {}
-            live_eq = None
-            try:
-                if account.get('liquidation_value') is not None:
-                    live_eq = float(account['liquidation_value'])
-                elif account.get('total_value') is not None:
-                    live_eq = float(account['total_value'])
-            except (TypeError, ValueError):
-                live_eq = None
-            if live_eq is not None:
-                by_day[today_s] = {
-                    'date': today_s,
-                    'equity': live_eq,
-                    'ts': datetime.now().isoformat(timespec='seconds'),
-                    'note': 'live',
-                    'cash': float(account['cash']) if account.get('cash') is not None else None,
-                    'effective_cash': None,
-                    'liquidation_value': float(account['liquidation_value'])
-                    if account.get('liquidation_value') is not None else None,
-                    'total_value': float(account['total_value'])
-                    if account.get('total_value') is not None else None,
-                }
 
     out = []  # type: List[Dict[str, Any]]
     for day_s in sorted(by_day.keys()):
@@ -6910,9 +8123,10 @@ def get_performance_comparison(range_key: str = '1M') -> Dict[str, Any]:
 
     Window is clamped to elapsed time since algorithm_start. Both series are
     normalized to 0% at the first point in the (clamped) window — brokerage style.
+
+    Read-only for the web dashboard — daily_close recording stays on the trader loop.
     """
     init_database()
-    maybe_record_daily_equity_close()
 
     key = (range_key or '1M').strip().upper()
     if key not in PERFORMANCE_RANGES:
@@ -7078,7 +8292,7 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         ranked: Optional ticker list (analyst-upside order). If None, uses current
                 DB watchlist. Dry-run passes the filter result to simulate a refresh.
     """
-    order_amount = float(getattr(config, 'ORDER_AMOUNT_DOLLARS', 1000.0))
+    order_amount = order_amount_dollars()
     # Rank #1–N by analyst upside: skip reasons here are worth a dashboard WARN.
     warn_top_n = int(getattr(config, 'BUY_WARN_TOP_N', 5))
     if ranked is None:
@@ -7229,7 +8443,7 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
             msg = (
                 f"Enough cash for a ${order_amount:.0f} buy, but no eligible "
                 f"watchlist names left (owned/pending/rebuy-debounce/no Schwab price). "
-                f"Consider loosening the '{getattr(config, 'WATCHLIST_FILTER_NAME', 'safe')}' filter "
+                f"Consider loosening the '{active_watchlist_filter()}' filter "
                 f"or checking Schwab connectivity."
             )
             print(f"⚠️  {msg}")
@@ -7242,7 +8456,7 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         elif not ranked:
             msg = (
                 f"Watchlist is empty. "
-                f"Filter '{getattr(config, 'WATCHLIST_FILTER_NAME', 'safe')}' may be too tight "
+                f"Filter '{active_watchlist_filter()}' may be too tight "
                 f"or Yahoo data needs a refresh. ({fund_reason})"
             )
             print(f"⚠️  {msg}")
@@ -7709,7 +8923,7 @@ def dry_run_system() -> Dict[str, Any]:
     cash = float(account.get('cash') or 0.0)
     effective_cash = cash - pending
     min_cash = minimum_cash()
-    order_amount = float(getattr(config, 'ORDER_AMOUNT_DOLLARS', 1000.0))
+    order_amount = order_amount_dollars()
     # Cash that can go to new buys while staying at/above the cash floor
     spendable = max(0.0, effective_cash - min_cash)
     buys_affordable = int(spendable // order_amount) if order_amount > 0 else 0
@@ -7832,7 +9046,7 @@ def dry_run_system() -> Dict[str, Any]:
     # Job 2 detail: watchlist + buys
     print("\n--- 2) Watchlist update + buys ---")
     wl_due = is_job_due(JOB_WATCHLIST_AND_BUYS, _watchlist_job_interval_days())
-    filter_name = getattr(config, 'WATCHLIST_FILTER_NAME', 'safe')
+    filter_name = active_watchlist_filter()
     wl_would = wl_due and market_open
     if wl_would:
         print(
@@ -7966,7 +9180,7 @@ def run_watchlist_and_buys_job() -> bool:
         print(f"Job {JOB_WATCHLIST_AND_BUYS}: skipped — market closed")
         return False
     interval = _watchlist_job_interval_days()
-    filter_name = getattr(config, 'WATCHLIST_FILTER_NAME', 'safe')
+    filter_name = active_watchlist_filter()
     mark_job_started(JOB_WATCHLIST_AND_BUYS, interval)
     try:
         sync = refresh_schwab_positions_if_needed(force=True)
@@ -8092,7 +9306,7 @@ def get_yahoo_staleness_summary() -> Dict[str, Any]:
     init_database()
     current_date = datetime.now().strftime('%Y-%m-%d')
     max_age_days = int(getattr(config, 'MARKET_DATA_REFRESH_DAYS', 7))
-    conn = get_connection()
+    conn = get_fundamentals_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT COUNT(*) FROM fundamentals')
     in_db = int(cursor.fetchone()[0] or 0)
@@ -8259,8 +9473,8 @@ def _watchlist_filter_catalog() -> Dict[str, Dict[str, Any]]:
 
 
 def get_watchlist_filter_description(filter_name: Optional[str] = None) -> Dict[str, Any]:
-    """Return one filter description (defaults to WATCHLIST_FILTER_NAME)."""
-    name = filter_name or getattr(config, 'WATCHLIST_FILTER_NAME', 'safe')
+    """Return one filter description (defaults to this user's active filter)."""
+    name = filter_name or active_watchlist_filter()
     name = str(name).strip().lower()
     catalog = _watchlist_filter_catalog()
     desc = catalog.get(name)
@@ -8268,7 +9482,7 @@ def get_watchlist_filter_description(filter_name: Optional[str] = None) -> Dict[
         return {
             'name': name,
             'title': name,
-            'summary': 'Unknown filter configured in WATCHLIST_FILTER_NAME.',
+            'summary': 'Unknown filter configured for this user.',
             'ranking': None,
             'criteria': [],
             'disabled': [],
@@ -8277,9 +9491,9 @@ def get_watchlist_filter_description(filter_name: Optional[str] = None) -> Dict[
 
 
 def get_watchlist_filter_dashboard() -> Dict[str, Any]:
-    """Dashboard payload: active filter + full catalog for the UI dropdown."""
+    """Dashboard payload: active filter + full catalog for the UI dropdown (view-only)."""
     catalog = _watchlist_filter_catalog()
-    active = str(getattr(config, 'WATCHLIST_FILTER_NAME', 'safe')).strip().lower()
+    active = str(active_watchlist_filter()).strip().lower()
     # Stable UI order: safe first, then risky, then any future filters
     order = ['safe', 'risky']
     filters = [catalog[k] for k in order if k in catalog]
@@ -8302,9 +9516,9 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
     """
     dry = trade_dry_run_enabled()
     min_cash = minimum_cash()
-    min_liq = float(getattr(config, 'MINIMUM_LIQUIDATION_VALUE', 25000.0))
-    order_amt = float(getattr(config, 'ORDER_AMOUNT_DOLLARS', 1000.0))
-    filter_name = str(getattr(config, 'WATCHLIST_FILTER_NAME', 'safe'))
+    min_liq = minimum_liquidation_value()
+    order_amt = order_amount_dollars()
+    filter_name = str(active_watchlist_filter())
     rebuy_rule = str(getattr(config, 'REBUY_RULE', 'below_sell_discount'))
     rebuy_pct = float(getattr(config, 'REBUY_DISCOUNT_PCT', 0.05)) * 100.0
     trail_act = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10)) * 100.0
@@ -8433,18 +9647,11 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
     return {'count': len(rules), 'rules': rules}
 
 
-_JOB_DISPLAY_NAMES = {
-    'refresh_market_data': 'Yahoo refresh',
-    'schwab_sync': 'Schwab sync',
-    'watchlist_and_buys': 'Watchlist & buys',
-    'sell_check': 'Sell check',
-}
-
-
 def get_next_scheduled_tasks() -> List[Dict[str, Any]]:
     """
     Upcoming scheduled tasks, soonest first.
     RTH-only tasks that are due while the market is closed wait until next open.
+    Jobs with status=running show elapsed time instead of a bare "now".
     """
     init_database()
     now = datetime.now()
@@ -8452,19 +9659,41 @@ def get_next_scheduled_tasks() -> List[Dict[str, Any]]:
     next_open = _as_naive_local(next_us_equity_market_open())
     items = []  # type: List[Dict[str, Any]]
     for job_name, _fn, interval_days in get_scheduled_jobs():
+        row = get_job_run(job_name)
+        status = str((row or {}).get('status') or '')
+        running = status == 'running'
+        running_minutes = None  # type: Optional[int]
+        if running and row and row.get('last_started'):
+            try:
+                started = datetime.fromisoformat(str(row['last_started']))
+                running_minutes = int(
+                    max(0, (now - started).total_seconds() // 60)
+                )
+            except (TypeError, ValueError):
+                running_minutes = 0
+
         due = is_job_due(job_name, interval_days)
         due_at = next_job_due_at(job_name, interval_days)
         needs_rth = job_name in JOBS_REQUIRE_MARKET_OPEN
-        if due:
+        if due or running:
             run_at = now
         else:
             run_at = due_at if due_at is not None else now
         if needs_rth and not market_open and run_at < next_open:
             run_at = next_open
+            running = False
         seconds = (run_at - now).total_seconds()
         minutes = int(max(0, round(seconds / 60.0)))
         title = _JOB_DISPLAY_NAMES.get(job_name, job_name.replace('_', ' ').title())
-        if minutes <= 0:
+        if running:
+            if running_minutes is None or running_minutes <= 0:
+                when = 'running'
+            elif running_minutes == 1:
+                when = 'running 1 min'
+            else:
+                when = 'running %d min' % running_minutes
+            minutes = 0
+        elif minutes <= 0:
             when = 'now'
         elif minutes == 1:
             when = 'in 1 minute'
@@ -8473,18 +9702,27 @@ def get_next_scheduled_tasks() -> List[Dict[str, Any]]:
             when = 'in 1 hour' if hours == 1 else 'in %d hours' % hours
         else:
             when = 'in %d minutes' % minutes
-        label = '%s %s' % (title, when) if when != 'now' else '%s now' % title
+        label = '%s %s' % (title, when)
         items.append({
             'job_name': job_name,
             'title': title,
             'due_at': run_at.isoformat(timespec='seconds'),
             'minutes_until': minutes,
-            'due_now': minutes <= 0,
+            'due_now': (not running) and minutes <= 0,
+            'running': bool(running),
+            'running_minutes': running_minutes,
+            'status': status or None,
             'requires_market_open': needs_rth,
             'when': when,
             'label': label,
         })
-    items.sort(key=lambda x: (int(x['minutes_until']), str(x['title'])))
+    items.sort(
+        key=lambda x: (
+            0 if x.get('running') else 1,
+            int(x['minutes_until']),
+            str(x['title']),
+        )
+    )
     return items
 
 
@@ -8511,6 +9749,24 @@ def get_dashboard_status() -> Dict[str, Any]:
             'progress_note': row.get('progress_note') if row else None,
             'next_due': due_at.isoformat() if due_at else None,
         })
+    user = uc.get_user_by_id(_uid())
+    try:
+        setup = get_account_setup_status()
+    except Exception:
+        setup = {'setup_complete': True}
+    try:
+        algo_ctl = get_algorithm_control_status()
+    except Exception:
+        algo_ctl = {'needs_first_run': False}
+    schwab = get_schwab_auth_status()
+    try:
+        stage = get_onboarding_stage()
+    except Exception:
+        stage = 'done'
+    needs_attention = (
+        stage != 'done'
+        or bool(schwab.get('warn'))
+    )
     return {
         'ts': datetime.now().isoformat(timespec='seconds'),
         'dashboard_rev': get_dashboard_rev(),
@@ -8526,7 +9782,17 @@ def get_dashboard_status() -> Dict[str, Any]:
         'yahoo': get_yahoo_staleness_summary(),
         'watchlist_filter': get_watchlist_filter_dashboard(),
         'trading_rules': get_trading_rules_dashboard(),
-        'schwab': get_schwab_auth_status(),
+        'schwab': schwab,
+        'account_setup': setup,
+        'algorithm_control': algo_ctl,
+        'onboarding_stage': stage,
+        'actions_attention': needs_attention,
+        'user': {
+            'id': _uid(),
+            'username': (user or {}).get('username'),
+            'display_name': (user or {}).get('display_name'),
+            'is_admin': bool((user or {}).get('is_admin')),
+        },
     }
 
 
@@ -8633,15 +9899,87 @@ def _dashboard_position_status(
     }
 
 
+_dashboard_refresh_lock = threading.Lock()
+_dashboard_refresh_started = 0.0
+
+
+def _positions_sync_status_from_flags() -> Dict[str, Any]:
+    """Last known positions sync metadata (no Schwab / no write)."""
+    last_s = get_runtime_flag('positions_synced_at')
+    age = None  # type: Optional[float]
+    if last_s:
+        try:
+            age = (datetime.now() - datetime.fromisoformat(last_s)).total_seconds()
+        except ValueError:
+            age = None
+    min_age = float(getattr(config, 'POSITIONS_SYNC_MIN_INTERVAL_SECONDS', 45))
+    fresh = age is not None and age < min_age
+    return {
+        'ok': True,
+        'synced': False,
+        'skipped': True,
+        'reason': 'fresh' if fresh else 'pending_refresh',
+        'age_seconds': age,
+        'synced_at': last_s,
+        'count': None,
+    }
+
+
+def _schedule_dashboard_schwab_refresh() -> None:
+    """
+    Fire-and-forget Schwab reconcile/sync so /api/portfolio never blocks the UI.
+
+    The trader loop also syncs during sell_check; this keeps marks fresher while
+    someone is watching the Trader page, without waiting on DB writers.
+    """
+    global _dashboard_refresh_started
+    min_age = float(getattr(config, 'POSITIONS_SYNC_MIN_INTERVAL_SECONDS', 45))
+    status = _positions_sync_status_from_flags()
+    if status.get('reason') == 'fresh':
+        return
+    now = time.time()
+    with _dashboard_refresh_lock:
+        if now - _dashboard_refresh_started < min_age:
+            return
+        _dashboard_refresh_started = now
+    uid = uc.current_user_id()
+
+    def _worker():
+        try:
+            ctx = uc.use_user(int(uid)) if uid is not None else _nullcontext()
+            with ctx:
+                if uid is not None:
+                    _sync_schwab_globals(int(uid))
+                try:
+                    reconcile_pending_orders()
+                except Exception:
+                    pass
+                try:
+                    refresh_schwab_positions_if_needed(force=False)
+                except Exception:
+                    pass
+                # Refresh cash / equity snapshot when Schwab is reachable
+                try:
+                    maybe_reinit_schwab_client()
+                    if account_info_usable(get_account_info() or {}):
+                        record_account_snapshot(note='dashboard_sync')
+                except Exception:
+                    pass
+        except Exception as e:
+            print('dashboard background sync: %s' % e)
+
+    threading.Thread(
+        target=_worker, daemon=True, name='dashboard-schwab-sync'
+    ).start()
+
+
 def get_dashboard_portfolio() -> Dict[str, Any]:
     """Trader page: positions, pending orders, totals (read-only)."""
     init_database()
-    # Refresh Schwab marks + clear filled pending buys so the UI is not stale.
-    try:
-        reconcile_pending_orders()
-    except Exception:
-        pass
-    positions_sync = refresh_schwab_positions_if_needed(force=False)
+    # Do not await Schwab/DB writers here — that could stall Loading for ~60s
+    # when the trader loop holds a write lock. Kick a background refresh instead.
+    _schedule_dashboard_schwab_refresh()
+    positions_sync = _positions_sync_status_from_flags()
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("PRAGMA table_info(positions)")
@@ -8771,13 +10109,6 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
     except sqlite3.OperationalError:
         pass
 
-    cursor.execute(
-        '''
-        SELECT ts, cash, effective_cash, liquidation_value, total_value, note
-        FROM account_snapshots ORDER BY id DESC LIMIT 1
-        '''
-    )
-    snap = cursor.fetchone()
     conn.close()
 
     open_orders = []  # type: List[Dict[str, Any]]
@@ -8802,6 +10133,40 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
             getattr(config, 'POSITIONS_SYNC_MIN_INTERVAL_SECONDS', 45)
         ) * 3
     )
+
+    # Cash / account value: last real Schwab snapshot only (never fabricated $10k).
+    # Green while younger than SCHWAB_SYNC_INTERVAL_MINUTES; orange after that.
+    # Do not purge here — DELETE on every portfolio poll contends with the trader loop.
+    snap_dict = get_latest_account_snapshot(exclude_fabricated=True)
+    account_snapshot = None  # type: Optional[Dict[str, Any]]
+    if snap_dict:
+        snap_age = None  # type: Optional[float]
+        try:
+            snap_age = (
+                datetime.now() - datetime.fromisoformat(str(snap_dict['ts']))
+            ).total_seconds()
+        except Exception:
+            snap_age = None
+        stale_after = float(
+            getattr(config, 'SCHWAB_SYNC_INTERVAL_MINUTES', 5)
+        ) * 60.0
+        snap_stale = snap_age is None or snap_age > stale_after
+        # Also stale when Schwab client is down (showing last known real balance)
+        if not SCHWAB_AVAILABLE:
+            snap_stale = True
+        account_snapshot = {
+            'ts': snap_dict.get('ts'),
+            'cash': snap_dict.get('cash'),
+            'effective_cash': snap_dict.get('effective_cash'),
+            'liquidation_value': snap_dict.get('liquidation_value'),
+            'total_value': snap_dict.get('total_value'),
+            'note': snap_dict.get('note'),
+            'stale': bool(snap_stale),
+            'age_seconds': snap_age,
+            'fresh_within_seconds': stale_after,
+            'source': 'snapshot',
+        }
+
     return {
         'ts': datetime.now().isoformat(timespec='seconds'),
         'positions': positions,
@@ -8817,6 +10182,8 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
         'books': {
             'legacy': books['legacy'],
             'algorithm': books['algorithm'],
+            'algo_buys': books.get('algo_buys') or [],
+            'enrolled': books.get('enrolled') or [],
             'untagged': books['untagged'],
         },
         'algorithm': get_algorithm_performance(),
@@ -8835,32 +10202,70 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
                 '(from trade_history). Day/open P/L are Schwab-synced position fields.'
             ),
         },
-        'account_snapshot': {
-            'ts': snap[0] if snap else None,
-            'cash': snap[1] if snap else None,
-            'effective_cash': snap[2] if snap else None,
-            'liquidation_value': snap[3] if snap else None,
-            'total_value': snap[4] if snap else None,
-            'note': snap[5] if snap else None,
-        } if snap else None,
+        'account_snapshot': account_snapshot,
     }
 
 
-def get_dashboard_events(limit: int = 100) -> List[Dict[str, Any]]:
-    """Log page: newest structured events first."""
+def get_dashboard_events(
+    limit: int = 100,
+    categories: Optional[List[str]] = None,
+    before_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Log page: newest structured events for the current user only.
+
+    Returns {'events': [...], 'has_more': bool}. Use before_id to page older
+    (id < before_id). Fetches limit+1 rows so has_more is exact.
+    """
     init_database()
     limit = max(1, min(int(limit), 500))
+    uid = _uid()
+    user = uc.get_user_by_id(uid) or {}
+
+    allowed = {'buy', 'sell', 'watchlist', 'task'}
+    cats = []  # type: List[str]
+    if categories:
+        for raw in categories:
+            key = normalize_log_category(raw)
+            if key in allowed and key not in cats:
+                cats.append(key)
+
+    before = None  # type: Optional[int]
+    if before_id is not None:
+        try:
+            before = int(before_id)
+        except (TypeError, ValueError):
+            before = None
+        if before is not None and before < 1:
+            before = None
+
+    fetch_n = limit + 1
+    where_parts = []  # type: List[str]
+    params = []  # type: List[Any]
+    if cats:
+        placeholders = ','.join(['?'] * len(cats))
+        where_parts.append('category IN (%s)' % placeholders)
+        params.extend(cats)
+    if before is not None:
+        where_parts.append('id < ?')
+        params.append(before)
+    params.append(fetch_n)
+
+    sql = 'SELECT id, ts, level, category, message, detail_json FROM event_log'
+    if where_parts:
+        sql += ' WHERE ' + ' AND '.join(where_parts)
+    sql += ' ORDER BY id DESC LIMIT ?'
+
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute(
-        '''
-        SELECT id, ts, level, category, message, detail_json
-        FROM event_log ORDER BY id DESC LIMIT ?
-        ''',
-        (limit,)
-    )
+    cursor.execute(sql, tuple(params))
     rows = cursor.fetchall()
     conn.close()
+
+    has_more = len(rows) > limit
+    if has_more:
+        rows = rows[:limit]
+
     events = []  # type: List[Dict[str, Any]]
     for r in rows:
         detail = None
@@ -8876,8 +10281,424 @@ def get_dashboard_events(limit: int = 100) -> List[Dict[str, Any]]:
             'category': r[3],
             'message': r[4],
             'detail': detail,
+            'user_id': uid,
+            'username': user.get('username'),
+            'display_name': user.get('display_name') or user.get('username'),
         })
-    return events
+    return {'events': events, 'has_more': has_more}
+
+
+def _schwab_linked_ok(auth: Optional[Dict[str, Any]] = None) -> bool:
+    auth = auth or get_schwab_auth_status()
+    return auth.get('state') in ('connected', 'expiring')
+
+
+def fetch_setup_account_snapshot() -> Optional[Dict[str, float]]:
+    """Live cash + liquidation for setup bounds (None if Schwab unusable)."""
+    try:
+        if not _schwab_linked_ok():
+            return None
+        maybe_reinit_schwab_client()
+        acct = get_account_info() or {}
+        if not account_info_usable(acct):
+            return None
+        return {
+            'cash': float(acct.get('cash') or 0.0),
+            'liquidation_value': float(acct.get('liquidation_value') or 0.0),
+        }
+    except Exception:
+        return None
+
+
+def compute_setup_bounds(
+    account: Optional[Dict[str, Any]],
+    minimum_cash_value: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Bound floors/buy size from live Schwab balances.
+    Min cash: 500 < x < cash - 1000
+    Min account value: min_cash < x < liquidation - 1000
+    Buy size: 0 < x <= cash - min_cash (or cash - 1000 while min_cash unset)
+    """
+    cash = float((account or {}).get('cash') or 0.0)
+    liq = float((account or {}).get('liquidation_value') or 0.0)
+    min_cash_lo = 500.0
+    min_cash_hi = cash - 1000.0
+    mc = minimum_cash_value
+    if mc is None:
+        spend_cap = max(0.0, cash - 1000.0)
+    else:
+        spend_cap = max(0.0, cash - float(mc))
+    return {
+        'minimum_cash': {
+            'min_exclusive': min_cash_lo,
+            'max_exclusive': min_cash_hi,
+            'valid_range': min_cash_hi > min_cash_lo,
+        },
+        'minimum_liquidation_value': {
+            'min_exclusive': float(mc) if mc is not None else min_cash_lo,
+            'max_exclusive': liq - 1000.0,
+            'valid_range': (liq - 1000.0) > (float(mc) if mc is not None else min_cash_lo),
+        },
+        'order_amount_dollars': {
+            'min_exclusive': 0.0,
+            'max_inclusive': spend_cap,
+            'valid_range': spend_cap > 0.0,
+        },
+        'cash': cash,
+        'liquidation_value': liq,
+    }
+
+
+def validate_setup_values(
+    minimum_cash_val: float,
+    minimum_liq_val: float,
+    order_amount_val: float,
+    account: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Return error string if values violate bounds; else None."""
+    if account is None:
+        return 'Link Schwab and load account balances before saving floors'
+    bounds = compute_setup_bounds(account, minimum_cash_value=minimum_cash_val)
+    bc = bounds['minimum_cash']
+    bl = bounds['minimum_liquidation_value']
+    bo = bounds['order_amount_dollars']
+    if not bc['valid_range']:
+        return (
+            'Account cash (%.0f) is too low to set a cash floor '
+            '(need cash > 1500)' % bounds['cash']
+        )
+    if not (bc['min_exclusive'] < minimum_cash_val < bc['max_exclusive']):
+        return (
+            'Minimum cash must be more than $%.0f and less than $%.0f '
+            '(cash − 1000)' % (bc['min_exclusive'], bc['max_exclusive'])
+        )
+    if not bl['valid_range']:
+        return 'Account value is too low to set a minimum account value'
+    if not (bl['min_exclusive'] < minimum_liq_val < bl['max_exclusive']):
+        return (
+            'Minimum account value must be more than your cash minimum ($%.0f) '
+            'and less than $%.0f (account − 1000)'
+            % (bl['min_exclusive'], bl['max_exclusive'])
+        )
+    if not (bo['min_exclusive'] < order_amount_val <= bo['max_inclusive']):
+        return (
+            'Buy size must be more than $0 and at most $%.0f '
+            '(cash − minimum cash)' % bo['max_inclusive']
+        )
+    return None
+
+
+def suggest_setup_values(account: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    """Sensible defaults inside bounds when account balances are known."""
+    if not account:
+        return {
+            'minimum_cash': 10000.0,
+            'minimum_liquidation_value': 25000.0,
+            'order_amount_dollars': 1000.0,
+        }
+    cash = float(account.get('cash') or 0.0)
+    liq = float(account.get('liquidation_value') or 0.0)
+    # Aim ~40% of (cash-1000) for floor, clamped into open interval.
+    hi_cash = cash - 1000.0
+    lo_cash = 500.0
+    if hi_cash > lo_cash:
+        mid = (lo_cash + hi_cash) / 2.0
+        min_cash = max(lo_cash + 1.0, min(hi_cash - 1.0, round(mid / 100.0) * 100.0))
+    else:
+        min_cash = lo_cash + 1.0
+    hi_liq = liq - 1000.0
+    if hi_liq > min_cash:
+        mid_liq = (min_cash + hi_liq) / 2.0
+        min_liq = max(min_cash + 1.0, min(hi_liq - 1.0, round(mid_liq / 100.0) * 100.0))
+    else:
+        min_liq = min_cash + 1.0
+    buy_cap = max(1.0, cash - min_cash)
+    order_amt = min(1000.0, buy_cap)
+    if order_amt <= 0:
+        order_amt = 1.0
+    return {
+        'minimum_cash': float(min_cash),
+        'minimum_liquidation_value': float(min_liq),
+        'order_amount_dollars': float(order_amt),
+    }
+
+
+def get_onboarding_stage() -> str:
+    """
+    schwab | settings | algorithm | go_live | done
+    Admins with finished setup skip the Account setup card path.
+    """
+    uid = _uid()
+    settings = uc.get_user_settings(uid)
+    schwab_ok = _schwab_linked_ok()
+    setup_done = bool(settings.get('setup_complete')) or user_is_admin(uid)
+    if not schwab_ok and not user_is_admin(uid):
+        return 'schwab'
+    if not setup_done:
+        return 'settings' if schwab_ok else 'schwab'
+    if not get_algorithm_start():
+        return 'algorithm'
+    if trade_dry_run_enabled():
+        return 'go_live'
+    return 'done'
+
+
+def get_account_setup_status() -> Dict[str, Any]:
+    """Checklist for Actions → Account setup (Schwab + floors + buy size)."""
+    import filter_builder as fb
+    fb.init_filter_tables()
+    uid = _uid()
+    settings = uc.get_user_settings(uid)
+    auth = get_schwab_auth_status()
+    schwab_ok = _schwab_linked_ok(auth)
+    account = fetch_setup_account_snapshot() if schwab_ok else None
+    steps = {
+        'schwab_linked': bool(schwab_ok),
+        'minimum_cash': settings.get('minimum_cash') is not None,
+        'minimum_liquidation_value': settings.get('minimum_liquidation_value') is not None,
+        'order_amount_dollars': settings.get('order_amount_dollars') is not None,
+    }
+    # Owner/admin already runs — never require the onboarding Account setup card.
+    complete = bool(settings.get('setup_complete')) or user_is_admin(uid)
+    if complete and not settings.get('setup_complete'):
+        uc.update_user_settings(uid, setup_complete=True)
+        settings = uc.get_user_settings(uid)
+    can_finish = bool(schwab_ok) and all(
+        steps[k] for k in (
+            'minimum_cash', 'minimum_liquidation_value', 'order_amount_dollars',
+        )
+    )
+    # If values present, re-check against live bounds when finishing is attempted
+    # (status still reports can_finish from presence; save validates strictly).
+    if can_finish and account is not None:
+        err = validate_setup_values(
+            float(settings['minimum_cash']),
+            float(settings['minimum_liquidation_value']),
+            float(settings['order_amount_dollars']),
+            account,
+        )
+        if err:
+            can_finish = False
+    mc = settings.get('minimum_cash')
+    bounds = compute_setup_bounds(
+        account, minimum_cash_value=float(mc) if mc is not None else None,
+    ) if account else None
+    stage = get_onboarding_stage()
+    return {
+        'setup_complete': complete,
+        'can_finish': can_finish and bool(account),
+        'onboarding_stage': stage,
+        'steps': steps,
+        'schwab': {
+            'state': auth.get('state'),
+            'warn': auth.get('warn'),
+            'needs_login': auth.get('needs_login'),
+        },
+        'account': account,
+        'bounds': bounds,
+        'settings': {
+            'minimum_cash': settings.get('minimum_cash'),
+            'minimum_liquidation_value': settings.get('minimum_liquidation_value'),
+            'order_amount_dollars': settings.get('order_amount_dollars'),
+            'active_filter': settings.get('active_filter') or 'safe',
+            'trade_dry_run': settings.get('trade_dry_run'),
+        },
+        'suggestions': suggest_setup_values(account),
+    }
+
+
+def user_is_admin(user_id: Optional[int] = None) -> bool:
+    uid = int(user_id) if user_id is not None else _uid()
+    u = uc.get_user_by_id(uid) or {}
+    return bool(u.get('is_admin'))
+
+
+def get_algorithm_control_status() -> Dict[str, Any]:
+    """Actions → Algorithm control card."""
+    import filter_builder as fb
+    fb.init_filter_tables()
+    uid = _uid()
+    settings = uc.get_user_settings(uid)
+    start = get_algorithm_start()
+    custom = fb.get_user_custom_filter(uid)
+    options = [
+        {'name': 'safe', 'title': 'Safe Giant'},
+        {'name': 'risky', 'title': 'Risky Momentum'},
+    ]
+    if custom:
+        options.append({'name': custom['name'], 'title': custom['name']})
+    setup_done = bool(settings.get('setup_complete')) or user_is_admin(uid)
+    return {
+        'algorithm_start': start,
+        'needs_first_run': not bool(start),
+        'trade_dry_run': bool(settings.get('trade_dry_run')),
+        'active_filter': settings.get('active_filter') or 'safe',
+        'filter_options': options,
+        'setup_complete': setup_done,
+        'schwab_linked': _schwab_linked_ok(),
+        'onboarding_stage': get_onboarding_stage(),
+        'custom_filter': custom,
+        'field_catalog': fb.field_catalog_for_api(),
+        'starter_criteria': fb.starter_criteria(),
+        'max_custom_fields': fb.MAX_CUSTOM_FIELDS,
+        'can_run': bool(setup_done and _schwab_linked_ok()),
+        'can_go_live': bool(setup_done and _schwab_linked_ok() and start),
+    }
+
+
+def save_account_setup(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Save floors / buy size; optionally mark setup complete (not filter)."""
+    uid = _uid()
+    if not _schwab_linked_ok():
+        return {
+            'ok': False,
+            'error': 'Link Schwab before setting floors and buy size',
+            'setup': get_account_setup_status(),
+        }
+    account = fetch_setup_account_snapshot()
+    kwargs = {}  # type: Dict[str, Any]
+    try:
+        if 'minimum_cash' in payload:
+            kwargs['minimum_cash'] = float(payload['minimum_cash'])
+        if 'minimum_liquidation_value' in payload:
+            kwargs['minimum_liquidation_value'] = float(payload['minimum_liquidation_value'])
+        if 'order_amount_dollars' in payload:
+            kwargs['order_amount_dollars'] = float(payload['order_amount_dollars'])
+    except (TypeError, ValueError):
+        return {
+            'ok': False,
+            'error': 'Floors and buy size must be numbers',
+            'setup': get_account_setup_status(),
+        }
+    # Merge with existing for partial saves
+    settings = uc.get_user_settings(uid)
+    min_cash = kwargs.get(
+        'minimum_cash',
+        settings.get('minimum_cash'),
+    )
+    min_liq = kwargs.get(
+        'minimum_liquidation_value',
+        settings.get('minimum_liquidation_value'),
+    )
+    order_amt = kwargs.get(
+        'order_amount_dollars',
+        settings.get('order_amount_dollars'),
+    )
+    if payload.get('finish') or len(kwargs) >= 3:
+        if min_cash is None or min_liq is None or order_amt is None:
+            return {
+                'ok': False,
+                'error': 'Set minimum cash, minimum account value, and buy size',
+                'setup': get_account_setup_status(),
+            }
+        err = validate_setup_values(
+            float(min_cash), float(min_liq), float(order_amt), account,
+        )
+        if err:
+            return {'ok': False, 'error': err, 'setup': get_account_setup_status()}
+    if payload.get('finish'):
+        kwargs['setup_complete'] = True
+    if kwargs:
+        uc.update_user_settings(uid, **kwargs)
+    return {
+        'ok': True,
+        'setup': get_account_setup_status(),
+        'onboarding_stage': get_onboarding_stage(),
+    }
+
+
+def run_algorithm_action(action: str, filter_name: Optional[str] = None) -> Dict[str, Any]:
+    """
+    action: run | pause | go_live
+    """
+    uid = _uid()
+    action = (action or '').strip().lower()
+    settings = uc.get_user_settings(uid)
+    setup_done = bool(settings.get('setup_complete')) or user_is_admin(uid)
+    schwab_ok = _schwab_linked_ok()
+
+    if filter_name:
+        uc.set_user_active_filter(uid, str(filter_name).strip())
+
+    if action == 'pause':
+        uc.set_user_trade_dry_run(uid, True)
+        log_event('web', 'Trading paused (dry-run on)')
+        return {
+            'ok': True,
+            'algorithm': get_algorithm_control_status(),
+            'onboarding_stage': get_onboarding_stage(),
+        }
+
+    if action == 'go_live':
+        if not setup_done:
+            return {
+                'ok': False,
+                'error': 'Finish account setup before going live',
+                'algorithm': get_algorithm_control_status(),
+            }
+        if not schwab_ok:
+            return {
+                'ok': False,
+                'error': 'Link Schwab before going live',
+                'algorithm': get_algorithm_control_status(),
+            }
+        if not get_algorithm_start():
+            return {
+                'ok': False,
+                'error': 'Press Run first to set your algorithm start (dry-run)',
+                'algorithm': get_algorithm_control_status(),
+            }
+        uc.set_user_trade_dry_run(uid, False)
+        log_event('web', 'Trading set to LIVE (dry-run off)', level='warn')
+        return {
+            'ok': True,
+            'algorithm': get_algorithm_control_status(),
+            'onboarding_stage': get_onboarding_stage(),
+        }
+
+    if action == 'run':
+        if not setup_done:
+            return {
+                'ok': False,
+                'error': 'Finish account setup (Schwab + floors + buy size) before Run',
+                'algorithm': get_algorithm_control_status(),
+            }
+        if not schwab_ok:
+            return {
+                'ok': False,
+                'error': 'Link Schwab before starting the algorithm',
+                'algorithm': get_algorithm_control_status(),
+            }
+        active = (filter_name or settings.get('active_filter') or '').strip()
+        if not active:
+            return {
+                'ok': False,
+                'error': 'Choose a filter before Run',
+                'algorithm': get_algorithm_control_status(),
+            }
+        if filter_name:
+            pass  # already set above
+        elif not settings.get('active_filter'):
+            uc.set_user_active_filter(uid, active)
+        start = get_algorithm_start()
+        if not start:
+            result = mark_algorithm_start(force=False)
+            # Ensure dry-run for first start
+            uc.set_user_trade_dry_run(uid, True)
+            log_event(
+                'web',
+                'Algorithm start marked — scorecard/performance baseline set (still dry-run until Go live)',
+                detail={'algorithm_start': result.get('algorithm_start')},
+            )
+        else:
+            log_event('web', 'Algorithm Run acknowledged (already started %s)' % start)
+        return {
+            'ok': True,
+            'algorithm': get_algorithm_control_status(),
+            'onboarding_stage': get_onboarding_stage(),
+        }
+    return {'ok': False, 'error': 'Unknown action (use run, pause, or go_live)'}
 
 
 def get_file_log_tail(lines: int = 200) -> str:

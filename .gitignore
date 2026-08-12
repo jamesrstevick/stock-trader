@@ -1,8 +1,11 @@
 # Database files
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
+trader_loop.lock
 
 # Configuration files with sensitive data
 config.py
@@ -66,3 +69,7 @@ data/backtest_results/
 # Temporary files
 *.tmp
 *.temp
+
+# Host supervisor heartbeat / command files (Dell always-on)
+data/host_status.json
+data/host_command.json

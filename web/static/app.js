@@ -19,6 +19,7 @@
       if (path.indexOf('/api/log') === 0) mockPath = '/static/mock/log.json';
       if (path.indexOf('/api/performance') === 0) mockPath = '/static/mock/performance.json';
       if (path.indexOf('/api/schwab/auth') === 0) mockPath = '/static/mock/schwab_auth.json';
+      if (path.indexOf('/api/host') === 0) mockPath = '/static/mock/host.json';
       var mr = await fetch(mockPath);
       if (!mr.ok) throw new Error('Mock missing: ' + mockPath);
       var mockData = await mr.json();
@@ -27,13 +28,24 @@
       }
       return mockData;
     }
-    var r = await fetch(apiBase() + path);
+    var r = await fetch(apiBase() + path, { credentials: 'same-origin' });
+    if (r.status === 401) {
+      window.location.href = '/login';
+      throw new Error('login_required');
+    }
     if (!r.ok) throw new Error(path + ' → ' + r.status);
     return r.json();
   }
 
   async function postJson(path, body) {
     if (useMock()) {
+      if (path.indexOf('/api/host') === 0) {
+        return {
+          ok: true,
+          queued: true,
+          message: 'Mock: would pull or restart on the Dell',
+        };
+      }
       return {
         ok: true,
         message: 'Mock: would submit Schwab callback (no live exchange)',
@@ -42,9 +54,14 @@
     }
     var r = await fetch(apiBase() + path, {
       method: 'POST',
+      credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body || {}),
     });
+    if (r.status === 401) {
+      window.location.href = '/login';
+      throw new Error('login_required');
+    }
     var data = {};
     try { data = await r.json(); } catch (e) { data = {}; }
     if (!r.ok) {
@@ -296,6 +313,19 @@
     return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
   }
 
+  function formatMdY(iso) {
+    if (!iso) return '—';
+    var s = String(iso).trim();
+    var m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m) return m[2] + '/' + m[3] + '/' + m[1];
+    var t = Date.parse(s);
+    if (isNaN(t)) return s;
+    var d = new Date(t);
+    var mm = String(d.getMonth() + 1).padStart(2, '0');
+    var dd = String(d.getDate()).padStart(2, '0');
+    return mm + '/' + dd + '/' + d.getFullYear();
+  }
+
   function timeAgo(iso) {
     if (!iso) return '—';
     var t = Date.parse(iso);
@@ -383,14 +413,109 @@
     return /[?&]code=/.test(s);
   }
 
-  function applySchwabChrome(schwab) {
-    lastSchwabStatus = schwab || null;
+  var lastStatusPayload = null;
+  var currentUser = null;
+  var hostBusy = false;
+  var lastOnboardingStage = 'done';
+  var filterBuilderState = { criteria: [], catalog: [], debounce: null };
+  var ONBOARD_SNOOZE_KEY = 'onboardingGoLiveSnoozeUntil';
+
+  function onboardingGoLiveSnoozed() {
+    try {
+      var v = parseInt(localStorage.getItem(ONBOARD_SNOOZE_KEY) || '0', 10);
+      return !isNaN(v) && Date.now() < v;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function setOnboardingGoLiveSnooze(hours) {
+    var ms = (hours != null ? Number(hours) : 4) * 3600 * 1000;
+    try {
+      localStorage.setItem(ONBOARD_SNOOZE_KEY, String(Date.now() + ms));
+    } catch (e) {}
+  }
+
+  function scrollToActionCard(id) {
+    location.hash = 'actions';
+    showPage('actions');
+    var card = document.getElementById(id);
+    if (card && card.scrollIntoView) {
+      setTimeout(function () {
+        card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 60);
+    }
+  }
+
+  function applyActionsBadge(status) {
     var badge = document.getElementById('nav-actions-badge');
+    if (!badge) return;
+    var attention = !!(status && status.actions_attention);
+    if (!attention && status && status.schwab) attention = !!status.schwab.warn;
+    badge.hidden = !attention;
+  }
+
+  function applyOnboardingBanner(stage) {
+    lastOnboardingStage = stage || 'done';
+    var banner = document.getElementById('onboarding-banner');
+    var text = document.getElementById('onboarding-banner-text');
+    var cta = document.getElementById('onboarding-banner-cta');
+    var dismiss = document.getElementById('onboarding-banner-dismiss');
+    if (!banner || !text || !cta) return;
+    var copy = {
+      schwab: {
+        text: 'Connect Schwab to get started — the bot will not run for this account until linked.',
+        cta: 'Connect Schwab',
+        target: 'schwab-reconnect-card',
+        dismiss: false,
+      },
+      settings: {
+        text: 'Schwab linked — set your cash floors and buy size next.',
+        cta: 'Finish account setup',
+        target: 'account-setup-card',
+        dismiss: false,
+      },
+      algorithm: {
+        text: 'Account ready — pick a filter and press Run (starts in dry-run).',
+        cta: 'Start algorithm',
+        target: 'algorithm-control-card',
+        dismiss: false,
+      },
+      go_live: {
+        text: 'Dry-run is active — Go live when you are ready for real orders.',
+        cta: 'Review Go live',
+        target: 'algorithm-control-card',
+        dismiss: true,
+      },
+    };
+    var cfg = copy[stage];
+    if (!cfg || stage === 'done') {
+      banner.hidden = true;
+      return;
+    }
+    if (stage === 'go_live' && onboardingGoLiveSnoozed()) {
+      banner.hidden = true;
+      return;
+    }
+    text.textContent = cfg.text;
+    cta.textContent = cfg.cta;
+    cta.setAttribute('data-target', cfg.target);
+    if (dismiss) dismiss.hidden = !cfg.dismiss;
+    banner.hidden = false;
+  }
+
+  function applySchwabChrome(schwab, stage) {
+    lastSchwabStatus = schwab || null;
     var banner = document.getElementById('schwab-banner');
     var bannerText = document.getElementById('schwab-banner-text');
     var warn = !!(schwab && schwab.warn);
-    if (badge) badge.hidden = !warn;
     if (!banner || !bannerText) return;
+
+    // During first-time Schwab stage, onboarding banner owns the CTA.
+    if (stage === 'schwab') {
+      banner.hidden = true;
+      return;
+    }
 
     if (!warn || schwabBannerSnoozed()) {
       banner.hidden = true;
@@ -408,7 +533,19 @@
     banner.hidden = false;
   }
 
-  function renderSchwabActionCard(schwab) {
+  function showWelcomeBanner(user) {
+    var banner = document.getElementById('welcome-banner');
+    var text = document.getElementById('welcome-banner-text');
+    if (!banner || !text) return;
+    var name = (user && (user.display_name || user.username)) || 'there';
+    text.textContent = 'Welcome ' + name;
+    banner.hidden = false;
+    setTimeout(function () {
+      banner.hidden = true;
+    }, 3000);
+  }
+
+  function renderSchwabActionCard(schwab, stage) {
     var card = document.getElementById('schwab-reconnect-card');
     var pillEl = document.getElementById('schwab-status-pill');
     var detail = document.getElementById('schwab-status-detail');
@@ -417,10 +554,13 @@
     if (!card || !pillEl) return;
 
     schwab = schwab || {};
+    stage = stage || lastOnboardingStage;
     var warn = !!schwab.warn;
-    card.classList.toggle('urgent', warn);
-
     var state = schwab.state || (schwab.available ? 'connected' : 'disconnected');
+    var needsLink = state !== 'connected' && state !== 'expiring';
+    card.classList.toggle('urgent', stage === 'schwab' || (needsLink && stage !== 'done') || warn);
+    card.classList.remove('urgent-warn');
+
     pillEl.className = 'pill';
     if (state === 'connected') {
       pillEl.textContent = 'Connected';
@@ -434,6 +574,9 @@
     }
 
     var parts = [];
+    if (stage === 'schwab') {
+      parts.push('Required first step for this account');
+    }
     if (schwab.hours_left != null) {
       if (schwab.hours_left > 0) {
         parts.push('Expires in ' + formatTimeLeft(schwab.hours_left, schwab.warn_hours));
@@ -443,8 +586,8 @@
     } else {
       parts.push('No Schwab credentials on file');
     }
-    if (warn) {
-      parts.push('Reconnect now (or anytime) to renew ~7 days');
+    if (warn || needsLink) {
+      parts.push('Connect now to renew ~7 days');
     } else {
       parts.push('You can reconnect early anytime to reset the clock');
     }
@@ -458,22 +601,487 @@
   async function refreshSchwabUi() {
     try {
       var data = await fetchJson('/api/status');
+      lastStatusPayload = data;
+      if (data.user) currentUser = data.user;
       var schwab = data.schwab || await fetchJson('/api/schwab/auth');
-      applySchwabChrome(schwab);
+      var stage = data.onboarding_stage ||
+        (data.account_setup && data.account_setup.onboarding_stage) ||
+        'done';
+      applyActionsBadge(data);
+      applyOnboardingBanner(stage);
+      applySchwabChrome(schwab, stage);
       var active = document.querySelector('.page.active');
       if (active && active.id === 'page-actions') {
-        renderSchwabActionCard(schwab);
+        renderSchwabActionCard(schwab, stage);
+        renderAccountSetup(data.account_setup || { setup_complete: !!(currentUser && currentUser.is_admin) }, stage);
+        renderAlgorithmControl(data.algorithm_control, stage);
       }
       return schwab;
     } catch (e) {
-      // Don't force the Actions badge on a transient status fetch failure
       return lastSchwabStatus;
     }
   }
 
+  function fillFilterSelect(sel, options, selected) {
+    if (!sel) return;
+    sel.innerHTML = '';
+    (options || []).forEach(function (o) {
+      var opt = document.createElement('option');
+      opt.value = o.name;
+      opt.textContent = o.title || o.name;
+      if (o.name === selected) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  }
+
+  function moneyHint(boundsKey, bounds, exclusiveMax) {
+    if (!bounds || !bounds[boundsKey]) return '';
+    var b = bounds[boundsKey];
+    if (boundsKey === 'order_amount_dollars') {
+      return 'More than $0, at most $' + Math.floor(b.max_inclusive || 0).toLocaleString();
+    }
+    var lo = b.min_exclusive;
+    var hi = b.max_exclusive;
+    return 'More than $' + Math.floor(lo).toLocaleString() +
+      ', less than $' + Math.floor(hi).toLocaleString();
+  }
+
+  function renderAccountSetup(setup, stage) {
+    var card = document.getElementById('account-setup-card');
+    if (!card) return;
+    setup = setup || {};
+    stage = stage || setup.onboarding_stage || lastOnboardingStage;
+    // Owner/admin accounts that already trade: never show onboarding setup.
+    var done = !!(setup.setup_complete) || !!(currentUser && currentUser.is_admin);
+    if (done) {
+      card.hidden = true;
+      card.setAttribute('hidden', '');
+      return;
+    }
+    card.hidden = false;
+    card.removeAttribute('hidden');
+    card.classList.toggle('urgent', stage === 'settings');
+    card.classList.remove('urgent-warn');
+
+    var schwabOk = !!(setup.steps && setup.steps.schwab_linked);
+    var steps = setup.steps || {};
+    var list = document.getElementById('setup-checklist');
+    if (list) {
+      var items = [
+        ['schwab_linked', 'Schwab account linked'],
+        ['minimum_cash', 'Minimum cash set'],
+        ['minimum_liquidation_value', 'Minimum account value set'],
+        ['order_amount_dollars', 'Buy size set'],
+      ];
+      list.innerHTML = items.map(function (pair) {
+        var ok = !!steps[pair[0]];
+        return '<li class="' + (ok ? 'ok' : 'bad') + '">' + pair[1] + '</li>';
+      }).join('');
+    }
+
+    var acctLine = document.getElementById('setup-account-line');
+    var acct = setup.account;
+    if (acctLine) {
+      if (acct) {
+        acctLine.hidden = false;
+        acctLine.textContent =
+          'Live from Schwab — cash $' +
+          Math.round(acct.cash || 0).toLocaleString() +
+          ' · account value $' +
+          Math.round(acct.liquidation_value || 0).toLocaleString();
+      } else {
+        acctLine.hidden = !schwabOk;
+        acctLine.textContent = schwabOk
+          ? 'Could not load account balances yet — reconnect Schwab or try again.'
+          : '';
+      }
+    }
+
+    var s = setup.settings || {};
+    var sug = setup.suggestions || {};
+    var bounds = setup.bounds || {};
+    var cash = document.getElementById('setup-min-cash');
+    var liq = document.getElementById('setup-min-liq');
+    var ord = document.getElementById('setup-order-amt');
+    var fieldsDisabled = !schwabOk;
+    [cash, liq, ord].forEach(function (el) {
+      if (el) el.disabled = fieldsDisabled;
+    });
+    var saveBtn = document.getElementById('setup-save-btn');
+    if (saveBtn) saveBtn.disabled = fieldsDisabled;
+
+    if (cash && document.activeElement !== cash) {
+      cash.value = s.minimum_cash != null ? s.minimum_cash : (sug.minimum_cash || '');
+      if (bounds.minimum_cash) {
+        cash.min = bounds.minimum_cash.min_exclusive;
+        cash.max = bounds.minimum_cash.max_exclusive;
+      }
+    }
+    if (liq && document.activeElement !== liq) {
+      liq.value = s.minimum_liquidation_value != null
+        ? s.minimum_liquidation_value
+        : (sug.minimum_liquidation_value || '');
+      if (bounds.minimum_liquidation_value) {
+        liq.min = bounds.minimum_liquidation_value.min_exclusive;
+        liq.max = bounds.minimum_liquidation_value.max_exclusive;
+      }
+    }
+    if (ord && document.activeElement !== ord) {
+      ord.value = s.order_amount_dollars != null
+        ? s.order_amount_dollars
+        : (sug.order_amount_dollars || '');
+      if (bounds.order_amount_dollars) {
+        ord.min = 1;
+        ord.max = bounds.order_amount_dollars.max_inclusive;
+      }
+    }
+    var hCash = document.getElementById('setup-min-cash-hint');
+    var hLiq = document.getElementById('setup-min-liq-hint');
+    var hOrd = document.getElementById('setup-order-amt-hint');
+    if (hCash) {
+      hCash.textContent = fieldsDisabled
+        ? 'Link Schwab first'
+        : moneyHint('minimum_cash', bounds);
+    }
+    if (hLiq) {
+      hLiq.textContent = fieldsDisabled
+        ? 'Link Schwab first'
+        : moneyHint('minimum_liquidation_value', bounds);
+    }
+    if (hOrd) {
+      hOrd.textContent = fieldsDisabled
+        ? 'Link Schwab first'
+        : moneyHint('order_amount_dollars', bounds);
+    }
+  }
+
+  function setActionFeedback(id, msg, ok) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    if (!msg) {
+      el.hidden = true;
+      el.textContent = '';
+      el.className = 'action-feedback';
+      return;
+    }
+    el.hidden = false;
+    el.textContent = msg;
+    el.className = 'action-feedback ' + (ok ? 'ok' : 'bad');
+  }
+
+  function renderAlgorithmControl(algo, stage) {
+    var card = document.getElementById('algorithm-control-card');
+    var pill = document.getElementById('algo-status-pill');
+    var detail = document.getElementById('algo-status-detail');
+    if (!card || !pill) return;
+    algo = algo || {};
+    stage = stage || algo.onboarding_stage || lastOnboardingStage;
+    var needs = !!algo.needs_first_run;
+    var setupDone = !!algo.setup_complete || !!(currentUser && currentUser.is_admin);
+    var canRun = !!algo.can_run || (setupDone && !!algo.schwab_linked);
+    var canLive = !!algo.can_go_live;
+    var blocked = stage === 'schwab' || stage === 'settings';
+
+    card.classList.toggle('muted-card', blocked);
+    card.classList.toggle('urgent', stage === 'algorithm');
+    card.classList.toggle('urgent-warn', stage === 'go_live');
+
+    pill.className = 'pill';
+    if (blocked) {
+      pill.textContent = 'Locked';
+      pill.classList.add('warn');
+    } else if (needs) {
+      pill.textContent = 'Not started';
+      pill.classList.add('warn');
+    } else if (algo.trade_dry_run) {
+      pill.textContent = 'Dry-run';
+      pill.classList.add('warn');
+    } else {
+      pill.textContent = 'Live';
+      pill.classList.add('ok');
+    }
+    if (detail) {
+      if (blocked) {
+        detail.textContent = 'Finish Schwab connection and account setup before starting the algorithm.';
+      } else if (needs) {
+        detail.textContent =
+          'Choose a filter and press Run. That sets your performance start and begins dry-run loops.';
+      } else {
+        var filterLabel = algo.active_filter || 'safe';
+        (algo.filter_options || []).forEach(function (o) {
+          if (o.name === algo.active_filter) filterLabel = o.title || o.name;
+        });
+        detail.textContent =
+          'Running since ' + (algo.algorithm_start || '—') +
+          ' · Filter: ' + filterLabel +
+          ' · ' + (algo.trade_dry_run ? 'Dry-run (no live orders)' : 'LIVE orders enabled') +
+          '.';
+      }
+    }
+    fillFilterSelect(
+      document.getElementById('algo-filter-select'),
+      algo.filter_options,
+      algo.active_filter
+    );
+    var runBtn = document.getElementById('algo-run-btn');
+    var liveBtn = document.getElementById('algo-live-btn');
+    var pauseBtn = document.getElementById('algo-pause-btn');
+    var filterSel = document.getElementById('algo-filter-select');
+    if (runBtn) runBtn.disabled = blocked || !canRun;
+    if (liveBtn) liveBtn.disabled = blocked || !canLive;
+    if (pauseBtn) pauseBtn.disabled = blocked || needs;
+    if (filterSel) filterSel.disabled = blocked;
+
+    if (!filterBuilderState.catalog.length && algo.field_catalog) {
+      filterBuilderState.catalog = algo.field_catalog;
+    }
+    if (!filterBuilderState.criteria.length && (algo.starter_criteria || algo.custom_filter)) {
+      var custom = algo.custom_filter;
+      filterBuilderState.criteria = (custom && custom.criteria && custom.criteria.length)
+        ? JSON.parse(JSON.stringify(custom.criteria))
+        : JSON.parse(JSON.stringify(algo.starter_criteria || []));
+      var nameInput = document.getElementById('filter-save-name');
+      if (nameInput && custom && custom.name) nameInput.value = custom.name;
+      renderFilterBuilderTableAndBind();
+      scheduleFilterPreview();
+    }
+  }
+
+  function criterionMeta(field) {
+    for (var i = 0; i < filterBuilderState.catalog.length; i++) {
+      if (filterBuilderState.catalog[i].field === field) return filterBuilderState.catalog[i];
+    }
+    return { field: field, meaning: field, ops: ['gt', 'lt', 'between'] };
+  }
+
+  function readFilterBuilderFromDom() {
+    filterBuilderState.criteria.forEach(function (c, idx) {
+      var opEl = document.querySelector('select[data-idx="' + idx + '"][data-k="op"]');
+      if (opEl) c.op = opEl.value;
+      ['min', 'max', 'value', 'why'].forEach(function (k) {
+        var el = document.querySelector('[data-idx="' + idx + '"][data-k="' + k + '"]');
+        if (!el) return;
+        if (k === 'why') c.why = el.value;
+        else if (el.value !== '') c[k] = Number(el.value);
+      });
+    });
+  }
+
+  function scheduleFilterPreview() {
+    var el = document.getElementById('filter-match-count');
+    if (filterBuilderState.debounce) clearTimeout(filterBuilderState.debounce);
+    filterBuilderState.debounce = setTimeout(async function () {
+      readFilterBuilderFromDom();
+      try {
+        var res = await postJson('/api/filters/preview', { criteria: filterBuilderState.criteria });
+        if (el) el.textContent = (res.count != null ? res.count : '—') + ' stocks match';
+      } catch (e) {
+        if (el) el.textContent = 'Could not preview';
+      }
+    }, 300);
+  }
+
+  function renderFilterBuilderTableAndBind() {
+    renderFilterBuilderTable();
+    var body = document.getElementById('filter-builder-body');
+    if (!body) return;
+    body.onchange = function (ev) {
+      readFilterBuilderFromDom();
+      if (ev.target && ev.target.classList && ev.target.classList.contains('fb-op')) {
+        renderFilterBuilderTableAndBind();
+      }
+      scheduleFilterPreview();
+    };
+    body.oninput = function (ev) {
+      if (ev.target && ev.target.getAttribute('data-k')) scheduleFilterPreview();
+    };
+    body.onclick = function (ev) {
+      var btn = ev.target.closest('[data-remove]');
+      if (!btn) return;
+      var idx = Number(btn.getAttribute('data-remove'));
+      readFilterBuilderFromDom();
+      filterBuilderState.criteria.splice(idx, 1);
+      renderFilterBuilderTableAndBind();
+      scheduleFilterPreview();
+    };
+  }
+
+  function renderFilterBuilderTable() {
+    var body = document.getElementById('filter-builder-body');
+    if (!body) return;
+    body.innerHTML = '';
+    filterBuilderState.criteria.forEach(function (c, idx) {
+      var meta = criterionMeta(c.field);
+      var tr = document.createElement('tr');
+      var op = c.op || 'gt';
+      var setHtml;
+      if (op === 'between') {
+        setHtml =
+          '<div class="filter-set-cell">' +
+          opSelectHtml(idx, op) +
+          '<input type="number" step="any" data-idx="' + idx + '" data-k="min" value="' + (c.min != null ? c.min : '') + '" />' +
+          '<span>–</span>' +
+          '<input type="number" step="any" data-idx="' + idx + '" data-k="max" value="' + (c.max != null ? c.max : '') + '" />' +
+          '</div>';
+      } else {
+        setHtml =
+          '<div class="filter-set-cell">' +
+          opSelectHtml(idx, op) +
+          '<input type="number" step="any" data-idx="' + idx + '" data-k="value" value="' + (c.value != null ? c.value : '') + '" />' +
+          '</div>';
+      }
+      tr.innerHTML =
+        '<td class="field">' + escapeHtml(c.field) + '</td>' +
+        '<td class="wrap">' + escapeHtml(meta.meaning || '') + '</td>' +
+        '<td class="set-to">' + setHtml + '</td>' +
+        '<td class="wrap"><input type="text" data-idx="' + idx + '" data-k="why" value="' + escapeAttr(c.why || '') + '" /></td>' +
+        '<td><button type="button" class="btn-remove-field" data-remove="' + idx + '" aria-label="Remove">×</button></td>';
+      body.appendChild(tr);
+    });
+  }
+
+  function opSelectHtml(idx, op) {
+    var opts = [
+      ['gt', '>'], ['gte', '≥'], ['lt', '<'], ['lte', '≤'], ['between', 'between']
+    ];
+    return '<select data-idx="' + idx + '" data-k="op" class="fb-op">' +
+      opts.map(function (o) {
+        return '<option value="' + o[0] + '"' + (op === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
+      }).join('') + '</select>';
+  }
+
+  function escapeAttr(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  }
+
   async function loadActions() {
-    var schwab = await refreshSchwabUi();
-    renderSchwabActionCard(schwab || lastSchwabStatus || {});
+    await refreshSchwabUi();
+    if (!hostBusy) loadHostCard();
+  }
+
+  function hostChildLabel(name) {
+    if (name === 'loop') return 'Trader loop';
+    if (name === 'dashboard') return 'Dashboard';
+    if (name === 'tunnel') return 'Cloudflare tunnel';
+    return name;
+  }
+
+  function renderHostCard(data) {
+    var card = document.getElementById('host-deploy-card');
+    if (!card) return;
+    card.hidden = false;
+    var pill = document.getElementById('host-status-pill');
+    var detail = document.getElementById('host-status-detail');
+    var list = document.getElementById('host-proc-list');
+    var gitLine = document.getElementById('host-git-line');
+    var pullBtn = document.getElementById('host-pull-btn');
+    var restartBtn = document.getElementById('host-restart-btn');
+    var alive = !!(data && data.supervisor);
+    if (pill) {
+      pill.textContent = alive ? (data.busy ? 'Busy' : 'Running') : 'Offline';
+      pill.className = 'pill ' + (alive ? (data.busy ? 'warn' : 'ok') : 'bad');
+    }
+    if (detail) {
+      detail.textContent = alive
+        ? 'Pull from GitHub on this machine, then restart the three processes. Crashes restart on their own.'
+        : ((data && data.hint) || 'Supervisor is not running on this machine.');
+    }
+    var children = (data && data.children) || {};
+    if (list) {
+      list.innerHTML = ['loop', 'dashboard', 'tunnel'].map(function (name) {
+        var c = children[name] || {};
+        var state = c.skipped ? 'skipped' : (c.running ? 'running' : 'stopped');
+        var extra = c.pid ? (' pid ' + c.pid) : '';
+        var restarts = c.restarts ? (' · restarts ' + c.restarts) : '';
+        return '<li><span>' + hostChildLabel(name) + '</span><span class="host-proc-state">' +
+          state + extra + restarts + '</span></li>';
+      }).join('');
+    }
+    var git = (data && data.git) || {};
+    if (gitLine) {
+      gitLine.textContent = 'Git: ' + (git.branch || '—') + ' @ ' + (git.sha || '—') +
+        (git.dirty ? ' (local changes)' : '');
+    }
+    var disable = hostBusy || !alive;
+    if (pullBtn) pullBtn.disabled = disable;
+    if (restartBtn) restartBtn.disabled = disable;
+  }
+
+  async function loadHostCard() {
+    var card = document.getElementById('host-deploy-card');
+    if (!card) return;
+    if (currentUser && !currentUser.is_admin) {
+      card.hidden = true;
+      return;
+    }
+    try {
+      var data = await fetchJson('/api/host');
+      renderHostCard(data);
+    } catch (e) {
+      if (currentUser && currentUser.is_admin) {
+        renderHostCard({ supervisor: false, hint: 'Could not read host status.' });
+      } else {
+        card.hidden = true;
+      }
+    }
+  }
+
+  function sleepMs(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  async function waitForHostCommand(cmdId) {
+    var deadline = Date.now() + 180000;
+    var sawDown = false;
+    while (Date.now() < deadline) {
+      await sleepMs(2000);
+      try {
+        var data = await fetchJson('/api/host');
+        var last = data.last_command || {};
+        if (cmdId && last.id === cmdId && last.finished_at && !data.busy) {
+          return data;
+        }
+        if (sawDown && data.supervisor && !data.busy) {
+          return data;
+        }
+        renderHostCard(data);
+      } catch (e) {
+        sawDown = true;
+        setActionFeedback('host-feedback', 'Dashboard restarting…', true);
+      }
+    }
+    throw new Error('Timed out waiting for the host (3 min). Check logs/supervisor.log on the Dell.');
+  }
+
+  async function runHostAction(action) {
+    var confirmMsg = action === 'pull'
+      ? 'Pull the latest GitHub commit onto this machine and restart the trader, dashboard, and tunnel? The site will drop for a few seconds.'
+      : 'Restart the trader loop, dashboard, and tunnel on this machine? The site will drop for a few seconds.';
+    if (!window.confirm(confirmMsg)) return;
+    hostBusy = true;
+    var pullBtn = document.getElementById('host-pull-btn');
+    var restartBtn = document.getElementById('host-restart-btn');
+    if (pullBtn) pullBtn.disabled = true;
+    if (restartBtn) restartBtn.disabled = true;
+    setActionFeedback(
+      'host-feedback',
+      action === 'pull' ? 'Queuing git pull…' : 'Queuing restart…',
+      true
+    );
+    try {
+      var path = action === 'pull' ? '/api/host/pull' : '/api/host/restart';
+      var queued = await postJson(path, {});
+      setActionFeedback('host-feedback', queued.message || 'Queued — waiting for supervisor…', true);
+      var data = await waitForHostCommand(queued.id);
+      var last = (data && data.last_command) || {};
+      var ok = last.ok !== false;
+      setActionFeedback('host-feedback', last.message || (ok ? 'Done.' : 'Failed'), ok);
+      renderHostCard(data);
+    } catch (e) {
+      setActionFeedback('host-feedback', e.message || 'Host command failed', false);
+    }
+    hostBusy = false;
+    loadHostCard();
   }
 
   function setSchwabFeedback(msg, ok) {
@@ -544,10 +1152,15 @@
       var result = await postJson('/api/schwab/auth', { callback_url: url });
       clearSchwabSnooze();
       if (input) input.value = '';
-      setSchwabFeedback(result.message || 'Connected — refresh token renewed (~7 days).', true);
-      var schwab = result.schwab || await fetchJson('/api/schwab/auth');
-      applySchwabChrome(schwab);
-      renderSchwabActionCard(schwab);
+      var stage = result.onboarding_stage || 'settings';
+      setSchwabFeedback(
+        (result.message || 'Schwab connected') + ' — next, set your floors and buy size.',
+        true
+      );
+      await refreshSchwabUi();
+      if (stage === 'settings' || stage === 'schwab') {
+        scrollToActionCard('account-setup-card');
+      }
     } catch (e) {
       setSchwabFeedback(e.message || 'Token exchange failed — open login again and paste quickly.', false);
     } finally {
@@ -595,13 +1208,202 @@
       noBtn.addEventListener('click', function () {
         var hours = (lastSchwabStatus && lastSchwabStatus.snooze_hours) || 4;
         setSchwabSnooze(hours);
-        applySchwabChrome(lastSchwabStatus);
+        applySchwabChrome(lastSchwabStatus, lastOnboardingStage);
       });
     }
   })();
 
+  function populateFilterFieldPick(filterText) {
+    var pick = document.getElementById('filter-field-pick');
+    if (!pick) return;
+    var used = {};
+    filterBuilderState.criteria.forEach(function (c) { used[c.field] = true; });
+    var q = String(filterText || '').toLowerCase().trim();
+    var opts = (filterBuilderState.catalog || []).filter(function (f) {
+      if (used[f.field]) return false;
+      if (!q) return true;
+      return (f.field + ' ' + (f.meaning || '')).toLowerCase().indexOf(q) >= 0;
+    });
+    pick.innerHTML = '<option value="">Choose field…</option>' +
+      opts.map(function (f) {
+        return '<option value="' + escapeAttr(f.field) + '">' +
+          escapeHtml(f.field) + '</option>';
+      }).join('');
+    pick.hidden = false;
+    var search = document.getElementById('filter-field-search');
+    if (search) search.hidden = false;
+  }
+
+  (function wireOnboardingBanner() {
+    var cta = document.getElementById('onboarding-banner-cta');
+    var dismiss = document.getElementById('onboarding-banner-dismiss');
+    if (cta) {
+      cta.addEventListener('click', function () {
+        var target = cta.getAttribute('data-target') || 'schwab-reconnect-card';
+        scrollToActionCard(target);
+      });
+    }
+    if (dismiss) {
+      dismiss.addEventListener('click', function () {
+        setOnboardingGoLiveSnooze(4);
+        applyOnboardingBanner(lastOnboardingStage);
+      });
+    }
+  })();
+
+  (function wireSetupAlgorithmFilter() {
+    var setupSave = document.getElementById('setup-save-btn');
+    var setupSchwab = document.getElementById('setup-goto-schwab');
+    var algoRun = document.getElementById('algo-run-btn');
+    var algoPause = document.getElementById('algo-pause-btn');
+    var algoLive = document.getElementById('algo-live-btn');
+    var filterAdd = document.getElementById('filter-add-field');
+    var filterSave = document.getElementById('filter-save-btn');
+    var fieldSearch = document.getElementById('filter-field-search');
+    var fieldPick = document.getElementById('filter-field-pick');
+
+    if (setupSave) {
+      setupSave.addEventListener('click', async function () {
+        setActionFeedback('setup-feedback', 'Saving…', true);
+        var payload = {
+          minimum_cash: Number((document.getElementById('setup-min-cash') || {}).value),
+          minimum_liquidation_value: Number((document.getElementById('setup-min-liq') || {}).value),
+          order_amount_dollars: Number((document.getElementById('setup-order-amt') || {}).value),
+          finish: true,
+        };
+        try {
+          var res = await postJson('/api/account/setup', payload);
+          renderAccountSetup(res.setup || res, res.onboarding_stage);
+          setActionFeedback(
+            'setup-feedback',
+            (res.setup && res.setup.setup_complete)
+              ? 'Setup complete — next: pick a filter and press Run.'
+              : (res.error || 'Saved.'),
+            !!(res.setup && res.setup.setup_complete) || !!res.ok
+          );
+          await refreshSchwabUi();
+          if (res.setup && res.setup.setup_complete) {
+            scrollToActionCard('algorithm-control-card');
+          }
+        } catch (e) {
+          setActionFeedback('setup-feedback', e.message || 'Save failed', false);
+          refreshSchwabUi();
+        }
+      });
+    }
+    if (setupSchwab) {
+      setupSchwab.addEventListener('click', function () {
+        scrollToActionCard('schwab-reconnect-card');
+      });
+    }
+
+    async function algoAction(action) {
+      setActionFeedback('algo-feedback', 'Working…', true);
+      var filter = (document.getElementById('algo-filter-select') || {}).value || null;
+      try {
+        var res = await postJson('/api/algorithm', { action: action, filter: filter });
+        renderAlgorithmControl(res.algorithm || res, res.onboarding_stage);
+        var msg = action === 'run'
+          ? 'Baseline set — loops will run in dry-run until Go live.'
+          : (action === 'pause' ? 'Paused (dry-run on).' : 'LIVE orders enabled.');
+        if (res.algorithm && res.algorithm.needs_first_run === false && action === 'run') {
+          msg = res.algorithm.algorithm_start
+            ? ('Start marked at ' + res.algorithm.algorithm_start +
+              ' — loops run in dry-run until Go live.')
+            : msg;
+        }
+        setActionFeedback('algo-feedback', msg, true);
+        await refreshSchwabUi();
+      } catch (e) {
+        setActionFeedback('algo-feedback', e.message || 'Action failed', false);
+        refreshSchwabUi();
+      }
+    }
+    if (algoRun) algoRun.addEventListener('click', function () { algoAction('run'); });
+    if (algoPause) algoPause.addEventListener('click', function () { algoAction('pause'); });
+    if (algoLive) {
+      algoLive.addEventListener('click', function () {
+        if (!window.confirm('Go live? Real Schwab orders will be placed when the bot trades.')) return;
+        algoAction('go_live');
+      });
+    }
+
+    if (filterAdd) {
+      filterAdd.addEventListener('click', function () {
+        if (filterBuilderState.criteria.length >= 15) {
+          setActionFeedback('filter-builder-feedback', 'Max 15 fields', false);
+          return;
+        }
+        populateFilterFieldPick('');
+      });
+    }
+    if (fieldSearch) {
+      fieldSearch.addEventListener('input', function () {
+        populateFilterFieldPick(fieldSearch.value);
+      });
+    }
+    if (fieldPick) {
+      fieldPick.addEventListener('change', function () {
+        var field = fieldPick.value;
+        if (!field) return;
+        if (filterBuilderState.criteria.length >= 15) {
+          setActionFeedback('filter-builder-feedback', 'Max 15 fields', false);
+          return;
+        }
+        filterBuilderState.criteria.push({
+          field: field,
+          op: 'gt',
+          value: 0,
+          why: '',
+        });
+        fieldPick.hidden = true;
+        fieldPick.value = '';
+        if (fieldSearch) {
+          fieldSearch.hidden = true;
+          fieldSearch.value = '';
+        }
+        renderFilterBuilderTableAndBind();
+        scheduleFilterPreview();
+        setActionFeedback('filter-builder-feedback', '', true);
+      });
+    }
+    if (filterSave) {
+      filterSave.addEventListener('click', async function () {
+        readFilterBuilderFromDom();
+        var name = ((document.getElementById('filter-save-name') || {}).value || '').trim();
+        setActionFeedback('filter-builder-feedback', 'Saving…', true);
+        try {
+          var res = await postJson('/api/filters/save', {
+            name: name,
+            criteria: filterBuilderState.criteria,
+          });
+          setActionFeedback(
+            'filter-builder-feedback',
+            'Saved "' + ((res.filter && res.filter.name) || name) + '" (' +
+              (res.count != null ? res.count : '—') +
+              ' matches). Selected as active filter.',
+            true
+          );
+          var algo = await fetchJson('/api/algorithm');
+          renderAlgorithmControl(algo, algo.onboarding_stage);
+          var sel = document.getElementById('algo-filter-select');
+          if (sel && res.filter && res.filter.name) sel.value = res.filter.name;
+        } catch (e) {
+          setActionFeedback('filter-builder-feedback', e.message || 'Save failed', false);
+        }
+      });
+    }
+  })();
+
+  (function wireHostActions() {
+    var pullBtn = document.getElementById('host-pull-btn');
+    var restartBtn = document.getElementById('host-restart-btn');
+    if (pullBtn) pullBtn.addEventListener('click', function () { runHostAction('pull'); });
+    if (restartBtn) restartBtn.addEventListener('click', function () { runHostAction('restart'); });
+  })();
+
   var refreshLog = document.getElementById('btn-refresh-log');
-  if (refreshLog) refreshLog.addEventListener('click', loadLog);
+  if (refreshLog) refreshLog.addEventListener('click', function () { refreshLogHead(); });
 
   var perfRanges = document.getElementById('perf-ranges');
   if (perfRanges) {
@@ -859,7 +1661,10 @@
     try {
       var data = await fetchJson('/api/status');
       if (data.dashboard_rev != null) lastContentRev = data.dashboard_rev;
-      if (data.schwab) applySchwabChrome(data.schwab);
+      var stage = data.onboarding_stage || 'done';
+      applyOnboardingBanner(stage);
+      applyActionsBadge(data);
+      if (data.schwab) applySchwabChrome(data.schwab, stage);
       var y = data.yahoo || {};
       var filterPayload = data.watchlist_filter || null;
       setupFilterPanel(filterPayload);
@@ -867,8 +1672,18 @@
 
       var activeFilter = findFilter(filterState.active);
       pills.innerHTML = '';
-      pills.appendChild(pill(data.trade_dry_run ? 'TRADE_DRY_RUN on' : 'LIVE trades', data.trade_dry_run ? 'ok' : 'warn'));
-      if (activeFilter) {
+      if (stage === 'schwab') {
+        pills.appendChild(pill('Setup: link Schwab', 'bad'));
+      } else if (stage === 'settings') {
+        pills.appendChild(pill('Setup: floors & buy size', 'warn'));
+      } else if (stage === 'algorithm') {
+        pills.appendChild(pill('Algorithm not started', 'warn'));
+      } else if (stage === 'go_live') {
+        pills.appendChild(pill('Dry-run', 'warn'));
+      } else {
+        pills.appendChild(pill(data.trade_dry_run ? 'TRADE_DRY_RUN on' : 'LIVE trades', data.trade_dry_run ? 'ok' : 'warn'));
+      }
+      if (activeFilter && (stage === 'done' || stage === 'go_live' || stage === 'algorithm')) {
         pills.appendChild(pill('Filter: ' + (activeFilter.title || activeFilter.name), 'ok'));
       }
       if (data.last_loop_wake) {
@@ -965,8 +1780,13 @@
       );
       var statusClass = 'pos-status';
       if (p.status === 'trail') statusClass += ' pos-status-trail';
-      else if (p.status === 'floor') statusClass += ' pos-status-floor';
-      else if (p.status === 'holding') statusClass += ' pos-status-holding';
+      else if (p.status === 'floor') {
+        // Color like G/L cells from total P/L; not bold like trail
+        statusClass += ' pos-status-floor';
+        var floorPl = Number(p.open_pl);
+        if (!isNaN(floorPl) && floorPl < 0) statusClass += ' neg';
+        else if (!isNaN(floorPl) && floorPl > 0) statusClass += ' pos';
+      } else if (p.status === 'holding') statusClass += ' pos-status-holding';
       else if (p.status === 'tracking') statusClass += ' pos-status-tracking';
       else if (p.status === 'skipped' || p.status === 'not_enrolled') statusClass += ' pos-status-muted';
       var days = p.days_held;
@@ -1009,7 +1829,39 @@
     });
   }
 
+  var traderLoadingTimer = null;
+  var traderLoadInFlight = false;
+
+  function stopLoadingDots() {
+    if (traderLoadingTimer != null) {
+      clearInterval(traderLoadingTimer);
+      traderLoadingTimer = null;
+    }
+  }
+
+  function makeLoadingPill(baseText) {
+    var span = document.createElement('span');
+    span.className = 'pill';
+    span.appendChild(document.createTextNode(baseText || 'Loading'));
+    var dots = document.createElement('span');
+    dots.className = 'loading-dots';
+    dots.setAttribute('aria-hidden', 'true');
+    span.appendChild(dots);
+    stopLoadingDots();
+    var frames = ['.', '..', '...', ''];
+    var i = 0;
+    function tick() {
+      dots.textContent = frames[i];
+      i = (i + 1) % frames.length;
+    }
+    tick();
+    traderLoadingTimer = setInterval(tick, 400);
+    return span;
+  }
+
   async function loadTrader() {
+    if (traderLoadInFlight) return;
+    traderLoadInFlight = true;
     var pills = document.getElementById('trader-pills');
     var cards = document.getElementById('trader-cards');
     var algoPills = document.getElementById('algo-pills');
@@ -1018,52 +1870,82 @@
     var obody = document.querySelector('#orders-table tbody');
     loadPerformance();
     bindPositionsSort();
+    if (pills && !pills.childElementCount) {
+      pills.appendChild(makeLoadingPill('Loading'));
+    }
     try {
       var data = await fetchJson('/api/portfolio');
+      stopLoadingDots();
       var t = data.totals || {};
       var snap = data.account_snapshot || {};
       var algo = data.algorithm || {};
       var sc = algo.scorecard || {};
       pills.innerHTML = '';
       pills.appendChild(pill((data.positions || []).length + ' positions', 'ok'));
-      if (snap.cash != null) pills.appendChild(pill('Cash ' + money(snap.cash), ''));
+      // Cash: only real Schwab snapshots. Green within SCHWAB_SYNC_INTERVAL; orange after.
+      if (snap.cash != null && snap.cash !== '') {
+        var cashLabel = 'Cash ' + money(snap.cash);
+        if (snap.stale) {
+          if (snap.ts) cashLabel += ' · ' + timeAgo(snap.ts);
+          pills.appendChild(pill(cashLabel, 'warn'));
+        } else {
+          pills.appendChild(pill(cashLabel, 'ok'));
+        }
+      } else {
+        pills.appendChild(pill('Cash unavailable', 'warn'));
+      }
       var pSync = data.positions_sync || {};
       if (pSync.stale || pSync.ok === false) {
-        pills.appendChild(pill('Schwab marks stale', 'warn'));
+        var syncLabel = marksSyncLabel(pSync);
+        pills.appendChild(pill(syncLabel, 'warn'));
       } else if (pSync.synced_at) {
-        pills.appendChild(pill('Marks ' + String(pSync.synced_at).replace('T', ' ').slice(0, 19), 'ok'));
+        pills.appendChild(pill('Marks updated ' + timeAgo(pSync.synced_at), 'ok'));
       }
       if (useMock()) pills.appendChild(pill('Mock data', 'warn'));
 
+      var cashVal = snap.cash;
+      var mvVal = t.market_value;
+      var accountVal = snap.liquidation_value;
+      if (accountVal == null && mvVal != null && cashVal != null) {
+        accountVal = Number(mvVal) + Number(cashVal);
+      } else if (accountVal == null) {
+        accountVal = mvVal;
+      }
+      var accountHint =
+        'Market Value: ' + money(mvVal) + '\n' +
+        'Cash Value: ' + money(cashVal) +
+        (snap.stale && snap.ts ? ('\nCash/account snapshot · ' + timeAgo(snap.ts)) : '');
+
       cards.innerHTML =
-        card('Market value', money(t.market_value), 'Sum of positions') +
-        card('Day G/L', pct(t.day_pct), money(t.day_pl)) +
-        card('G/L', money(t.open_pl), pct(t.open_pct)) +
-        card('Cost basis', money(t.cost_basis), t.realized_note || '');
+        card('Account value', money(accountVal), accountHint) +
+        card('Day G/L', money(t.day_pl), pct(t.day_pct), plTone(t.day_pl)) +
+        card('Total G/L', money(t.open_pl), pct(t.open_pct), plTone(t.open_pl));
 
       if (algoPills && algoCards) {
         algoPills.innerHTML = '';
         if (algo.algorithm_start) {
-          algoPills.appendChild(pill('Start ' + algo.algorithm_start, 'ok'));
+          algoPills.appendChild(pill('Start ' + formatMdY(algo.algorithm_start), 'ok'));
         } else {
           algoPills.appendChild(pill('Algorithm start not set', 'warn'));
         }
-        var enrolled = (algo.books && algo.books.enrolled) || [];
-        var algoBuys = (algo.books && algo.books.algo_buys) || [];
-        algoPills.appendChild(pill(enrolled.length + ' enrolled (excluded)', ''));
-        algoPills.appendChild(pill(algoBuys.length + ' algo buys', algoBuys.length ? 'ok' : ''));
+        var books = algo.books || data.books || {};
+        var algoBuys = books.algo_buys || [];
+        var algoBook = books.algorithm || [];
+        var buyCount = algoBuys.length || algoBook.length;
+        algoPills.appendChild(pill(buyCount + ' positions', buyCount ? 'ok' : ''));
 
         var realized = sc.realized_pl != null ? Number(sc.realized_pl) : 0;
         var unreal = sc.unrealized_pl != null ? Number(sc.unrealized_pl) : 0;
         var totalPl = sc.total_pl != null ? Number(sc.total_pl) : realized + unreal;
+        var tradeCount = sc.trade_count != null ? sc.trade_count : 0;
         algoCards.innerHTML =
-          card('Realized G/L', money(realized), 'Closed algo buys only') +
-          card('Unrealized G/L', money(unreal), 'Open algo_buy positions') +
-          card('Total algo G/L', money(totalPl), 'Realized + unrealized') +
+          card('Realized G/L', money(realized), 'Closed positions only') +
+          card('Unrealized G/L', money(unreal), 'Open positions') +
+          card('Total G/L', money(totalPl), 'Realized + unrealized') +
           card(
             'Deployed',
             money(sc.buy_dollars),
-            (sc.trade_count != null ? sc.trade_count : 0) + ' algo trades · open MV ' + money(sc.open_market_value)
+            'Market Value ' + money(sc.open_market_value) + '\n' + tradeCount + ' trades'
           );
       }
 
@@ -1078,7 +1960,10 @@
             var when = t.when;
             if (!when) {
               var mins = t.minutes_until != null ? Number(t.minutes_until) : null;
-              if (t.due_now || (mins != null && mins <= 0)) {
+              if (t.running) {
+                var rm = t.running_minutes != null ? Number(t.running_minutes) : 0;
+                when = rm <= 0 ? 'running' : (rm === 1 ? 'running 1 min' : ('running ' + rm + ' min'));
+              } else if (t.due_now || (mins != null && mins <= 0)) {
                 when = 'now';
               } else if (mins == null) {
                 when = '—';
@@ -1091,8 +1976,9 @@
                 when = 'in ' + mins + ' minutes';
               }
             }
+            var liClass = t.running ? 'due-now task-running' : (t.due_now ? 'due-now' : '');
             return (
-              '<li class="' + (t.due_now ? 'due-now' : '') + '">' +
+              '<li class="' + liClass + '">' +
                 '<span class="task-name">' + escapeHtml(title) + '</span>' +
                 '<span class="task-when">' + escapeHtml(when) + '</span>' +
               '</li>'
@@ -1127,6 +2013,7 @@
         obody.innerHTML = '<tr><td colspan="4" class="empty">No pending or open orders.</td></tr>';
       }
     } catch (e) {
+      stopLoadingDots();
       pills.innerHTML = '';
       pills.appendChild(pill('API error: ' + e.message, 'bad'));
       if (algoPills) algoPills.innerHTML = '';
@@ -1134,6 +2021,8 @@
       positionsRows = [];
       tbody.innerHTML = '<tr><td colspan="9" class="empty">Could not load portfolio.</td></tr>';
       obody.innerHTML = '';
+    } finally {
+      traderLoadInFlight = false;
     }
   }
 
@@ -1145,9 +2034,13 @@
     { id: 'task', label: 'Tasks', meaning: 'Scheduler noise: task start/finish, Yahoo batches, Schwab sync, account snapshots.' }
   ];
 
+  var LOG_PAGE_SIZE = 50;
   // Default: activity only (not Tasks)
   var logFilterSelected = { buy: true, sell: true, watchlist: true };
   var logEventsCache = [];
+  var logHasMore = false;
+  var logLoadingMore = false;
+  var logLoadInFlight = false;
 
   function normalizeLogCategory(ev) {
     var c = String((ev && ev.category) || '').toLowerCase();
@@ -1172,6 +2065,14 @@
     return found ? found.label : id;
   }
 
+  function logEventsQuery(extra) {
+    var keys = Object.keys(logFilterSelected);
+    var q = '/api/events?limit=' + LOG_PAGE_SIZE;
+    if (keys.length) q += '&categories=' + encodeURIComponent(keys.join(','));
+    if (extra && extra.before_id) q += '&before_id=' + encodeURIComponent(String(extra.before_id));
+    return q;
+  }
+
   function ensureLogFilters() {
     var host = document.getElementById('log-filters');
     if (!host || host.getAttribute('data-ready') === '1') return;
@@ -1187,7 +2088,7 @@
         if (logFilterSelected[cat.id]) delete logFilterSelected[cat.id];
         else logFilterSelected[cat.id] = true;
         btn.classList.toggle('active', !!logFilterSelected[cat.id]);
-        renderLogEvents();
+        loadLog({ reset: true });
       });
       host.appendChild(btn);
     });
@@ -1205,26 +2106,125 @@
     hint.textContent = 'Showing: ' + labels.join(' + ') + '. Click a pill again to remove it.';
   }
 
+  function logDayKey(ts) {
+    var s = String(ts || '');
+    var m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : '';
+  }
+
+  function logDayLabel(dayKey) {
+    if (!dayKey) return 'Unknown date';
+    var parts = dayKey.split('-');
+    var d = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+    if (isNaN(d.getTime())) return dayKey;
+    var now = new Date();
+    var today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    var yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    var dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    if (dayStart.getTime() === today.getTime()) return 'Today';
+    if (dayStart.getTime() === yesterday.getTime()) return 'Yesterday';
+    return d.toLocaleDateString(undefined, {
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    });
+  }
+
+  function logTimeOnly(ts) {
+    var s = String(ts || '');
+    var m = s.match(/T(\d{2}:\d{2}:\d{2})/);
+    if (m) return m[1];
+    m = s.match(/\s(\d{2}:\d{2}:\d{2})/);
+    if (m) return m[1];
+    return s;
+  }
+
+  function mergeLogHead(fresh) {
+    if (!Array.isArray(fresh) || !fresh.length) {
+      if (!logEventsCache.length) logEventsCache = [];
+      return;
+    }
+    var minFresh = Infinity;
+    fresh.forEach(function (e) {
+      var id = Number(e.id);
+      if (!isNaN(id) && id < minFresh) minFresh = id;
+    });
+    var older = logEventsCache.filter(function (e) {
+      return Number(e.id) < minFresh;
+    });
+    var seen = {};
+    var out = [];
+    fresh.concat(older).forEach(function (e) {
+      var id = e && e.id;
+      if (id == null || seen[id]) return;
+      seen[id] = true;
+      out.push(e);
+    });
+    logEventsCache = out;
+  }
+
+  function renderLogMore() {
+    var foot = document.getElementById('log-more');
+    if (!foot) return;
+    foot.hidden = false;
+    foot.innerHTML = '';
+    if (!logEventsCache.length) {
+      foot.hidden = true;
+      return;
+    }
+    if (logLoadingMore) {
+      var loading = document.createElement('span');
+      loading.className = 'log-end';
+      loading.textContent = 'Loading…';
+      foot.appendChild(loading);
+      return;
+    }
+    if (!logHasMore) {
+      var end = document.createElement('span');
+      end.className = 'log-end';
+      end.textContent = 'End of log';
+      foot.appendChild(end);
+      return;
+    }
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn-ghost';
+    btn.textContent = 'Load older';
+    btn.addEventListener('click', loadLogOlder);
+    foot.appendChild(btn);
+  }
+
   function renderLogEvents() {
     var box = document.getElementById('event-list');
     if (!box) return;
     updateLogFilterHint();
-    var selected = Object.keys(logFilterSelected);
     var events = logEventsCache.map(function (ev) {
       return Object.assign({}, ev, { _cat: normalizeLogCategory(ev) });
     });
-    if (selected.length) {
-      events = events.filter(function (ev) { return !!logFilterSelected[ev._cat]; });
-    }
     if (!logEventsCache.length) {
       box.innerHTML = '<div class="empty">No events yet. Run the trader or Yahoo refresh to generate log rows.</div>';
+      renderLogMore();
       return;
     }
     if (!events.length) {
       box.innerHTML = '<div class="empty">No events match the selected filters.</div>';
+      renderLogMore();
       return;
     }
-    box.innerHTML = events.map(function (ev) {
+    var html = [];
+    var lastDay = null;
+    events.forEach(function (ev) {
+      var day = logDayKey(ev.ts);
+      if (day && day !== lastDay) {
+        html.push(
+          '<div class="log-day-break" role="separator">' +
+            escapeHtml(logDayLabel(day)) +
+          '</div>'
+        );
+        lastDay = day;
+      }
       var lvl = String(ev.level || 'info').toLowerCase();
       if (lvl === 'warning') lvl = 'warn';
       var rowClass = 'event';
@@ -1238,31 +2238,102 @@
       if (lvl === 'warn' || lvl === 'error' || lvl === 'issue') {
         lvlClass = ' ' + (lvl === 'issue' ? 'error' : lvl);
       }
-      return (
+      var tsText = day ? logTimeOnly(ev.ts) : String(ev.ts || '');
+      html.push(
         '<div class="' + rowClass + '">' +
-          '<div class="ts">' + escapeHtml(ev.ts || '') + '</div>' +
-          '<div class="lvl' + lvlClass + '">' +
-            lvlLabel +
-          '</div>' +
+          '<div class="ts">' + escapeHtml(tsText) + '</div>' +
+          '<div class="lvl' + lvlClass + '">' + lvlLabel + '</div>' +
           '<div class="cat">' + escapeHtml(logCategoryLabel(ev._cat)) + '</div>' +
           '<div>' + escapeHtml(ev.message || '') + '</div>' +
         '</div>'
       );
-    }).join('');
+    });
+    box.innerHTML = html.join('');
+    renderLogMore();
   }
 
-  async function loadLog() {
+  async function loadLog(opts) {
+    var reset = !opts || opts.reset !== false;
     var box = document.getElementById('event-list');
     ensureLogFilters();
+    if (logLoadInFlight) return;
+    logLoadInFlight = true;
     try {
-      var data = await fetchJson('/api/events?limit=100');
-      var events = data.events || data;
+      var data = await fetchJson(logEventsQuery());
+      var events = data.events || [];
       if (!Array.isArray(events)) events = [];
-      logEventsCache = events;
+      if (reset) {
+        logEventsCache = events;
+        logHasMore = !!data.has_more;
+      } else {
+        mergeLogHead(events);
+        // has_more only from reset / load older
+      }
       renderLogEvents();
     } catch (e) {
-      box.innerHTML = '<div class="empty">Could not load events: ' + escapeHtml(e.message) + '</div>';
+      if (box && (!logEventsCache || !logEventsCache.length)) {
+        box.innerHTML = '<div class="empty">Could not load events: ' + escapeHtml(e.message) + '</div>';
+      }
+      renderLogMore();
+    } finally {
+      logLoadInFlight = false;
     }
+  }
+
+  async function refreshLogHead() {
+    ensureLogFilters();
+    if (logLoadInFlight || logLoadingMore) return;
+    logLoadInFlight = true;
+    try {
+      var data = await fetchJson(logEventsQuery());
+      var events = data.events || [];
+      if (!Array.isArray(events)) events = [];
+      if (!logEventsCache.length) {
+        logEventsCache = events;
+        logHasMore = !!data.has_more;
+      } else {
+        mergeLogHead(events);
+      }
+      renderLogEvents();
+    } catch (e) {
+      // Keep existing list on poll failure
+    } finally {
+      logLoadInFlight = false;
+    }
+  }
+
+  async function loadLogOlder() {
+    if (logLoadingMore || !logHasMore || !logEventsCache.length) return;
+    var oldest = null;
+    logEventsCache.forEach(function (e) {
+      var id = Number(e.id);
+      if (isNaN(id)) return;
+      if (oldest == null || id < oldest) oldest = id;
+    });
+    if (oldest == null) return;
+    logLoadingMore = true;
+    renderLogMore();
+    try {
+      var data = await fetchJson(logEventsQuery({ before_id: oldest }));
+      var events = data.events || [];
+      if (!Array.isArray(events)) events = [];
+      var seen = {};
+      logEventsCache.forEach(function (e) { seen[e.id] = true; });
+      events.forEach(function (e) {
+        if (e && e.id != null && !seen[e.id]) {
+          seen[e.id] = true;
+          logEventsCache.push(e);
+        }
+      });
+      logHasMore = !!data.has_more;
+      renderLogEvents();
+    } catch (e) {
+      logLoadingMore = false;
+      renderLogMore();
+      return;
+    }
+    logLoadingMore = false;
+    renderLogMore();
   }
 
   function pill(text, kind) {
@@ -1272,13 +2343,50 @@
     return span;
   }
 
-  function card(label, value, hint) {
+  function plTone(v) {
+    if (v === null || v === undefined || v === '') return '';
+    var n = Number(v);
+    if (isNaN(n) || n === 0) return '';
+    return n > 0 ? 'pos' : 'neg';
+  }
+
+  function marksSyncLabel(pSync) {
+    var reason = (pSync && pSync.reason) || '';
+    var ago = pSync && pSync.synced_at ? timeAgo(pSync.synced_at) : '';
+    if (reason === 'schwab_unavailable') {
+      return ago
+        ? 'Marks outdated — Schwab offline · last ' + ago
+        : 'Marks outdated — Schwab offline';
+    }
+    if (reason === 'sync_failed') {
+      return ago
+        ? 'Marks outdated — sync failed · last ' + ago
+        : 'Marks outdated — sync failed';
+    }
+    if (reason === 'database_locked') {
+      return ago
+        ? 'Marks updating soon — DB busy · last ' + ago
+        : 'Marks updating soon — DB busy';
+    }
+    if (ago) return 'Marks outdated · last updated ' + ago;
+    return 'Marks outdated — not synced yet';
+  }
+
+  function card(label, value, hint, valueClass) {
+    var tone = valueClass ? ' ' + valueClass : '';
     return (
       '<div class="card"><div class="label">' + escapeHtml(label) + '</div>' +
-      '<div class="value">' + escapeHtml(value) + '</div>' +
+      '<div class="value' + tone + '">' + escapeHtml(value) + '</div>' +
       (hint ? '<div class="hint">' + escapeHtml(hint) + '</div>' : '') +
       '</div>'
     );
+  }
+
+  function possessiveAccountLabel(name) {
+    var n = String(name || '').trim();
+    if (!n) return 'Account';
+    if (/s$/i.test(n)) return n + "' Account";
+    return n + "'s Account";
   }
 
   function escapeHtml(s) {
@@ -1291,17 +2399,44 @@
 
   // Hash routing for portability (#trader)
   function fromHash() {
-    var h = (location.hash || '#about').replace('#', '');
+    var h = (location.hash || '#trader').replace('#', '');
     if (h === 'home') h = 'about'; // old bookmark
-    if (['about', 'trader', 'log', 'actions'].indexOf(h) < 0) h = 'about';
+    if (['about', 'trader', 'log', 'actions'].indexOf(h) < 0) h = 'trader';
     showPage(h);
   }
   window.addEventListener('hashchange', fromHash);
-  document.querySelectorAll('nav.side button').forEach(function (btn) {
+  document.querySelectorAll('nav.side button[data-page]').forEach(function (btn) {
     btn.addEventListener('click', function () {
       location.hash = btn.getAttribute('data-page');
     });
   });
+
+  var logoutBtn = document.getElementById('nav-logout');
+  if (logoutBtn) {
+    logoutBtn.addEventListener('click', function () {
+      logoutBtn.disabled = true;
+      var navigated = false;
+      function goLogin() {
+        if (navigated) return;
+        navigated = true;
+        window.location.href = '/login';
+      }
+      postJson('/api/logout', {}).catch(function () {}).then(goLogin);
+      // Never leave Sign out looking dead if the API stalls.
+      setTimeout(goLogin, 2000);
+    });
+  }
+
+  fetchJson('/api/me').then(function (me) {
+    currentUser = (me && me.user) || null;
+    var el = document.getElementById('brand-user');
+    if (el && currentUser) {
+      var name = currentUser.display_name || currentUser.username || '';
+      el.textContent = possessiveAccountLabel(name);
+    }
+    if (currentUser) showWelcomeBanner(currentUser);
+    loadHostCard();
+  }).catch(function () {});
 
   fromHash();
   refreshSchwabUi();
@@ -1329,11 +2464,14 @@
       return;
     }
     fetchJson('/api/status').then(function (data) {
-      if (data.schwab) applySchwabChrome(data.schwab);
+      var stage = data.onboarding_stage || 'done';
+      applyOnboardingBanner(stage);
+      applyActionsBadge(data);
+      if (data.schwab) applySchwabChrome(data.schwab, stage);
       var rev = data.dashboard_rev;
       if (rev === lastContentRev) return;
       lastContentRev = rev;
-      if (active.id === 'page-log') loadLog();
+      if (active.id === 'page-log') refreshLogHead();
     }).catch(function () {});
   }, 15000);
 })();

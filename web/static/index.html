@@ -12,6 +12,20 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
+  <div id="welcome-banner" class="welcome-banner" hidden role="status" aria-live="polite">
+    <div class="welcome-banner-inner">
+      <p class="welcome-banner-text" id="welcome-banner-text">Welcome</p>
+    </div>
+  </div>
+  <div id="onboarding-banner" class="onboarding-banner" hidden role="status" aria-live="polite">
+    <div class="onboarding-banner-inner">
+      <p class="onboarding-banner-text" id="onboarding-banner-text"></p>
+      <div class="onboarding-banner-actions">
+        <button type="button" class="btn-primary" id="onboarding-banner-cta">Continue</button>
+        <button type="button" class="btn-ghost" id="onboarding-banner-dismiss" hidden>Later</button>
+      </div>
+    </div>
+  </div>
   <div id="schwab-banner" class="schwab-banner" hidden role="status" aria-live="polite">
     <div class="schwab-banner-inner">
       <p class="schwab-banner-text" id="schwab-banner-text"></p>
@@ -24,20 +38,21 @@
   <div class="shell">
     <nav class="side" aria-label="Primary">
       <p class="brand">Jame Trader</p>
-      <p class="brand-sub">About this system</p>
+      <p class="brand-sub" id="brand-user">Account</p>
       <div class="nav-links">
-        <button type="button" data-page="about" class="active">About</button>
-        <button type="button" data-page="trader">Trader</button>
+        <button type="button" data-page="trader" class="active">Trader</button>
         <button type="button" data-page="log">Log</button>
         <button type="button" data-page="actions" id="nav-actions">
           Actions
           <span class="nav-badge" id="nav-actions-badge" hidden aria-label="Attention needed">!</span>
         </button>
+        <button type="button" data-page="about">About</button>
       </div>
+      <button type="button" class="btn-ghost nav-logout" id="nav-logout">Sign out</button>
     </nav>
 
     <main>
-      <section id="page-about" class="page active">
+      <section id="page-about" class="page">
         <h1>What this system does</h1>
         <p class="lead">
           An always-on trading assistant: it refreshes market fundamentals from Yahoo,
@@ -102,7 +117,7 @@
         </div>
       </section>
 
-      <section id="page-trader" class="page">
+      <section id="page-trader" class="page active">
         <h1>Trader</h1>
         <p class="lead">Positions, open orders, and mark-to-market P/L from the local database (Schwab-synced when available).</p>
         <div class="meta-row" id="trader-pills"></div>
@@ -111,7 +126,7 @@
         <div class="panel">
           <h2>Algorithm scorecard</h2>
           <p class="lead" style="margin-top:0">
-            Post-start buys only (<code>origin=algo_buy</code>). Pre-start enrolled holdings are sell-managed but excluded here.
+            How the bot's doing — realized and open gains since the algorithm started.
           </p>
           <div class="meta-row" id="algo-pills"></div>
           <div class="cards" id="algo-cards"></div>
@@ -190,26 +205,28 @@
         <div class="toolbar">
           <div>
             <h1>Log</h1>
-            <p class="lead" style="margin-bottom:0">Trading story by default (Buy / Sell / Watchlist). Tasks hides scheduler noise until you select it.</p>
+            <p class="lead" style="margin-bottom:0">Buy / Sell / Watchlist by default. New events stream in; Load older for history. Tasks stays off until you select it.</p>
           </div>
           <button type="button" class="btn-ghost" id="btn-refresh-log">Refresh</button>
         </div>
         <div class="meta-row log-filters" id="log-filters" aria-label="Filter by event type"></div>
         <p class="log-filter-hint" id="log-filter-hint"></p>
         <div class="panel" id="event-list"></div>
+        <div class="log-more" id="log-more" hidden></div>
       </section>
 
       <section id="page-actions" class="page">
         <h1>Actions</h1>
-        <p class="lead">Remote controls for the always-on bot. More actions will land here later.</p>
+        <p class="lead">Connect Schwab, set floors, then start the algorithm. One step at a time for new accounts.</p>
 
         <article class="action-card" id="schwab-reconnect-card">
           <div class="action-card-head">
-            <h2>Schwab reconnect</h2>
+            <h2>Schwab connection</h2>
             <span class="pill" id="schwab-status-pill">Checking…</span>
           </div>
           <p class="action-card-desc" id="schwab-status-detail">
-            Open Schwab login, approve, then paste the redirect URL here so the bot can renew its API session (~7 days).
+            Link Schwab first. New accounts cannot run the bot until this is connected.
+            Later, use the same flow to renew the API session (~7 days).
           </p>
           <ol class="action-steps">
             <li>Press <strong>Open Schwab login</strong> (new tab).</li>
@@ -230,6 +247,112 @@
             <button type="button" class="btn-primary" id="schwab-submit" disabled>Submit</button>
           </div>
           <p class="action-feedback" id="schwab-feedback" hidden></p>
+        </article>
+
+        <article class="action-card" id="account-setup-card" hidden>
+          <div class="action-card-head">
+            <h2>Account setup</h2>
+            <span class="pill warn" id="setup-status-pill">Incomplete</span>
+          </div>
+          <p class="action-card-desc" id="setup-card-desc">
+            After Schwab is linked, set your cash floor, minimum account value, and buy size.
+            Bounds come from your live account balances.
+          </p>
+          <p class="setup-account-line" id="setup-account-line" hidden></p>
+          <ul class="setup-checklist" id="setup-checklist"></ul>
+          <div class="setup-fields">
+            <label class="action-field">
+              <span>Minimum cash ($)</span>
+              <input type="number" id="setup-min-cash" min="0" step="100" />
+              <span class="field-hint" id="setup-min-cash-hint"></span>
+            </label>
+            <label class="action-field">
+              <span>Minimum account value ($)</span>
+              <input type="number" id="setup-min-liq" min="0" step="100" />
+              <span class="field-hint" id="setup-min-liq-hint"></span>
+            </label>
+            <label class="action-field">
+              <span>Buy size per stock ($)</span>
+              <input type="number" id="setup-order-amt" min="1" step="50" />
+              <span class="field-hint" id="setup-order-amt-hint"></span>
+            </label>
+          </div>
+          <div class="action-row">
+            <button type="button" class="btn-primary" id="setup-save-btn">Save &amp; finish setup</button>
+            <button type="button" class="btn-ghost" id="setup-goto-schwab">Schwab connection</button>
+          </div>
+          <p class="action-feedback" id="setup-feedback" hidden></p>
+        </article>
+
+        <article class="action-card" id="algorithm-control-card">
+          <div class="action-card-head">
+            <h2>Algorithm</h2>
+            <span class="pill" id="algo-status-pill">—</span>
+          </div>
+          <p class="action-card-desc" id="algo-status-detail">
+            Pick a filter and press Run to start (dry-run). Go live places real orders.
+          </p>
+          <label class="action-field">
+            <span>Filter</span>
+            <select id="algo-filter-select"></select>
+          </label>
+          <details class="filter-builder" id="filter-builder">
+            <summary>Build a custom filter (optional — one per account, max 15 fields)</summary>
+            <p class="action-card-desc">
+              Edit Set to values. Live match count updates as you change bounds.
+              Save with a name to use it as your filter.
+            </p>
+            <p class="filter-match-count" id="filter-match-count">— stocks match</p>
+            <div class="scroll-x">
+              <table class="data filter-table" id="filter-builder-table">
+                <thead>
+                  <tr>
+                    <th>Field</th>
+                    <th>Meaning</th>
+                    <th>Set to</th>
+                    <th>Why</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="filter-builder-body"></tbody>
+              </table>
+            </div>
+            <div class="action-row filter-builder-toolbar">
+              <button type="button" class="btn-add-field" id="filter-add-field" title="Add field">+</button>
+              <input type="search" id="filter-field-search" class="filter-field-search" placeholder="Search fields…" hidden />
+              <select id="filter-field-pick" hidden></select>
+              <label class="action-field filter-name-field">
+                <span>Filter name</span>
+                <input type="text" id="filter-save-name" placeholder="e.g. My Safe" maxlength="40" />
+              </label>
+              <button type="button" class="btn-primary" id="filter-save-btn">Save filter</button>
+            </div>
+            <p class="action-feedback" id="filter-builder-feedback" hidden></p>
+          </details>
+          <div class="action-row">
+            <button type="button" class="btn-primary" id="algo-run-btn">Run</button>
+            <button type="button" class="btn-ghost" id="algo-pause-btn">Pause</button>
+            <button type="button" class="btn-ghost" id="algo-live-btn">Go live</button>
+          </div>
+          <p class="action-feedback" id="algo-feedback" hidden></p>
+        </article>
+
+        <article class="action-card" id="host-deploy-card" hidden>
+          <div class="action-card-head">
+            <h2>Dell host</h2>
+            <span class="pill" id="host-status-pill">—</span>
+          </div>
+          <p class="action-card-desc" id="host-status-detail">
+            Pull from GitHub on this machine, then restart the trader loop, dashboard, and tunnel.
+            The supervisor restarts any of those three if they crash.
+          </p>
+          <ul class="host-proc-list" id="host-proc-list"></ul>
+          <p class="host-git-line" id="host-git-line"></p>
+          <div class="action-row">
+            <button type="button" class="btn-primary" id="host-pull-btn">Pull from GitHub</button>
+            <button type="button" class="btn-ghost" id="host-restart-btn">Restart processes</button>
+          </div>
+          <p class="action-feedback" id="host-feedback" hidden></p>
         </article>
       </section>
     </main>

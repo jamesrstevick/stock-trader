@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Sign in — Jame Trader</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="/static/config.js"></script>
+</head>
+<body class="login-body">
+  <main class="login-shell">
+    <h1 class="login-brand">Jame Trader</h1>
+    <p class="login-lead">Sign in to manage your account on this machine.</p>
+    <form id="login-form" class="login-form" autocomplete="on">
+      <label>
+        <span>Username</span>
+        <input type="text" name="username" id="login-username" required autocomplete="username" />
+      </label>
+      <label>
+        <span>Password</span>
+        <input type="password" name="password" id="login-password" required autocomplete="current-password" />
+      </label>
+      <p class="login-error" id="login-error" hidden></p>
+      <button type="submit" class="btn-primary" id="login-submit">Sign in</button>
+    </form>
+  </main>
+  <script src="/static/login.js"></script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+{
+  "ok": true,
+  "supervisor": true,
+  "busy": false,
+  "git": {
+    "branch": "main",
+    "sha": "abc1234",
+    "dirty": false,
+    "repo": true
+  },
+  "children": {
+    "loop": { "running": true, "pid": 1001, "restarts": 0 },
+    "dashboard": { "running": true, "pid": 1002, "restarts": 0 },
+    "tunnel": { "running": true, "pid": 1003, "restarts": 0 }
+  },
+  "last_command": {
+    "id": "mock",
+    "action": "pull",
+    "ok": true,
+    "message": "Mock: already up to date",
+    "finished_at": "2026-08-12T12:00:00"
+  },
+  "updated_at": "2026-08-12T12:00:00",
+  "supervisor_pid": 999
+}

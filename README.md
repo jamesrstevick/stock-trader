@@ -10,7 +10,7 @@ On your home machine (or Pi), `python main.py --loop` wakes on a schedule:
 - **Watchlist + buys** — re-ranks with the active filter (default: `safe`), then considers ~$1k buys when cash rules allow.
 - **Sell check** — every ~15 minutes: arm trails after +10%, ratchet stops, hard stops when the thesis (watchlist) changes.
 
-A separate FastAPI dashboard (`python web_app.py`) is read-only in v1. Live data comes from the local API (optionally via Cloudflare Tunnel), or mock fixtures with `?mock=1`.
+A separate FastAPI dashboard (`python web_app.py`) uses **in-app login** (username/password, ~30-day session). Each user has their own Schwab link, filter, watchlist, positions, and log. Yahoo fundamentals are shared. Live data comes from the local API, or mock fixtures with `?mock=1`.
 
 ## Trading rules (high level)
 
@@ -29,10 +29,10 @@ Exact values come from `config.py` and show live on the About page.
 
 | Page | Purpose |
 |------|---------|
-| **About** | System overview, active filter, jobs, trading rules |
 | **Trader** | Positions, orders, algo scorecard + next tasks, performance vs S&P 500 |
 | **Log** | Trading story by default (Buy / Sell / Watchlist); Tasks pill for scheduler noise |
 | **Actions** | **Schwab reconnect** (paste-back OAuth) and future remote controls |
+| **About** | System overview, active filter, jobs, trading rules |
 
 ## Setup
 
@@ -47,14 +47,34 @@ copy config.example.py config.py   # or: cp config.example.py config.py
 Edit `config.py` with your Schwab API credentials. Keep `TRADE_DRY_RUN = True` until you intentionally go live.
 
 ```bash
+# One shot (Windows) — opens three windows: loop, dashboard, cloudflared tunnel
+.\start.ps1
+# or: start.bat
+# skip tunnel: .\start.ps1 -NoTunnel
+
+# Dell always-on host (auto-restart + Pull from GitHub button):
+.\supervisor.ps1
+
+# Or manually:
 # Terminal A — bot
 python main.py --loop
 
 # Terminal B — dashboard
 python web_app.py
+
+# Terminal C — Cloudflare tunnel (optional, for trader.traderjame.com)
+cloudflared tunnel run stock-trader
 ```
 
-Open `http://127.0.0.1:8787/`. Offline UI: `http://127.0.0.1:8787/?mock=1`.
+Open `http://127.0.0.1:8787/` — sign in (default owner `jame` is created on first DB init). Offline UI: `http://127.0.0.1:8787/?mock=1`.
+
+Add another user (e.g. your brother):
+
+```bash
+python main.py --create-user brother "their-password" --display Brother
+```
+
+Set that user’s active filter / dry-run in the DB (`user_settings`) or ask for a small admin helper later — the webpage filter dropdown is view-only.
 
 ### Useful one-shots
 
@@ -88,16 +108,46 @@ From the dashboard (local or via tunnel):
 
 Within `SCHWAB_AUTH_WARN_HOURS` (default **48**), a site banner asks to reconnect; **No** snoozes it for `SCHWAB_AUTH_SNOOZE_HOURS` (default **4**). The Actions nav badge stays visible while warning even if snoozed. You can reconnect early anytime to reset the 7-day clock.
 
-Protect `POST /api/schwab/auth` with **Cloudflare Access** — it can mint trading tokens.
+Schwab reconnect requires a signed-in session (each user’s tokens stay in their own `tokens_<username>.db`).
 
-### Cloudflare Tunnel (optional)
+### Remote access (optional)
 
-Point a tunnel at `http://127.0.0.1:8787`, put Cloudflare Access in front, and do **not** port-forward. Bind stays `127.0.0.1`.
+Keep the bind on `127.0.0.1` and reach the dashboard via your LAN or a mesh VPN (e.g. Tailscale). Do **not** port-forward the dashboard to the open internet without extra hardening.
+
+### Dell always-on host
+
+Develop on your Surface (or any PC): commit, `git push`. The Dell is a clone of the same repo. It runs `supervisor.ps1`, which keeps the three processes up and restarts any that crash.
+
+**Once on the Dell**
+
+1. Install Git, Python 3, and (optional) `cloudflared`. Sign Git in so `git pull` works without a prompt (`gh auth login`, Git Credential Manager, or an SSH key).
+2. `git clone` this repo. Create `.venv`, `pip install -r requirements.txt`, copy `config.py` (it is gitignored — copy from your Surface or recreate from `config.example.py`).
+3. Windows: **Sleep → Never**. Optional: auto-login for the Dell user.
+4. Do **not** use `start.ps1` on the Dell (no crash restart). Use:
+
+```powershell
+.\supervisor.ps1
+# or register a logon task:
+.\install_host_startup.ps1
+Start-ScheduledTask -TaskName JameTraderHost
+```
+
+5. Leave that user logged in. The supervisor window can stay open; children run hidden. Restarts are logged in `logs/supervisor.log`.
+
+**Pull from the website**
+
+Sign in as an admin (`jame` / `--admin` users). **Actions → Dell host → Pull from GitHub** fetches the branch, runs `pip install -r requirements.txt`, and restarts loop + dashboard + tunnel. The site will drop for a few seconds. **Restart processes** bounces the three without pulling.
+
+`config.py`, SQLite DBs, and Schwab tokens stay on the Dell (gitignored / home directory). Don’t commit from the Dell unless you mean to.
 
 ## Project layout
 
 ```
 stock-trader/
+├── start.ps1 / start.bat  # Dev launch: loop + dashboard + tunnel
+├── supervisor.ps1         # Dell host: auto-restart + git pull commands
+├── install_host_startup.ps1  # Scheduled Task: supervisor at logon
+├── host_control.py     # Dashboard ↔ supervisor command/status files
 ├── config.example.py   # Template (copy to config.py — not committed)
 ├── config.py           # Local secrets & knobs (gitignored)
 ├── stock_trader.py     # Core library

@@ -8,8 +8,10 @@ config.py is gitignored — never commit real keys.
 SCHWAB_API_KEY = "your_api_key_here"
 SCHWAB_API_SECRET = "your_api_secret_here"
 SCHWAB_REDIRECT_URI = "https://127.0.0.1"
-# schwabdev token DB (shared by bot + dashboard OAuth paste-back)
+# Legacy single-user token path (migrated to tokens_<username>.db on first run)
 SCHWAB_TOKENS_DB = "~/.schwabdev/tokens.db"
+# Per-user Schwab token files live here as tokens_<username>.db
+SCHWAB_TOKENS_DIR = "~/.schwabdev"
 # Refresh token lifetime (Schwab / schwabdev); full browser login required after this.
 SCHWAB_REFRESH_TOKEN_DAYS = 7
 # Dashboard banner + Actions urgent highlight when refresh expires within this many hours.
@@ -19,6 +21,10 @@ SCHWAB_AUTH_SNOOZE_HOURS = 4
 
 # Database Configuration
 DATABASE_PATH = "market_data.db"
+# Yahoo fundamentals live in a side DB so long Yahoo batches don't lock trading/UI.
+FUNDAMENTALS_DATABASE_PATH = "market_fundamentals.db"
+# When a due job fails (DB lock / transient), wake the loop again after this many seconds.
+JOB_RETRY_SOON_SECONDS = 30
 
 # Max age (days) before a ticker is past the staleness SLA (warn + prioritize).
 MARKET_DATA_REFRESH_DAYS = 7
@@ -56,6 +62,8 @@ WATCHLIST_JOB_INTERVAL_HOURS = 1
 MINIMUM_HOLD_HOURS = 16
 SELL_CHECK_INTERVAL_MINUTES = 15
 SCHWAB_SYNC_INTERVAL_MINUTES = 5
+# If a job stays status=running longer than this, reclaim it so the loop can retry.
+STALE_JOB_RUNNING_MINUTES = 5
 POST_ORDER_SYNC_DELAY_SECONDS = 3
 POSITIONS_SYNC_MIN_INTERVAL_SECONDS = 45
 
@@ -95,3 +103,15 @@ WEB_PORT = 8787
 WEB_LOG_PATH = 'logs/trader.log'
 WEB_CORS_ORIGINS = ''
 WEB_FETCH_OPEN_ORDERS = False
+# In-app login session lifetime (days)
+SESSION_DAYS = 30
+# First-run owner (only when users table is empty). Prefer --create-user after that.
+BOOTSTRAP_USERNAME = 'jame'
+BOOTSTRAP_PASSWORD = 'change-me'
+BOOTSTRAP_DISPLAY_NAME = 'Jame'
+
+# WATCHLIST_FILTER_NAME seeds each user's active_filter on first create.
+# New users always start with trade_dry_run=1 (Dry Run), regardless of TRADE_DRY_RUN.
+# Floors / buy size start NULL until Account setup (Schwab → bounds from live cash).
+# Loops for a user start only after Algorithm → Run (algorithm_start). Then Go live.
+# After that, per-user values in the DB win (not switched from the webpage).
