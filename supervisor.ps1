@@ -93,27 +93,49 @@ function Stop-MatchingCommandLine {
         }
 }
 
+function Stop-RepoPython {
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -match 'python' -and $_.CommandLine -and (
+                $_.CommandLine -match 'main\.py' -or
+                $_.CommandLine -match 'web_app\.py'
+            )
+        } |
+        ForEach-Object {
+            Write-HostLog ("Stopping leftover python pid {0}" -f $_.ProcessId)
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+}
+
 function Start-HiddenProcess {
     param(
         [string]$FilePath,
-        [string[]]$ArgumentList
+        [string[]]$ArgumentList,
+        [string]$LogStem
     )
-    # Start-Process -WindowStyle Hidden fails on Windows PowerShell 5.1
-    # ("cannot find all the information required"). Use ProcessStartInfo instead.
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $FilePath
-    $psi.WorkingDirectory = $Root
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    if ($ArgumentList -and $ArgumentList.Count -gt 0) {
-        $quoted = New-Object System.Collections.Generic.List[string]
-        foreach ($a in $ArgumentList) {
-            if ($a -match '\s') { [void]$quoted.Add('"' + $a + '"') }
-            else { [void]$quoted.Add($a) }
-        }
-        $psi.Arguments = ($quoted -join ' ')
+    $outLog = Join-Path $LogDir ($LogStem + '.out.log')
+    $errLog = Join-Path $LogDir ($LogStem + '.err.log')
+    $params = @{
+        FilePath = $FilePath
+        WorkingDirectory = $Root
+        PassThru = $true
+        RedirectStandardOutput = $outLog
+        RedirectStandardError = $errLog
     }
-    return [System.Diagnostics.Process]::Start($psi)
+    if ($ArgumentList -and $ArgumentList.Count -gt 0) {
+        $params.ArgumentList = $ArgumentList
+    }
+    return Start-Process @params
+}
+
+function Write-LogTail {
+    param([string]$Name)
+    $errLog = Join-Path $LogDir ($Name + '.err.log')
+    if (-not (Test-Path $errLog)) { return }
+    $lines = Get-Content -Path $errLog -Tail 12 -ErrorAction SilentlyContinue
+    foreach ($line in $lines) {
+        if ($line) { Write-HostLog ("  {0}" -f $line) }
+    }
 }
 
 $python = Find-VenvPython
@@ -206,11 +228,11 @@ function Start-NamedChild {
     if (Test-Alive $script:children[$Name]) { return }
 
     if ($Name -eq 'loop') {
-        $script:children.loop = Start-HiddenProcess $python @('main.py', '--loop')
+        $script:children.loop = Start-HiddenProcess $python @('main.py', '--loop') 'loop'
     } elseif ($Name -eq 'dashboard') {
-        $script:children.dashboard = Start-HiddenProcess $python @('web_app.py')
+        $script:children.dashboard = Start-HiddenProcess $python @('web_app.py') 'dashboard'
     } elseif ($Name -eq 'tunnel') {
-        $script:children.tunnel = Start-HiddenProcess $cloudflared @('tunnel', 'run', 'stock-trader')
+        $script:children.tunnel = Start-HiddenProcess $cloudflared @('tunnel', 'run', 'stock-trader') 'tunnel'
     }
     $script:startedAt[$Name] = Get-Date
     $p = $script:children[$Name]
@@ -236,6 +258,7 @@ function Note-ChildExit {
     $delay = [Math]::Min(60, [Math]::Pow(2, [Math]::Min(5, [int]$script:crashStreak[$Name])))
     $script:nextStart[$Name] = (Get-Date).AddSeconds($delay)
     Write-HostLog ("{0} exited (code {1})  - restart in {2}s" -f $Name, $code, $delay)
+    Write-LogTail $Name
 }
 
 function Stop-AllChildren {
@@ -363,11 +386,16 @@ function Invoke-HostCommand {
 }
 
 Write-HostLog ("Supervisor starting (python {0})" -f $python)
+if (-not (Test-Path (Join-Path $Root 'config.py'))) {
+    Write-HostLog 'Missing config.py. Copy it from the Surface into this folder, then restart supervisor.'
+}
+Stop-RepoPython
 Stop-MatchingCommandLine 'main\.py["\s]+--loop'
 Stop-MatchingCommandLine 'web_app\.py'
 if ($tunnelEnabled) {
     Stop-MatchingCommandLine 'cloudflared.*tunnel run stock-trader'
 }
+Start-Sleep -Seconds 1
 
 Restart-AllChildren
 Write-Host 'Dashboard (local): http://127.0.0.1:8787/'
