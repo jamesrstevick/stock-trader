@@ -329,6 +329,27 @@ def create_user(
         conn.close()
 
 
+def set_password(username: str, password: str) -> Dict[str, Any]:
+    """Set password for an existing user, or create admin jame-style owner if missing."""
+    init_auth_tables()
+    username = (username or '').strip().lower()
+    if not username or not password:
+        return {'ok': False, 'error': 'username and password required'}
+    existing = get_user_by_username(username)
+    if not existing:
+        return create_user(username, password, display_name=username, is_admin=True)
+    conn = get_connection()
+    try:
+        conn.execute(
+            'UPDATE users SET password_hash=? WHERE username=?',
+            (hash_password(password), username),
+        )
+        conn.commit()
+        return {'ok': True, 'username': username, 'updated': True}
+    finally:
+        conn.close()
+
+
 def bootstrap_default_users() -> None:
     """Create the owner account if no users exist (first multi-user install)."""
     init_auth_tables()

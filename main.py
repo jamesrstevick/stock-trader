@@ -10,6 +10,8 @@ Usage:
                                      # soft reset: snapshot + enroll all holdings (scorecard excludes them)
   python main.py --create-user NAME PASS [--display NAME] [--admin]
                                      # add a dashboard/trading user
+  python main.py --set-password NAME PASS
+                                     # set password (creates the user as admin if missing)
   python web_app.py                  # local dashboard (separate process)
 
 Scheduled runs (--loop / default once) keep the terminal relatively quiet: short
@@ -45,6 +47,16 @@ def main(argv=None):
             display_name=display,
             is_admin=('--admin' in rest),
         )
+        print(result)
+        sys.exit(0 if result.get('ok') else 1)
+    if '--set-password' in argv:
+        i = argv.index('--set-password')
+        rest = argv[i + 1:]
+        if len(rest) < 2:
+            print('Usage: python main.py --set-password USERNAME PASSWORD')
+            sys.exit(2)
+        st.init_database()
+        result = uc.set_password(rest[0], rest[1])
         print(result)
         sys.exit(0 if result.get('ok') else 1)
     if '--dry-run' in argv or '-n' in argv:
