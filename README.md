@@ -116,34 +116,20 @@ Keep the bind on `127.0.0.1` and reach the dashboard via your LAN or a mesh VPN 
 
 ### Dell always-on host
 
-Develop on your Surface (or any PC): commit, `git push`. The Dell is a clone of the same repo. It runs `supervisor.ps1`, which keeps the three processes up and restarts any that crash.
+On the Dell you do **not** need Cursor. Double-click **`setup_host.bat`** in the repo folder (File Explorer). It installs Python 3.12 if needed, creates `.venv`, installs packages, and starts the supervisor.
 
-**Once on the Dell**
+First time only: copy `config.py` from your Surface into that same folder (or let the script create one from `config.example.py` and paste your Schwab keys). Windows: **Sleep → Never**. Leave the setup/supervisor window open.
 
-1. Install Git, Python 3, and (optional) `cloudflared`. Sign Git in so `git pull` works without a prompt (`gh auth login`, Git Credential Manager, or an SSH key).
-2. `git clone` this repo. Create `.venv`, `pip install -r requirements.txt`, copy `config.py` (it is gitignored — copy from your Surface or recreate from `config.example.py`).
-3. Windows: **Sleep → Never**. Optional: auto-login for the Dell user.
-4. Do **not** use `start.ps1` on the Dell (no crash restart). Use:
+Later deploys: push from the Surface, then **Actions → Dell host → Pull from GitHub**.
 
-```powershell
-.\supervisor.ps1
-# or register a logon task:
-.\install_host_startup.ps1
-Start-ScheduledTask -TaskName JameTraderHost
-```
+To start at logon: `.\install_host_startup.ps1` then `Start-ScheduledTask -TaskName JameTraderHost`.
 
-5. Leave that user logged in. The supervisor window can stay open; children run hidden. Restarts are logged in `logs/supervisor.log`.
-
-**Pull from the website**
-
-Sign in as an admin (`jame` / `--admin` users). **Actions → Dell host → Pull from GitHub** fetches the branch, runs `pip install -r requirements.txt`, and restarts loop + dashboard + tunnel. The site will drop for a few seconds. **Restart processes** bounces the three without pulling.
-
-`config.py`, SQLite DBs, and Schwab tokens stay on the Dell (gitignored / home directory). Don’t commit from the Dell unless you mean to.
 
 ## Project layout
 
 ```
 stock-trader/
+├── setup_host.bat / setup_host.ps1  # Dell: double-click to install + run
 ├── start.ps1 / start.bat  # Dev launch: loop + dashboard + tunnel
 ├── supervisor.ps1         # Dell host: auto-restart + git pull commands
 ├── install_host_startup.ps1  # Scheduled Task: supervisor at logon
