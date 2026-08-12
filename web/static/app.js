@@ -1899,7 +1899,7 @@
         var syncLabel = marksSyncLabel(pSync);
         pills.appendChild(pill(syncLabel, 'warn'));
       } else if (pSync.synced_at) {
-        pills.appendChild(pill('Marks updated ' + timeAgo(pSync.synced_at), 'ok'));
+        pills.appendChild(pill('Schwab prices ' + timeAgo(pSync.synced_at), 'ok'));
       }
       if (useMock()) pills.appendChild(pill('Mock data', 'warn'));
 
@@ -2355,21 +2355,21 @@
     var ago = pSync && pSync.synced_at ? timeAgo(pSync.synced_at) : '';
     if (reason === 'schwab_unavailable') {
       return ago
-        ? 'Marks outdated — Schwab offline · last ' + ago
-        : 'Marks outdated — Schwab offline';
+        ? 'Schwab prices outdated — Schwab offline · last ' + ago
+        : 'Schwab prices outdated — Schwab offline';
     }
     if (reason === 'sync_failed') {
       return ago
-        ? 'Marks outdated — sync failed · last ' + ago
-        : 'Marks outdated — sync failed';
+        ? 'Schwab prices outdated — sync failed · last ' + ago
+        : 'Schwab prices outdated — sync failed';
     }
     if (reason === 'database_locked') {
       return ago
-        ? 'Marks updating soon — DB busy · last ' + ago
-        : 'Marks updating soon — DB busy';
+        ? 'Schwab prices updating soon — DB busy · last ' + ago
+        : 'Schwab prices updating soon — DB busy';
     }
-    if (ago) return 'Marks outdated · last updated ' + ago;
-    return 'Marks outdated — not synced yet';
+    if (ago) return 'Schwab prices outdated · last updated ' + ago;
+    return 'Schwab prices outdated — not synced yet';
   }
 
   function card(label, value, hint, valueClass) {
