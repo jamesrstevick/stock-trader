@@ -14,6 +14,7 @@ import os
 import threading
 from typing import Optional
 
+import load_config
 import config
 import host_control as host
 import stock_trader as st
@@ -72,13 +73,25 @@ def _require_admin(request: Request):
     return None
 
 
-def _set_session_cookie(response, token: str) -> None:
+def _request_is_https(request: Request) -> bool:
+    forwarded = (request.headers.get('x-forwarded-proto') or '').split(',')[0].strip().lower()
+    if forwarded:
+        return forwarded == 'https'
+    host = (request.headers.get('host') or '').split(':')[0].lower()
+    if host and host not in ('127.0.0.1', 'localhost', '::1'):
+        return True
+    return (request.url.scheme or '').lower() == 'https'
+
+
+def _set_session_cookie(response, token: str, request: Optional[Request] = None) -> None:
     max_age = uc.session_days() * 24 * 3600
+    secure = _request_is_https(request) if request is not None else False
     response.set_cookie(
         key=uc.SESSION_COOKIE,
         value=token,
         httponly=True,
         samesite='lax',
+        secure=secure,
         max_age=max_age,
         path='/',
     )
@@ -195,7 +208,7 @@ async def api_login(request: Request):
             'display_name': user.get('display_name'),
         },
     })
-    _set_session_cookie(resp, token)
+    _set_session_cookie(resp, token, request)
     return resp
 
 
@@ -208,7 +221,12 @@ def api_logout(request: Request):
     except Exception as e:
         print('Warning: logout session cleanup: %s' % e)
     resp = JSONResponse({'ok': True})
-    resp.delete_cookie(uc.SESSION_COOKIE, path='/')
+    resp.delete_cookie(
+        uc.SESSION_COOKIE,
+        path='/',
+        secure=_request_is_https(request),
+        samesite='lax',
+    )
     return resp
 
 
@@ -466,7 +484,14 @@ def main(host: Optional[str] = None, port: Optional[int] = None):
     port = int(port or getattr(config, 'WEB_PORT', 8787))
     print('Dashboard: http://%s:%s/' % (host, port))
     print('Static dir: %s' % STATIC_DIR)
-    uvicorn.run(app, host=host, port=port, log_level='info')
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level='info',
+        proxy_headers=True,
+        forwarded_allow_ips='*',
+    )
 
 
 if __name__ == '__main__':

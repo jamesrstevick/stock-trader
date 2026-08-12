@@ -424,6 +424,7 @@ def list_active_users() -> List[Dict[str, Any]]:
 
 
 def authenticate(username: str, password: str) -> Optional[Dict[str, Any]]:
+    init_auth_tables()
     user = get_user_by_username(username)
     if not user or not user.get('is_active'):
         return None

@@ -6,7 +6,7 @@
   }
 
   // Already signed in? Go home.
-  fetch(apiBase() + '/api/me', { credentials: 'same-origin' })
+  fetch(apiBase() + '/api/me', { credentials: 'include' })
     .then(function (r) { return r.ok ? r.json() : null; })
     .then(function (data) {
       if (data && data.authenticated) {
@@ -44,7 +44,7 @@
 
     fetch(apiBase() + '/api/login', {
       method: 'POST',
-      credentials: 'same-origin',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: username, password: password }),
     })

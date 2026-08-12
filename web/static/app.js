@@ -28,7 +28,7 @@
       }
       return mockData;
     }
-    var r = await fetch(apiBase() + path, { credentials: 'same-origin' });
+    var r = await fetch(apiBase() + path, { credentials: 'include' });
     if (r.status === 401) {
       window.location.href = '/login';
       throw new Error('login_required');
@@ -54,7 +54,7 @@
     }
     var r = await fetch(apiBase() + path, {
       method: 'POST',
-      credentials: 'same-origin',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body || {}),
     });
