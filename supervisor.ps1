@@ -113,19 +113,21 @@ function Start-HiddenProcess {
         [string[]]$ArgumentList,
         [string]$LogStem
     )
-    $outLog = Join-Path $LogDir ($LogStem + '.out.log')
-    $errLog = Join-Path $LogDir ($LogStem + '.err.log')
-    $params = @{
-        FilePath = $FilePath
-        WorkingDirectory = $Root
-        PassThru = $true
-        RedirectStandardOutput = $outLog
-        RedirectStandardError = $errLog
-    }
+    # Do not use Start-Process: it opens a new console per child (restart storm).
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.WorkingDirectory = $Root
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
     if ($ArgumentList -and $ArgumentList.Count -gt 0) {
-        $params.ArgumentList = $ArgumentList
+        $quoted = New-Object System.Collections.Generic.List[string]
+        foreach ($a in $ArgumentList) {
+            if ($a -match '\s') { [void]$quoted.Add('"' + $a + '"') }
+            else { [void]$quoted.Add($a) }
+        }
+        $psi.Arguments = ($quoted -join ' ')
     }
-    return Start-Process @params
+    return [System.Diagnostics.Process]::Start($psi)
 }
 
 function Write-LogTail {
