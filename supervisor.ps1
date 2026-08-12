@@ -34,10 +34,21 @@ function Write-HostLog {
 }
 
 function Find-VenvPython {
-    foreach ($name in @('venv', '.venv')) {
+    $found = @()
+    foreach ($name in @('.venv', 'venv')) {
         $candidate = Join-Path $Root "$name\Scripts\python.exe"
-        if (Test-Path $candidate) { return $candidate }
+        if (Test-Path $candidate) { $found += $candidate }
     }
+    foreach ($candidate in $found) {
+        try {
+            $out = & $candidate -c 'import sys; print(sys.version_info[0] * 100 + sys.version_info[1])' 2>$null
+            $n = 0
+            if ([int]::TryParse(("$out").Trim(), [ref]$n) -and $n -ge 311) {
+                return $candidate
+            }
+        } catch {}
+    }
+    if ($found.Count -gt 0) { return $found[0] }
     return $null
 }
 
@@ -87,7 +98,22 @@ function Start-HiddenProcess {
         [string]$FilePath,
         [string[]]$ArgumentList
     )
-    return Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -WorkingDirectory $Root -PassThru -WindowStyle Hidden
+    # Start-Process -WindowStyle Hidden fails on Windows PowerShell 5.1
+    # ("cannot find all the information required"). Use ProcessStartInfo instead.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.WorkingDirectory = $Root
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    if ($ArgumentList -and $ArgumentList.Count -gt 0) {
+        $quoted = New-Object System.Collections.Generic.List[string]
+        foreach ($a in $ArgumentList) {
+            if ($a -match '\s') { [void]$quoted.Add('"' + $a + '"') }
+            else { [void]$quoted.Add($a) }
+        }
+        $psi.Arguments = ($quoted -join ' ')
+    }
+    return [System.Diagnostics.Process]::Start($psi)
 }
 
 $python = Find-VenvPython
