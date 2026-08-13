@@ -655,7 +655,7 @@
       var active = document.querySelector('.page.active');
       if (active && active.id === 'page-actions') {
         renderSchwabActionCard(schwab, stage);
-        renderAccountSetup(data.account_setup || { setup_complete: !!(currentUser && currentUser.is_admin) }, stage);
+        renderAccountSetup(data.account_setup || { setup_complete: !!(currentUser && currentUser.is_admin) }, stage, schwab);
         renderAlgorithmControl(data.algorithm_control, stage);
       }
       return schwab;
@@ -700,7 +700,15 @@
       ', less than $' + Math.floor(hi).toLocaleString();
   }
 
-  function renderAccountSetup(setup, stage) {
+  function setupSchwabLinked(setup, schwab) {
+    if (setup && setup.steps && setup.steps.schwab_linked) return true;
+    var state = (setup && setup.schwab && setup.schwab.state)
+      || (schwab && schwab.state)
+      || (lastSchwabStatus && lastSchwabStatus.state);
+    return state === 'connected' || state === 'expiring';
+  }
+
+  function renderAccountSetup(setup, stage, schwab) {
     var card = document.getElementById('account-setup-card');
     if (!card) return;
     setup = setup || {};
@@ -724,7 +732,7 @@
         : 'After Schwab is linked, set your cash floor, minimum account value, and buy size. Bounds come from your live account balances.';
     }
 
-    var schwabOk = !!(setup.steps && setup.steps.schwab_linked);
+    var schwabOk = setupSchwabLinked(setup, schwab);
     var steps = setup.steps || {};
     var list = document.getElementById('setup-checklist');
     if (list) {
@@ -841,21 +849,14 @@
     var hCash = document.getElementById('setup-min-cash-hint');
     var hLiq = document.getElementById('setup-min-liq-hint');
     var hOrd = document.getElementById('setup-order-amt-hint');
-    if (hCash) {
-      hCash.textContent = fieldsDisabled
-        ? 'Link Schwab first'
-        : moneyHint('minimum_cash', bounds);
+    function fieldHint(key) {
+      if (!schwabOk) return 'Link Schwab first';
+      var text = moneyHint(key, bounds);
+      return text || 'Waiting for account balances';
     }
-    if (hLiq) {
-      hLiq.textContent = fieldsDisabled
-        ? 'Link Schwab first'
-        : moneyHint('minimum_liquidation_value', bounds);
-    }
-    if (hOrd) {
-      hOrd.textContent = fieldsDisabled
-        ? 'Link Schwab first'
-        : moneyHint('order_amount_dollars', bounds);
-    }
+    if (hCash) hCash.textContent = fieldHint('minimum_cash');
+    if (hLiq) hLiq.textContent = fieldHint('minimum_liquidation_value');
+    if (hOrd) hOrd.textContent = fieldHint('order_amount_dollars');
   }
 
   function setActionFeedback(id, msg, ok) {

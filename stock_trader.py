@@ -9759,7 +9759,7 @@ def get_dashboard_status() -> Dict[str, Any]:
     try:
         setup = get_account_setup_status()
     except Exception:
-        setup = {'setup_complete': True}
+        setup = _account_setup_status_fallback()
     try:
         algo_ctl = get_algorithm_control_status()
     except Exception:
@@ -10460,6 +10460,49 @@ def get_onboarding_stage() -> str:
     if trade_dry_run_enabled():
         return 'go_live'
     return 'done'
+
+
+def _account_setup_status_fallback() -> Dict[str, Any]:
+    """Settings + Schwab state when the full setup payload cannot be built."""
+    try:
+        settings = uc.get_user_settings(_uid())
+    except Exception:
+        settings = {}
+    try:
+        auth = get_schwab_auth_status()
+    except Exception:
+        auth = {}
+    schwab_ok = auth.get('state') in ('connected', 'expiring')
+    complete = bool(settings.get('setup_complete'))
+    try:
+        complete = complete or user_is_admin()
+    except Exception:
+        pass
+    return {
+        'setup_complete': complete,
+        'can_finish': False,
+        'steps': {
+            'schwab_linked': bool(schwab_ok),
+            'minimum_cash': settings.get('minimum_cash') is not None,
+            'minimum_liquidation_value': settings.get('minimum_liquidation_value') is not None,
+            'order_amount_dollars': settings.get('order_amount_dollars') is not None,
+        },
+        'schwab': {
+            'state': auth.get('state'),
+            'warn': auth.get('warn'),
+            'needs_login': auth.get('needs_login'),
+        },
+        'account': None,
+        'bounds': None,
+        'settings': {
+            'minimum_cash': settings.get('minimum_cash'),
+            'minimum_liquidation_value': settings.get('minimum_liquidation_value'),
+            'order_amount_dollars': settings.get('order_amount_dollars'),
+            'active_filter': settings.get('active_filter') or 'safe',
+            'trade_dry_run': settings.get('trade_dry_run'),
+        },
+        'suggestions': suggest_setup_values(None),
+    }
 
 
 def get_account_setup_status() -> Dict[str, Any]:
