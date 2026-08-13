@@ -262,23 +262,42 @@
           <ul class="setup-checklist" id="setup-checklist"></ul>
           <div class="setup-fields">
             <label class="action-field">
-              <span>Minimum cash ($)</span>
+              <span class="action-field-label">
+                <span class="action-field-name">Minimum cash ($)</span>
+                <button type="button" class="btn-icon setup-edit-btn" data-setup-field="cash" title="Edit" hidden>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                  <span class="sr-only">Edit minimum cash</span>
+                </button>
+              </span>
               <input type="number" id="setup-min-cash" min="0" step="100" />
               <span class="field-hint" id="setup-min-cash-hint"></span>
             </label>
             <label class="action-field">
-              <span>Minimum account value ($)</span>
+              <span class="action-field-label">
+                <span class="action-field-name">Minimum account value ($)</span>
+                <button type="button" class="btn-icon setup-edit-btn" data-setup-field="liq" title="Edit" hidden>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                  <span class="sr-only">Edit minimum account value</span>
+                </button>
+              </span>
               <input type="number" id="setup-min-liq" min="0" step="100" />
               <span class="field-hint" id="setup-min-liq-hint"></span>
             </label>
             <label class="action-field">
-              <span>Buy size per stock ($)</span>
+              <span class="action-field-label">
+                <span class="action-field-name">Buy size per stock ($)</span>
+                <button type="button" class="btn-icon setup-edit-btn" data-setup-field="ord" title="Edit" hidden>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                  <span class="sr-only">Edit buy size</span>
+                </button>
+              </span>
               <input type="number" id="setup-order-amt" min="1" step="50" />
               <span class="field-hint" id="setup-order-amt-hint"></span>
             </label>
           </div>
           <div class="action-row">
             <button type="button" class="btn-primary" id="setup-save-btn">Save &amp; finish setup</button>
+            <button type="button" class="btn-ghost" id="setup-cancel-btn" hidden>Cancel</button>
             <button type="button" class="btn-ghost" id="setup-goto-schwab">Schwab connection</button>
           </div>
           <p class="action-feedback" id="setup-feedback" hidden></p>

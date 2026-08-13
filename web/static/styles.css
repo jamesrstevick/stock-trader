@@ -676,7 +676,21 @@ table.data .pos-status-muted { color: var(--muted); }
   display: block;
   margin-bottom: 0.85rem;
 }
-.action-field span {
+.action-field-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem;
+  margin-bottom: 0.3rem;
+}
+.action-field-name {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.action-field > span:not(.action-field-label):not(.field-hint) {
   display: block;
   font-size: 0.78rem;
   font-weight: 600;
@@ -698,6 +712,34 @@ table.data .pos-status-muted { color: var(--muted); }
   outline: 2px solid var(--accent-soft);
   border-color: var(--accent);
 }
+.action-field input[readonly] {
+  background: #f6f3ec;
+  color: var(--ink);
+  cursor: default;
+}
+.action-field input[readonly]:focus {
+  outline: none;
+  border-color: var(--line);
+}
+.btn-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.55rem;
+  height: 1.55rem;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--muted);
+  cursor: pointer;
+}
+.btn-icon:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.btn-icon svg { display: block; }
 .action-feedback {
   margin: 0;
   font-size: 0.9rem;

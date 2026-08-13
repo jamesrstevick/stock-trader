@@ -445,6 +445,8 @@
   var currentUser = null;
   var hostBusy = false;
   var lastOnboardingStage = 'done';
+  var setupEditing = false;
+  var lastSetupPayload = null;
   var filterBuilderState = { criteria: [], catalog: [], debounce: null };
   var ONBOARD_SNOOZE_KEY = 'onboardingGoLiveSnoozeUntil';
 
@@ -683,33 +685,46 @@
     var card = document.getElementById('account-setup-card');
     if (!card) return;
     setup = setup || {};
+    lastSetupPayload = setup;
     stage = stage || setup.onboarding_stage || lastOnboardingStage;
-    // Owner/admin accounts that already trade: never show onboarding setup.
-    var done = !!(setup.setup_complete) || !!(currentUser && currentUser.is_admin);
-    if (done) {
-      card.hidden = true;
-      card.setAttribute('hidden', '');
-      return;
-    }
+    var done = !!(setup.setup_complete);
     card.hidden = false;
     card.removeAttribute('hidden');
-    card.classList.toggle('urgent', stage === 'settings');
+    card.classList.toggle('urgent', !done && stage === 'settings');
     card.classList.remove('urgent-warn');
+
+    var pill = document.getElementById('setup-status-pill');
+    if (pill) {
+      pill.className = 'pill ' + (done ? 'ok' : 'warn');
+      pill.textContent = done ? 'Set' : 'Incomplete';
+    }
+    var desc = document.getElementById('setup-card-desc');
+    if (desc) {
+      desc.textContent = done
+        ? 'Your cash floor, minimum account value, and buy size. Locked until you press the pencil to edit.'
+        : 'After Schwab is linked, set your cash floor, minimum account value, and buy size. Bounds come from your live account balances.';
+    }
 
     var schwabOk = !!(setup.steps && setup.steps.schwab_linked);
     var steps = setup.steps || {};
     var list = document.getElementById('setup-checklist');
     if (list) {
-      var items = [
-        ['schwab_linked', 'Schwab account linked'],
-        ['minimum_cash', 'Minimum cash set'],
-        ['minimum_liquidation_value', 'Minimum account value set'],
-        ['order_amount_dollars', 'Buy size set'],
-      ];
-      list.innerHTML = items.map(function (pair) {
-        var ok = !!steps[pair[0]];
-        return '<li class="' + (ok ? 'ok' : 'bad') + '">' + pair[1] + '</li>';
-      }).join('');
+      if (done) {
+        list.innerHTML = '';
+        list.hidden = true;
+      } else {
+        list.hidden = false;
+        var items = [
+          ['schwab_linked', 'Schwab account linked'],
+          ['minimum_cash', 'Minimum cash set'],
+          ['minimum_liquidation_value', 'Minimum account value set'],
+          ['order_amount_dollars', 'Buy size set'],
+        ];
+        list.innerHTML = items.map(function (pair) {
+          var ok = !!steps[pair[0]];
+          return '<li class="' + (ok ? 'ok' : 'bad') + '">' + pair[1] + '</li>';
+        }).join('');
+      }
     }
 
     var acctLine = document.getElementById('setup-account-line');
@@ -736,37 +751,60 @@
     var cash = document.getElementById('setup-min-cash');
     var liq = document.getElementById('setup-min-liq');
     var ord = document.getElementById('setup-order-amt');
+    var locked = done && !setupEditing;
     var fieldsDisabled = !schwabOk;
     [cash, liq, ord].forEach(function (el) {
-      if (el) el.disabled = fieldsDisabled;
+      if (!el) return;
+      el.disabled = fieldsDisabled;
+      el.readOnly = locked;
     });
     var saveBtn = document.getElementById('setup-save-btn');
-    if (saveBtn) saveBtn.disabled = fieldsDisabled;
+    var cancelBtn = document.getElementById('setup-cancel-btn');
+    var schwabBtn = document.getElementById('setup-goto-schwab');
+    if (saveBtn) {
+      saveBtn.hidden = done && !setupEditing;
+      saveBtn.disabled = fieldsDisabled || (done && !setupEditing);
+      saveBtn.textContent = done ? 'Save' : 'Save & finish setup';
+    }
+    if (cancelBtn) {
+      cancelBtn.hidden = !setupEditing;
+    }
+    if (schwabBtn) {
+      schwabBtn.hidden = done;
+    }
+    if (saveBtn && saveBtn.parentElement && saveBtn.parentElement.classList.contains('action-row')) {
+      saveBtn.parentElement.hidden = done && !setupEditing;
+    }
+    document.querySelectorAll('.setup-edit-btn').forEach(function (btn) {
+      btn.hidden = !done || setupEditing || fieldsDisabled;
+    });
 
-    if (cash && document.activeElement !== cash) {
-      cash.value = s.minimum_cash != null ? s.minimum_cash : (sug.minimum_cash || '');
-      if (bounds.minimum_cash) {
-        cash.min = bounds.minimum_cash.min_exclusive;
-        cash.max = bounds.minimum_cash.max_exclusive;
+    if (!setupEditing) {
+      if (cash && document.activeElement !== cash) {
+        cash.value = s.minimum_cash != null ? s.minimum_cash : (sug.minimum_cash || '');
+      }
+      if (liq && document.activeElement !== liq) {
+        liq.value = s.minimum_liquidation_value != null
+          ? s.minimum_liquidation_value
+          : (sug.minimum_liquidation_value || '');
+      }
+      if (ord && document.activeElement !== ord) {
+        ord.value = s.order_amount_dollars != null
+          ? s.order_amount_dollars
+          : (sug.order_amount_dollars || '');
       }
     }
-    if (liq && document.activeElement !== liq) {
-      liq.value = s.minimum_liquidation_value != null
-        ? s.minimum_liquidation_value
-        : (sug.minimum_liquidation_value || '');
-      if (bounds.minimum_liquidation_value) {
-        liq.min = bounds.minimum_liquidation_value.min_exclusive;
-        liq.max = bounds.minimum_liquidation_value.max_exclusive;
-      }
+    if (cash && bounds.minimum_cash) {
+      cash.min = bounds.minimum_cash.min_exclusive;
+      cash.max = bounds.minimum_cash.max_exclusive;
     }
-    if (ord && document.activeElement !== ord) {
-      ord.value = s.order_amount_dollars != null
-        ? s.order_amount_dollars
-        : (sug.order_amount_dollars || '');
-      if (bounds.order_amount_dollars) {
-        ord.min = 1;
-        ord.max = bounds.order_amount_dollars.max_inclusive;
-      }
+    if (liq && bounds.minimum_liquidation_value) {
+      liq.min = bounds.minimum_liquidation_value.min_exclusive;
+      liq.max = bounds.minimum_liquidation_value.max_exclusive;
+    }
+    if (ord && bounds.order_amount_dollars) {
+      ord.min = 1;
+      ord.max = bounds.order_amount_dollars.max_inclusive;
     }
     var hCash = document.getElementById('setup-min-cash-hint');
     var hLiq = document.getElementById('setup-min-liq-hint');
@@ -1286,6 +1324,7 @@
 
   (function wireSetupAlgorithmFilter() {
     var setupSave = document.getElementById('setup-save-btn');
+    var setupCancel = document.getElementById('setup-cancel-btn');
     var setupSchwab = document.getElementById('setup-goto-schwab');
     var algoRun = document.getElementById('algo-run-btn');
     var algoPause = document.getElementById('algo-pause-btn');
@@ -1295,27 +1334,59 @@
     var fieldSearch = document.getElementById('filter-field-search');
     var fieldPick = document.getElementById('filter-field-pick');
 
+    function beginSetupEdit(focusId) {
+      setupEditing = true;
+      renderAccountSetup(lastSetupPayload);
+      var el = document.getElementById(focusId);
+      if (el) {
+        el.focus();
+        if (el.select) el.select();
+      }
+    }
+
+    document.querySelectorAll('.setup-edit-btn').forEach(function (btn) {
+      btn.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        var which = btn.getAttribute('data-setup-field');
+        var focusId = 'setup-min-cash';
+        if (which === 'liq') focusId = 'setup-min-liq';
+        if (which === 'ord') focusId = 'setup-order-amt';
+        beginSetupEdit(focusId);
+      });
+    });
+    if (setupCancel) {
+      setupCancel.addEventListener('click', function () {
+        setupEditing = false;
+        setActionFeedback('setup-feedback', '');
+        renderAccountSetup(lastSetupPayload);
+      });
+    }
+
     if (setupSave) {
       setupSave.addEventListener('click', async function () {
+        var alreadySet = !!(lastSetupPayload && lastSetupPayload.setup_complete);
         setActionFeedback('setup-feedback', 'Saving…', true);
         var payload = {
           minimum_cash: Number((document.getElementById('setup-min-cash') || {}).value),
           minimum_liquidation_value: Number((document.getElementById('setup-min-liq') || {}).value),
           order_amount_dollars: Number((document.getElementById('setup-order-amt') || {}).value),
-          finish: true,
+          finish: !alreadySet,
         };
         try {
           var res = await postJson('/api/account/setup', payload);
+          setupEditing = false;
           renderAccountSetup(res.setup || res, res.onboarding_stage);
+          var finishedNow = !alreadySet && res.setup && res.setup.setup_complete;
           setActionFeedback(
             'setup-feedback',
-            (res.setup && res.setup.setup_complete)
+            finishedNow
               ? 'Setup complete — next: pick a filter and press Run.'
-              : (res.error || 'Saved.'),
-            !!(res.setup && res.setup.setup_complete) || !!res.ok
+              : (res.ok ? 'Settings saved.' : (res.error || 'Saved.')),
+            !!(res.ok || (res.setup && res.setup.setup_complete))
           );
           await refreshSchwabUi();
-          if (res.setup && res.setup.setup_complete) {
+          if (finishedNow) {
             scrollToActionCard('algorithm-control-card');
           }
         } catch (e) {
