@@ -184,6 +184,12 @@ button.pill-filter.active {
   color: var(--muted);
   min-height: 1.2em;
 }
+.watchlist-filters {
+  margin-bottom: 0.65rem;
+}
+table.data tbody tr.watchlist-owned td {
+  background: var(--accent-soft);
+}
 
 .log-day-break {
   display: flex;

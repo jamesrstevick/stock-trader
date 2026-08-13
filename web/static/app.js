@@ -2075,7 +2075,52 @@
   var watchlistColumns = [];
   var watchlistSort = { key: 'analyst_upside', dir: 'desc' };
   var watchlistSortBound = false;
+  var watchlistFilterBound = false;
   var watchlistExpanded = false;
+  var watchlistShowOwned = true;
+
+  function ownedTickerSet(positions) {
+    var set = {};
+    (positions || []).forEach(function (p) {
+      var t = p && p.ticker;
+      if (!t) return;
+      if (p.shares_owned != null && Number(p.shares_owned) <= 0) return;
+      set[String(t).toUpperCase()] = true;
+    });
+    return set;
+  }
+
+  function markWatchlistOwned(rows, positions) {
+    var owned = ownedTickerSet(positions);
+    return (rows || []).map(function (row) {
+      var copy = Object.assign({}, row);
+      copy.owned = !!owned[String(row.ticker || '').toUpperCase()];
+      return copy;
+    });
+  }
+
+  function syncWatchlistOwnedPill() {
+    var btn = document.getElementById('watchlist-owned-filter');
+    if (btn) btn.classList.toggle('active', !!watchlistShowOwned);
+  }
+
+  function ensureWatchlistFilters() {
+    var host = document.getElementById('watchlist-filters');
+    if (!host || watchlistFilterBound) return;
+    watchlistFilterBound = true;
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'watchlist-owned-filter';
+    btn.className = 'pill pill-filter' + (watchlistShowOwned ? ' active' : '');
+    btn.title = 'Names you already hold. Click off to hide them.';
+    btn.textContent = 'Owned';
+    btn.addEventListener('click', function () {
+      watchlistShowOwned = !watchlistShowOwned;
+      syncWatchlistOwnedPill();
+      renderWatchlistTable();
+    });
+    host.appendChild(btn);
+  }
 
   function compactMoney(v) {
     if (v === null || v === undefined || v === '') return '—';
@@ -2182,9 +2227,13 @@
     var expandBtn = document.getElementById('watchlist-expand-btn');
     var expandLabel = document.getElementById('watchlist-expand-label');
     if (!tbody) return;
+    ensureWatchlistFilters();
     renderWatchlistHeaders();
     updateWatchlistSortHeaders();
-    var sorted = sortPositions(watchlistRows, watchlistSort.key, watchlistSort.dir);
+    var rows = watchlistShowOwned
+      ? watchlistRows
+      : watchlistRows.filter(function (r) { return !r.owned; });
+    var sorted = sortPositions(rows, watchlistSort.key, watchlistSort.dir);
     var total = sorted.length;
     var showAll = watchlistExpanded || total <= WATCHLIST_PREVIEW;
     var visible = showAll ? sorted : sorted.slice(0, WATCHLIST_PREVIEW);
@@ -2192,6 +2241,7 @@
     tbody.innerHTML = '';
     visible.forEach(function (row) {
       var tr = document.createElement('tr');
+      if (row.owned) tr.className = 'watchlist-owned';
       var html = '';
       watchlistColumns.forEach(function (col) {
         var val = row[col.key];
@@ -2203,7 +2253,10 @@
       tbody.appendChild(tr);
     });
     if (!total) {
-      tbody.innerHTML = '<tr><td colspan="' + colCount + '" class="empty">No names on the watchlist.</td></tr>';
+      var emptyMsg = (!watchlistShowOwned && watchlistRows.length)
+        ? 'Owned names hidden.'
+        : 'No names on the watchlist.';
+      tbody.innerHTML = '<tr><td colspan="' + colCount + '" class="empty">' + emptyMsg + '</td></tr>';
     }
     if (expand) {
       if (total > WATCHLIST_PREVIEW) {
@@ -2429,7 +2482,7 @@
 
       var wl = data.watchlist || {};
       watchlistColumns = wl.columns || [];
-      watchlistRows = wl.rows || [];
+      watchlistRows = markWatchlistOwned(wl.rows || [], data.positions || []);
       var colKeys = {};
       watchlistColumns.forEach(function (c) { colKeys[c.key] = true; });
       if (watchlistSort.key !== 'analyst_upside' && !colKeys[watchlistSort.key]) {
@@ -2895,7 +2948,9 @@
     watchlistRows = [];
     watchlistColumns = [];
     watchlistExpanded = false;
+    watchlistShowOwned = true;
     watchlistSort = { key: 'analyst_upside', dir: 'desc' };
+    syncWatchlistOwnedPill();
     var pills = document.getElementById('trader-pills');
     var cards = document.getElementById('trader-cards');
     var algoPills = document.getElementById('algo-pills');
