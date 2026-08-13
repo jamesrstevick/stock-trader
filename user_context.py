@@ -444,6 +444,51 @@ def list_active_users() -> List[Dict[str, Any]]:
         conn.close()
 
 
+# Login-page signup: unused username + this password reveals Set password.
+NEW_USER_LOGIN_TOKEN = 'newuser'
+
+
+def register_from_login(username: str, new_password: str) -> Dict[str, Any]:
+    """
+    Create a non-admin user from the login form (password field was NEW_USER_LOGIN_TOKEN).
+    Returns {ok, user} or {ok: False, error}.
+    """
+    init_auth_tables()
+    username = (username or '').strip().lower()
+    new_password = new_password or ''
+    if not username:
+        return {'ok': False, 'error': 'Enter a username'}
+    if get_user_by_username(username):
+        return {
+            'ok': False,
+            'error': 'That username is already taken — sign in with your password',
+        }
+    if not new_password.strip():
+        return {'ok': False, 'error': 'Enter a password in Set password'}
+    if new_password.strip().lower() == NEW_USER_LOGIN_TOKEN:
+        return {'ok': False, 'error': 'Choose a real password (not "newuser")'}
+    created = create_user(
+        username,
+        new_password,
+        display_name=username,
+        is_admin=False,
+    )
+    if not created.get('ok'):
+        return {'ok': False, 'error': created.get('error') or 'Could not create user'}
+    user = get_user_by_username(username)
+    if not user or not user.get('is_active'):
+        return {'ok': False, 'error': 'Account created but sign-in failed — try signing in'}
+    return {
+        'ok': True,
+        'user': {
+            'id': user['id'],
+            'username': user['username'],
+            'display_name': user['display_name'],
+            'is_admin': user['is_admin'],
+        },
+    }
+
+
 def authenticate(username: str, password: str) -> Optional[Dict[str, Any]]:
     init_auth_tables()
     user = get_user_by_username(username)

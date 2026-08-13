@@ -1250,6 +1250,19 @@ table.data .pos-status-muted { color: var(--muted); }
   font-size: 0.9rem;
   margin: 0 0 0.75rem;
 }
+.login-hint {
+  color: var(--muted, #5c6570);
+  font-size: 0.82rem;
+  margin: -0.45rem 0 0.85rem;
+}
+#login-new-wrap[hidden],
+#login-new-hint[hidden] {
+  display: none !important;
+}
+#login-new-password {
+  font-family: ui-monospace, Consolas, 'Courier New', monospace;
+  letter-spacing: 0.02em;
+}
 .nav-logout {
   margin-top: auto;
   align-self: stretch;

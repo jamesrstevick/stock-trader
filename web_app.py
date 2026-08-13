@@ -181,6 +181,40 @@ async def api_login(request: Request):
         body = {}
     username = (body or {}).get('username') or ''
     password = (body or {}).get('password') or ''
+    new_password = (body or {}).get('new_password') or ''
+    # Unused username + password "newuser" + Set password → create account and sign in.
+    if str(password).strip().lower() == uc.NEW_USER_LOGIN_TOKEN:
+        try:
+            created = uc.register_from_login(str(username), str(new_password))
+        except Exception as e:
+            return JSONResponse(
+                {'ok': False, 'error': 'Could not create account — try again (%s)' % e},
+                status_code=503,
+            )
+        if not created.get('ok'):
+            return JSONResponse(
+                {'ok': False, 'error': created.get('error') or 'Could not create account'},
+                status_code=400,
+            )
+        user = created.get('user')
+        try:
+            token = uc.create_session(int(user['id']))
+        except Exception as e:
+            return JSONResponse(
+                {'ok': False, 'error': 'Account created but session failed — try signing in (%s)' % e},
+                status_code=503,
+            )
+        resp = JSONResponse({
+            'ok': True,
+            'created': True,
+            'user': {
+                'id': user['id'],
+                'username': user['username'],
+                'display_name': user.get('display_name'),
+            },
+        })
+        _set_session_cookie(resp, token, request)
+        return resp
     try:
         user = uc.authenticate(str(username), str(password))
     except Exception as e:

@@ -21,6 +21,11 @@
         <span>Password</span>
         <input type="password" name="password" id="login-password" required autocomplete="current-password" />
       </label>
+      <label id="login-new-wrap" hidden>
+        <span>Set password</span>
+        <input type="text" name="new_password" id="login-new-password" autocomplete="off" spellcheck="false" />
+      </label>
+      <p class="login-hint" id="login-new-hint" hidden>Visible so you can confirm it. This becomes the sign-in password.</p>
       <p class="login-error" id="login-error" hidden></p>
       <button type="submit" class="btn-primary" id="login-submit">Sign in</button>
     </form>
