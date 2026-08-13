@@ -518,6 +518,11 @@ def complete_schwab_oauth(
                 }
         except Exception:
             account_snap = None
+        if account_snap:
+            try:
+                record_account_snapshot(note='schwab_oauth')
+            except Exception:
+                pass
         result = {
             'ok': True,
             'schwab': status,
@@ -4897,23 +4902,31 @@ def get_latest_account_snapshot(
     exclude_fabricated: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Most recent persisted account snapshot for the current user (or None)."""
-    init_database()
+    try:
+        if not _DATABASE_READY:
+            if not mark_database_ready_if_present():
+                init_database()
+    except Exception:
+        pass
     uid = _uid()
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        '''
-        SELECT ts, cash, effective_cash, liquidation_value, total_value, note
-        FROM account_snapshots
-        WHERE user_id = ?
-          AND (COALESCE(liquidation_value, 0) > 0 OR COALESCE(total_value, 0) > 0)
-        ORDER BY id DESC
-        LIMIT 40
-        ''',
-        (uid,),
-    )
-    rows = cursor.fetchall()
-    conn.close()
+    try:
+        conn = get_connection(timeout=2.0, busy_timeout_ms=2000)
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT ts, cash, effective_cash, liquidation_value, total_value, note
+            FROM account_snapshots
+            WHERE user_id = ?
+              AND (COALESCE(liquidation_value, 0) > 0 OR COALESCE(total_value, 0) > 0)
+            ORDER BY id DESC
+            LIMIT 40
+            ''',
+            (uid,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+    except Exception:
+        return None
     for ts, cash, effective, liq, total, note in rows:
         if exclude_fabricated and _is_fabricated_balance_triplet(cash, liq, total):
             continue
@@ -10312,6 +10325,7 @@ def fetch_setup_account_snapshot(live: bool = False) -> Optional[Dict[str, Any]]
     Cash + liquidation for setup bounds, plus as_of for the age line.
     Default: last persisted Schwab snapshot (so the UI can show min/hrs/days ago).
     live=True: hit Schwab now (used when saving floors).
+    Snapshot errors must not skip the live Schwab read.
     """
     def _from_snap(snap: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not snap:
@@ -10329,10 +10343,18 @@ def fetch_setup_account_snapshot(live: bool = False) -> Optional[Dict[str, Any]]
     try:
         if not _schwab_linked_ok():
             return None
-        if not live:
+    except Exception:
+        return None
+
+    if not live:
+        try:
             from_db = _from_snap(get_latest_account_snapshot(exclude_fabricated=True))
             if from_db:
                 return from_db
+        except Exception:
+            pass
+
+    try:
         maybe_reinit_schwab_client()
         acct = get_account_info() or {}
         if account_info_usable(acct):
@@ -10341,6 +10363,10 @@ def fetch_setup_account_snapshot(live: bool = False) -> Optional[Dict[str, Any]]
                 'liquidation_value': float(acct.get('liquidation_value') or 0.0),
                 'as_of': datetime.now().isoformat(timespec='seconds'),
             }
+    except Exception:
+        pass
+
+    try:
         return _from_snap(get_latest_account_snapshot(exclude_fabricated=True))
     except Exception:
         return None
@@ -10478,6 +10504,22 @@ def _account_setup_status_fallback() -> Dict[str, Any]:
         complete = complete or user_is_admin()
     except Exception:
         pass
+    account = None
+    if schwab_ok:
+        try:
+            maybe_reinit_schwab_client()
+            account = fetch_setup_account_snapshot()
+        except Exception:
+            account = None
+    bounds = None
+    if account:
+        try:
+            mc = settings.get('minimum_cash')
+            bounds = compute_setup_bounds(
+                account, minimum_cash_value=float(mc) if mc is not None else None,
+            )
+        except Exception:
+            bounds = None
     return {
         'setup_complete': complete,
         'can_finish': False,
@@ -10492,8 +10534,8 @@ def _account_setup_status_fallback() -> Dict[str, Any]:
             'warn': auth.get('warn'),
             'needs_login': auth.get('needs_login'),
         },
-        'account': None,
-        'bounds': None,
+        'account': account,
+        'bounds': bounds,
         'settings': {
             'minimum_cash': settings.get('minimum_cash'),
             'minimum_liquidation_value': settings.get('minimum_liquidation_value'),
@@ -10507,13 +10549,26 @@ def _account_setup_status_fallback() -> Dict[str, Any]:
 
 def get_account_setup_status() -> Dict[str, Any]:
     """Checklist for Actions → Account setup (Schwab + floors + buy size)."""
-    import filter_builder as fb
-    fb.init_filter_tables()
+    try:
+        import filter_builder as fb
+        fb.init_filter_tables()
+    except Exception:
+        pass
     uid = _uid()
     settings = uc.get_user_settings(uid)
     auth = get_schwab_auth_status()
     schwab_ok = _schwab_linked_ok(auth)
-    account = fetch_setup_account_snapshot() if schwab_ok else None
+    if schwab_ok:
+        try:
+            maybe_reinit_schwab_client()
+        except Exception:
+            pass
+    account = None
+    if schwab_ok:
+        try:
+            account = fetch_setup_account_snapshot()
+        except Exception:
+            account = None
     steps = {
         'schwab_linked': bool(schwab_ok),
         'minimum_cash': settings.get('minimum_cash') is not None,
@@ -10523,8 +10578,11 @@ def get_account_setup_status() -> Dict[str, Any]:
     # Owner/admin already runs — never require the onboarding Account setup card.
     complete = bool(settings.get('setup_complete')) or user_is_admin(uid)
     if complete and not settings.get('setup_complete'):
-        uc.update_user_settings(uid, setup_complete=True)
-        settings = uc.get_user_settings(uid)
+        try:
+            uc.update_user_settings(uid, setup_complete=True)
+            settings = uc.get_user_settings(uid)
+        except Exception:
+            pass
     can_finish = bool(schwab_ok) and all(
         steps[k] for k in (
             'minimum_cash', 'minimum_liquidation_value', 'order_amount_dollars',
@@ -10533,19 +10591,30 @@ def get_account_setup_status() -> Dict[str, Any]:
     # If values present, re-check against live bounds when finishing is attempted
     # (status still reports can_finish from presence; save validates strictly).
     if can_finish and account is not None:
-        err = validate_setup_values(
-            float(settings['minimum_cash']),
-            float(settings['minimum_liquidation_value']),
-            float(settings['order_amount_dollars']),
-            account,
-        )
-        if err:
+        try:
+            err = validate_setup_values(
+                float(settings['minimum_cash']),
+                float(settings['minimum_liquidation_value']),
+                float(settings['order_amount_dollars']),
+                account,
+            )
+            if err:
+                can_finish = False
+        except Exception:
             can_finish = False
     mc = settings.get('minimum_cash')
-    bounds = compute_setup_bounds(
-        account, minimum_cash_value=float(mc) if mc is not None else None,
-    ) if account else None
-    stage = get_onboarding_stage()
+    bounds = None
+    if account:
+        try:
+            bounds = compute_setup_bounds(
+                account, minimum_cash_value=float(mc) if mc is not None else None,
+            )
+        except Exception:
+            bounds = None
+    try:
+        stage = get_onboarding_stage()
+    except Exception:
+        stage = 'done' if complete else 'settings'
     return {
         'setup_complete': complete,
         'can_finish': can_finish and bool(account),
