@@ -69,6 +69,12 @@
           message: 'Mock: would pull or restart on the Dell',
         };
       }
+      if (path.indexOf('/api/me/password') === 0) {
+        if (body && body.new_password) {
+          return { ok: true, updated: true };
+        }
+        return { ok: true, verified: true };
+      }
       return {
         ok: true,
         message: 'Mock: would submit Schwab callback (no live exchange)',
@@ -1539,6 +1545,104 @@
     if (restartBtn) restartBtn.addEventListener('click', function () { runHostAction('restart'); });
   })();
 
+  (function wireResetPassword() {
+    var input = document.getElementById('reset-password-input');
+    var label = document.getElementById('reset-password-label');
+    var desc = document.getElementById('reset-password-desc');
+    var saveBtn = document.getElementById('reset-password-save');
+    var cancelBtn = document.getElementById('reset-password-cancel');
+    if (!input || !saveBtn) return;
+
+    var currentPassword = '';
+    var awaitingNew = false;
+
+    function hasValue() {
+      return !!(input.value || '').trim();
+    }
+
+    function syncSaveEnabled() {
+      saveBtn.disabled = !hasValue();
+    }
+
+    function resetToCurrent(clearFeedback) {
+      currentPassword = '';
+      awaitingNew = false;
+      input.value = '';
+      input.type = 'password';
+      input.setAttribute('autocomplete', 'current-password');
+      if (label) label.textContent = 'Current password';
+      if (desc) {
+        desc.textContent =
+          'Enter your current password. The field then switches so you can set a new one.';
+      }
+      if (cancelBtn) cancelBtn.hidden = true;
+      if (clearFeedback) setActionFeedback('reset-password-feedback', '');
+      syncSaveEnabled();
+    }
+
+    function showNewStep() {
+      awaitingNew = true;
+      input.value = '';
+      input.type = 'text';
+      input.setAttribute('autocomplete', 'new-password');
+      if (label) label.textContent = 'New password';
+      if (desc) {
+        desc.textContent = 'Visible so you can confirm it. Press Save to update your sign-in password.';
+      }
+      if (cancelBtn) cancelBtn.hidden = false;
+      setActionFeedback('reset-password-feedback', '');
+      syncSaveEnabled();
+      input.focus();
+    }
+
+    async function submitResetPassword() {
+      if (!hasValue() || saveBtn.disabled) return;
+      var value = input.value;
+      saveBtn.disabled = true;
+      if (!awaitingNew) {
+        setActionFeedback('reset-password-feedback', 'Checking…', true);
+        try {
+          await postJson('/api/me/password', { current_password: value });
+          currentPassword = value;
+          showNewStep();
+        } catch (e) {
+          setActionFeedback(
+            'reset-password-feedback',
+            e.message || 'Current password is incorrect',
+            false
+          );
+          syncSaveEnabled();
+        }
+        return;
+      }
+      setActionFeedback('reset-password-feedback', 'Saving…', true);
+      try {
+        await postJson('/api/me/password', {
+          current_password: currentPassword,
+          new_password: value,
+        });
+        resetToCurrent(false);
+        setActionFeedback('reset-password-feedback', 'Password updated.', true);
+      } catch (e) {
+        setActionFeedback('reset-password-feedback', e.message || 'Save failed', false);
+        syncSaveEnabled();
+      }
+    }
+
+    input.addEventListener('input', syncSaveEnabled);
+    input.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        submitResetPassword();
+      }
+    });
+    saveBtn.addEventListener('click', function () { submitResetPassword(); });
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () { resetToCurrent(true); });
+    }
+    resetToCurrent(true);
+  })();
+
   var refreshLog = document.getElementById('btn-refresh-log');
   if (refreshLog) refreshLog.addEventListener('click', function () { refreshLogHead(); });
 
@@ -1966,6 +2070,184 @@
     });
   }
 
+  var WATCHLIST_PREVIEW = 10;
+  var watchlistRows = [];
+  var watchlistColumns = [];
+  var watchlistSort = { key: 'analyst_upside', dir: 'desc' };
+  var watchlistSortBound = false;
+  var watchlistExpanded = false;
+
+  function compactMoney(v) {
+    if (v === null || v === undefined || v === '') return '—';
+    var n = Number(v);
+    if (isNaN(n)) return '—';
+    var sign = n < 0 ? '-' : '';
+    var abs = Math.abs(n);
+    if (abs >= 1e12) return sign + '$' + (abs / 1e12).toFixed(1) + 'T';
+    if (abs >= 1e9) return sign + '$' + (abs / 1e9).toFixed(1) + 'B';
+    if (abs >= 1e6) return sign + '$' + (abs / 1e6).toFixed(1) + 'M';
+    return money(n);
+  }
+
+  function compactNum(v) {
+    if (v === null || v === undefined || v === '') return '—';
+    var n = Number(v);
+    if (isNaN(n)) return '—';
+    var sign = n < 0 ? '-' : '';
+    var abs = Math.abs(n);
+    if (abs >= 1e9) return sign + (abs / 1e9).toFixed(1) + 'B';
+    if (abs >= 1e6) return sign + (abs / 1e6).toFixed(1) + 'M';
+    if (abs >= 1e3) return sign + (abs / 1e3).toFixed(1) + 'K';
+    return n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  }
+
+  function formatNumberCell(v) {
+    if (v === null || v === undefined || v === '') return '—';
+    var n = Number(v);
+    if (isNaN(n)) return '—';
+    var abs = Math.abs(n);
+    var digits = abs >= 100 ? 0 : (abs >= 10 ? 1 : 2);
+    return n.toLocaleString(undefined, {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits
+    });
+  }
+
+  function fracPct(v) {
+    if (v === null || v === undefined || v === '') return '—';
+    var n = Number(v);
+    if (isNaN(n)) return '—';
+    return (n * 100).toFixed(1) + '%';
+  }
+
+  function pointsPct(v) {
+    if (v === null || v === undefined || v === '') return '—';
+    var n = Number(v);
+    if (isNaN(n)) return '—';
+    return n.toFixed(1) + '%';
+  }
+
+  function formatWatchlistCell(value, kind, key) {
+    if (key === 'ticker') return escapeHtml(value == null ? '' : String(value));
+    if (kind === 'text') return escapeHtml(value == null || value === '' ? '—' : String(value));
+    if (kind === 'dollars') return compactMoney(value);
+    if (kind === 'price') return money(value);
+    if (kind === 'fraction') return fracPct(value);
+    if (kind === 'percent_points') return pointsPct(value);
+    if (kind === 'shares') return compactNum(value);
+    return formatNumberCell(value);
+  }
+
+  function watchlistCellClass(kind, key, value) {
+    if (key === 'ticker' || kind === 'text') return '';
+    var cls = 'num';
+    if (key === 'analyst_upside') {
+      var n = Number(value);
+      if (!isNaN(n) && n > 0) cls += ' pos';
+      else if (!isNaN(n) && n < 0) cls += ' neg';
+    }
+    return cls;
+  }
+
+  function updateWatchlistSortHeaders() {
+    var table = document.getElementById('watchlist-table');
+    if (!table) return;
+    table.querySelectorAll('th[data-sort]').forEach(function (th) {
+      var key = th.getAttribute('data-sort');
+      var active = key === watchlistSort.key;
+      th.classList.toggle('sorted', active);
+      th.classList.toggle('desc', active && watchlistSort.dir === 'desc');
+      th.setAttribute('aria-sort', active
+        ? (watchlistSort.dir === 'asc' ? 'ascending' : 'descending')
+        : 'none');
+    });
+  }
+
+  function renderWatchlistHeaders() {
+    var theadRow = document.querySelector('#watchlist-table thead tr');
+    if (!theadRow) return;
+    theadRow.innerHTML = '';
+    watchlistColumns.forEach(function (col) {
+      var th = document.createElement('th');
+      th.setAttribute('data-sort', col.key);
+      if (col.key !== 'ticker' && col.kind !== 'text') th.className = 'num';
+      th.textContent = col.label || col.key;
+      theadRow.appendChild(th);
+    });
+  }
+
+  function renderWatchlistTable() {
+    var tbody = document.querySelector('#watchlist-table tbody');
+    var expand = document.getElementById('watchlist-expand');
+    var expandBtn = document.getElementById('watchlist-expand-btn');
+    var expandLabel = document.getElementById('watchlist-expand-label');
+    if (!tbody) return;
+    renderWatchlistHeaders();
+    updateWatchlistSortHeaders();
+    var sorted = sortPositions(watchlistRows, watchlistSort.key, watchlistSort.dir);
+    var total = sorted.length;
+    var showAll = watchlistExpanded || total <= WATCHLIST_PREVIEW;
+    var visible = showAll ? sorted : sorted.slice(0, WATCHLIST_PREVIEW);
+    var colCount = Math.max(watchlistColumns.length, 1);
+    tbody.innerHTML = '';
+    visible.forEach(function (row) {
+      var tr = document.createElement('tr');
+      var html = '';
+      watchlistColumns.forEach(function (col) {
+        var val = row[col.key];
+        var cls = watchlistCellClass(col.kind, col.key, val);
+        html += '<td' + (cls ? ' class="' + cls + '"' : '') + '>' +
+          formatWatchlistCell(val, col.kind, col.key) + '</td>';
+      });
+      tr.innerHTML = html;
+      tbody.appendChild(tr);
+    });
+    if (!total) {
+      tbody.innerHTML = '<tr><td colspan="' + colCount + '" class="empty">No names on the watchlist.</td></tr>';
+    }
+    if (expand) {
+      if (total > WATCHLIST_PREVIEW) {
+        expand.hidden = false;
+        if (expandBtn) expandBtn.setAttribute('aria-expanded', watchlistExpanded ? 'true' : 'false');
+        var arrow = expand.querySelector('.table-expand-arrow');
+        if (arrow) arrow.textContent = watchlistExpanded ? '▲' : '▼';
+        if (expandLabel) {
+          expandLabel.textContent = watchlistExpanded
+            ? 'Show less'
+            : ('Show all ' + total);
+        }
+      } else {
+        expand.hidden = true;
+      }
+    }
+  }
+
+  function bindWatchlistSort() {
+    if (watchlistSortBound) return;
+    var table = document.getElementById('watchlist-table');
+    if (!table) return;
+    watchlistSortBound = true;
+    table.querySelector('thead').addEventListener('click', function (ev) {
+      var th = ev.target.closest('th[data-sort]');
+      if (!th) return;
+      var key = th.getAttribute('data-sort');
+      if (watchlistSort.key === key) {
+        watchlistSort.dir = watchlistSort.dir === 'desc' ? 'asc' : 'desc';
+      } else {
+        watchlistSort.key = key;
+        watchlistSort.dir = key === 'ticker' ? 'asc' : 'desc';
+      }
+      renderWatchlistTable();
+    });
+    var expandBtn = document.getElementById('watchlist-expand-btn');
+    if (expandBtn) {
+      expandBtn.addEventListener('click', function () {
+        watchlistExpanded = !watchlistExpanded;
+        renderWatchlistTable();
+      });
+    }
+  }
+
   var traderLoadingTimer = null;
   var traderLoadInFlight = false;
 
@@ -2007,6 +2289,7 @@
     var obody = document.querySelector('#orders-table tbody');
     loadPerformance();
     bindPositionsSort();
+    bindWatchlistSort();
     if (pills && !pills.childElementCount) {
       pills.appendChild(makeLoadingPill('Loading'));
     }
@@ -2144,6 +2427,16 @@
       positionsRows = data.positions || [];
       renderPositionsTable();
 
+      var wl = data.watchlist || {};
+      watchlistColumns = wl.columns || [];
+      watchlistRows = wl.rows || [];
+      var colKeys = {};
+      watchlistColumns.forEach(function (c) { colKeys[c.key] = true; });
+      if (watchlistSort.key !== 'analyst_upside' && !colKeys[watchlistSort.key]) {
+        watchlistSort = { key: 'analyst_upside', dir: 'desc' };
+      }
+      renderWatchlistTable();
+
       obody.innerHTML = '';
       (data.pending_orders || []).forEach(function (o) {
         var tr = document.createElement('tr');
@@ -2152,6 +2445,23 @@
           '<td>' + escapeHtml(o.ticker || '') + '</td>' +
           '<td class="num">' + (o.quantity_ordered != null ? o.quantity_ordered : '—') + '</td>' +
           '<td>' + money(o.order_amount_dollars) + (o.order_id ? ' · id ' + escapeHtml(String(o.order_id)) : '') + '</td>';
+        obody.appendChild(tr);
+      });
+      (data.limit_sells || []).forEach(function (o) {
+        var tr = document.createElement('tr');
+        var detailParts = [];
+        if (o.stop_price != null && o.stop_price !== '') {
+          detailParts.push('stop ' + money(o.stop_price));
+        }
+        if (o.limit_price != null && o.limit_price !== '') {
+          detailParts.push('limit ' + money(o.limit_price));
+        }
+        if (o.order_id) detailParts.push('id ' + String(o.order_id));
+        tr.innerHTML =
+          '<td>limit sell</td>' +
+          '<td>' + escapeHtml(o.ticker || '') + '</td>' +
+          '<td class="num">' + (o.quantity != null ? o.quantity : '—') + '</td>' +
+          '<td>' + escapeHtml(detailParts.join(' · ') || '—') + '</td>';
         obody.appendChild(tr);
       });
       (data.open_orders || []).forEach(function (o) {
@@ -2163,7 +2473,11 @@
           '<td>' + (o.order_id ? 'id ' + escapeHtml(String(o.order_id)) : '—') + '</td>';
         obody.appendChild(tr);
       });
-      if (!(data.pending_orders || []).length && !(data.open_orders || []).length) {
+      if (
+        !(data.pending_orders || []).length &&
+        !(data.limit_sells || []).length &&
+        !(data.open_orders || []).length
+      ) {
         obody.innerHTML = '<tr><td colspan="4" class="empty">No pending or open orders.</td></tr>';
       }
     } catch (e) {
@@ -2174,8 +2488,14 @@
       if (algoPills) algoPills.innerHTML = '';
       if (algoCards) algoCards.innerHTML = '';
       positionsRows = [];
+      watchlistRows = [];
+      watchlistColumns = [];
       tbody.innerHTML = '<tr><td colspan="9" class="empty">Could not load portfolio.</td></tr>';
       obody.innerHTML = '';
+      var wbody = document.querySelector('#watchlist-table tbody');
+      if (wbody) wbody.innerHTML = '<tr><td class="empty">Could not load watchlist.</td></tr>';
+      var wexpand = document.getElementById('watchlist-expand');
+      if (wexpand) wexpand.hidden = true;
     } finally {
       traderLoadInFlight = false;
     }
@@ -2572,12 +2892,19 @@
     lastContentRev = null;
     logEventsCache = [];
     positionsRows = [];
+    watchlistRows = [];
+    watchlistColumns = [];
+    watchlistExpanded = false;
+    watchlistSort = { key: 'analyst_upside', dir: 'desc' };
     var pills = document.getElementById('trader-pills');
     var cards = document.getElementById('trader-cards');
     var algoPills = document.getElementById('algo-pills');
     var algoCards = document.getElementById('algo-cards');
     var tbody = document.querySelector('#positions-table tbody');
     var obody = document.querySelector('#orders-table tbody');
+    var wbody = document.querySelector('#watchlist-table tbody');
+    var whead = document.querySelector('#watchlist-table thead tr');
+    var wexpand = document.getElementById('watchlist-expand');
     var nextList = document.getElementById('algo-next-tasks-list');
     if (pills) pills.innerHTML = '';
     if (cards) cards.innerHTML = '';
@@ -2585,6 +2912,9 @@
     if (algoCards) algoCards.innerHTML = '';
     if (tbody) tbody.innerHTML = '';
     if (obody) obody.innerHTML = '';
+    if (wbody) wbody.innerHTML = '';
+    if (whead) whead.innerHTML = '';
+    if (wexpand) wexpand.hidden = true;
     if (nextList) nextList.innerHTML = '';
     var perfEmpty = document.getElementById('perf-empty');
     var perfReturns = document.getElementById('perf-returns');

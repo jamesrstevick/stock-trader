@@ -268,6 +268,23 @@ async def api_login(request: Request):
     return resp
 
 
+@app.post('/api/me/password')
+async def api_me_password(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    # Wrong current password is 400, not 401 — 401 would bounce the UI to /login.
+    result = uc.change_own_password(
+        int(request.state.user['id']),
+        (body or {}).get('current_password') or '',
+        (body or {}).get('new_password'),
+    )
+    if not result.get('ok'):
+        return JSONResponse(result, status_code=400)
+    return result
+
+
 @app.post('/api/logout')
 def api_logout(request: Request):
     # Destroy this tab's session. Only clear the shared cookie when this tab

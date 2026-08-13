@@ -25,7 +25,10 @@
       "open_pct": 8.9,
       "trail_active": true,
       "book": "algorithm",
+      "stop_order_id": "1001",
       "stop_order_price": 124.72,
+      "stop_limit_price": 124.10,
+      "stop_order_qty": 8,
       "stop_display_price": 124.72,
       "status": "trail",
       "status_label": "trail $124.72",
@@ -66,6 +69,48 @@
     }
   ],
   "open_orders": [],
+  "limit_sells": [
+    {
+      "ticker": "DELL",
+      "quantity": 8,
+      "order_id": "1001",
+      "order_type": "STOP_LIMIT",
+      "stop_price": 124.72,
+      "limit_price": 124.10,
+      "source": "limit_sell"
+    }
+  ],
+  "watchlist": {
+    "filter": "safe",
+    "filter_title": "Safe Giant",
+    "ranking": "analyst_upside",
+    "columns": [
+      {"key": "ticker", "label": "Ticker", "kind": "text"},
+      {"key": "market_cap", "label": "Mkt cap", "kind": "dollars"},
+      {"key": "beta", "label": "Beta", "kind": "number"},
+      {"key": "short_float", "label": "Short %", "kind": "fraction"},
+      {"key": "pe_ratio", "label": "P/E", "kind": "number"},
+      {"key": "peg_ratio", "label": "PEG", "kind": "number"},
+      {"key": "analyst_upside", "label": "Upside", "kind": "fraction"},
+      {"key": "recommendation_mean", "label": "Rec", "kind": "number"},
+      {"key": "dividend_yield", "label": "Div", "kind": "percent_points"}
+    ],
+    "rows": [
+      {"ticker": "MET", "rank": 1, "market_cap": 52000000000, "beta": 0.92, "short_float": 0.012, "pe_ratio": 12.4, "peg_ratio": 1.1, "analyst_upside": 0.28, "recommendation_mean": 1.8, "dividend_yield": 2.1},
+      {"ticker": "DELL", "rank": 2, "market_cap": 85000000000, "beta": 1.05, "short_float": 0.031, "pe_ratio": 18.2, "peg_ratio": 0.9, "analyst_upside": 0.22, "recommendation_mean": 1.9, "dividend_yield": 1.6},
+      {"ticker": "JPM", "rank": 3, "market_cap": 580000000000, "beta": 1.12, "short_float": 0.008, "pe_ratio": 11.8, "peg_ratio": 1.4, "analyst_upside": 0.19, "recommendation_mean": 2.0, "dividend_yield": 2.4},
+      {"ticker": "CSCO", "rank": 4, "market_cap": 210000000000, "beta": 0.88, "short_float": 0.015, "pe_ratio": 16.1, "peg_ratio": 1.6, "analyst_upside": 0.17, "recommendation_mean": 2.0, "dividend_yield": 3.1},
+      {"ticker": "IBM", "rank": 5, "market_cap": 190000000000, "beta": 0.71, "short_float": 0.022, "pe_ratio": 22.0, "peg_ratio": 1.8, "analyst_upside": 0.16, "recommendation_mean": 1.7, "dividend_yield": 2.8},
+      {"ticker": "T", "rank": 6, "market_cap": 140000000000, "beta": 0.65, "short_float": 0.018, "pe_ratio": 9.5, "peg_ratio": 1.2, "analyst_upside": 0.15, "recommendation_mean": 2.0, "dividend_yield": 4.2},
+      {"ticker": "VZ", "rank": 7, "market_cap": 170000000000, "beta": 0.42, "short_float": 0.011, "pe_ratio": 10.2, "peg_ratio": 1.5, "analyst_upside": 0.14, "recommendation_mean": 1.9, "dividend_yield": 6.1},
+      {"ticker": "PFE", "rank": 8, "market_cap": 160000000000, "beta": 0.68, "short_float": 0.019, "pe_ratio": 14.7, "peg_ratio": 1.3, "analyst_upside": 0.13, "recommendation_mean": 2.0, "dividend_yield": 3.8},
+      {"ticker": "KO", "rank": 9, "market_cap": 280000000000, "beta": 0.59, "short_float": 0.007, "pe_ratio": 24.1, "peg_ratio": 1.9, "analyst_upside": 0.12, "recommendation_mean": 1.8, "dividend_yield": 3.0},
+      {"ticker": "PEP", "rank": 10, "market_cap": 230000000000, "beta": 0.54, "short_float": 0.009, "pe_ratio": 25.3, "peg_ratio": 2.0, "analyst_upside": 0.11, "recommendation_mean": 1.9, "dividend_yield": 2.9},
+      {"ticker": "MRK", "rank": 11, "market_cap": 250000000000, "beta": 0.48, "short_float": 0.010, "pe_ratio": 13.9, "peg_ratio": 1.1, "analyst_upside": 0.105, "recommendation_mean": 1.6, "dividend_yield": 2.5},
+      {"ticker": "ABBV", "rank": 12, "market_cap": 320000000000, "beta": 0.61, "short_float": 0.014, "pe_ratio": 16.8, "peg_ratio": 1.4, "analyst_upside": 0.10, "recommendation_mean": 1.7, "dividend_yield": 3.4}
+    ],
+    "count": 12
+  },
   "totals": {
     "cost_basis": 1900.0,
     "market_value": 1950.0,

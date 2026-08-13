@@ -350,6 +350,43 @@ def set_password(username: str, password: str) -> Dict[str, Any]:
         conn.close()
 
 
+def change_own_password(
+    user_id: int,
+    current_password: str,
+    new_password: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Confirm the signed-in user's current password.
+    When new_password is omitted or empty, only verify.
+    When provided, replace the hash (session stays valid).
+    """
+    init_auth_tables()
+    profile = get_user_by_id(int(user_id))
+    if not profile or not profile.get('is_active'):
+        return {'ok': False, 'error': 'Account not found'}
+    user = get_user_by_username(profile.get('username') or '')
+    if not user or not verify_password(current_password or '', user.get('password_hash') or ''):
+        return {'ok': False, 'error': 'Current password is incorrect'}
+    if new_password is None or new_password == '':
+        return {'ok': True, 'verified': True}
+    if not str(new_password).strip():
+        return {'ok': False, 'error': 'Enter a new password'}
+    if str(new_password).strip().lower() == NEW_USER_LOGIN_TOKEN:
+        return {'ok': False, 'error': 'Choose a real password (not "newuser")'}
+    if verify_password(new_password, user.get('password_hash') or ''):
+        return {'ok': False, 'error': 'New password must be different'}
+    conn = get_connection()
+    try:
+        conn.execute(
+            'UPDATE users SET password_hash=? WHERE id=?',
+            (hash_password(new_password), int(user_id)),
+        )
+        conn.commit()
+        return {'ok': True, 'updated': True, 'username': user.get('username')}
+    finally:
+        conn.close()
+
+
 def bootstrap_default_users() -> None:
     """Create the owner account if no users exist (first multi-user install)."""
     init_auth_tables()

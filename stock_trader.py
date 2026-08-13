@@ -9993,8 +9993,163 @@ def _schedule_dashboard_schwab_refresh() -> None:
     ).start()
 
 
+_WATCHLIST_FIELD_META = {
+    'ticker': {'label': 'Ticker', 'kind': 'text'},
+    'market_cap': {'label': 'Mkt cap', 'kind': 'dollars'},
+    'beta': {'label': 'Beta', 'kind': 'number'},
+    'short_float': {'label': 'Short %', 'kind': 'fraction'},
+    'pe_ratio': {'label': 'P/E', 'kind': 'number'},
+    'peg_ratio': {'label': 'PEG', 'kind': 'number'},
+    'analyst_upside': {'label': 'Upside', 'kind': 'fraction'},
+    'recommendation_mean': {'label': 'Rec', 'kind': 'number'},
+    'dividend_yield': {'label': 'Div', 'kind': 'percent_points'},
+    'avg_volume': {'label': 'Avg vol', 'kind': 'shares'},
+    'current_price': {'label': 'Price', 'kind': 'price'},
+    'forward_pe': {'label': 'Fwd P/E', 'kind': 'number'},
+    'price_to_book': {'label': 'P/B', 'kind': 'number'},
+    'debt_to_equity': {'label': 'D/E', 'kind': 'number'},
+    'profit_margins': {'label': 'Margin', 'kind': 'fraction'},
+    'revenue_growth': {'label': 'Rev growth', 'kind': 'fraction'},
+}
+
+
+def _watchlist_column_meta(field: str) -> Dict[str, str]:
+    """Short table header + value kind for a filter field."""
+    known = _WATCHLIST_FIELD_META.get(field)
+    if known:
+        return dict(known)
+    kind = 'number'
+    try:
+        import filter_builder as fb
+        meta = getattr(fb, '_FIELD_BY_NAME', {}).get(field) or {}
+        kind = str(meta.get('value_kind') or 'number')
+        if field == 'current_price' or (kind == 'dollars' and field != 'market_cap'):
+            kind = 'price'
+    except Exception:
+        pass
+    label = field.replace('_', ' ').title()
+    return {'label': label, 'kind': kind}
+
+
+def _watchlist_display_fields(filter_name: Optional[str] = None) -> Tuple[List[str], str, str]:
+    """Active filter's criterion fields, title, and name for the trader watchlist table."""
+    name = str(filter_name or active_watchlist_filter() or 'safe').strip()
+    name_l = name.lower()
+    catalog = _watchlist_filter_catalog()
+    desc = catalog.get(name_l)
+    if desc:
+        fields = [c.get('field') for c in (desc.get('criteria') or []) if c.get('field')]
+        title = str(desc.get('title') or name)
+        return fields, title, name_l
+    try:
+        import filter_builder as fb
+        custom = fb.get_user_custom_filter(_uid())
+    except Exception:
+        custom = None
+    if custom:
+        custom_name = str(custom.get('name') or '').strip()
+        if custom_name.lower() == name_l:
+            fields = [c.get('field') for c in (custom.get('criteria') or []) if c.get('field')]
+            title = custom_name or name
+            return fields, title, custom_name
+    return ['analyst_upside'], name, name_l
+
+
+def get_dashboard_watchlist() -> Dict[str, Any]:
+    """
+    Trader watchlist table: membership from watchlist, columns from the active
+    filter's fields, rows ranked by analyst upside (highest first).
+    """
+    filter_fields, filter_title, filter_name = _watchlist_display_fields()
+    columns = [{'key': 'ticker', 'label': 'Ticker', 'kind': 'text'}]
+    seen = {'ticker'}
+    for field in filter_fields:
+        if not field or field in seen:
+            continue
+        seen.add(field)
+        meta = _watchlist_column_meta(field)
+        columns.append({
+            'key': field,
+            'label': meta['label'],
+            'kind': meta['kind'],
+        })
+
+    empty = {
+        'filter': filter_name,
+        'filter_title': filter_title,
+        'ranking': 'analyst_upside',
+        'columns': columns,
+        'rows': [],
+        'count': 0,
+    }
+    try:
+        ranked = get_watchlist_ranked()
+    except sqlite3.OperationalError:
+        return empty
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('PRAGMA table_info(watchlist)')
+        wl_cols = [row[1] for row in cursor.fetchall()]
+        if not wl_cols:
+            return empty
+        select_cols = []
+        for col in ['ticker', 'current_price', 'target_price'] + [
+            f for f in filter_fields if f != 'analyst_upside'
+        ]:
+            if col in wl_cols and col not in select_cols:
+                select_cols.append(col)
+        if 'ticker' not in select_cols:
+            return empty
+        cursor.execute('SELECT ' + ', '.join(select_cols) + ' FROM watchlist')
+        by_ticker = {}  # type: Dict[str, Dict[str, Any]]
+        for row in cursor.fetchall():
+            d = dict(zip(select_cols, row))
+            ticker = d.get('ticker')
+            if not ticker:
+                continue
+            price = d.get('current_price')
+            target = d.get('target_price')
+            upside = None  # type: Optional[float]
+            try:
+                price_f = float(price) if price is not None else None
+                target_f = float(target) if target is not None else None
+                if price_f and target_f and price_f > 0:
+                    upside = (target_f - price_f) / price_f
+            except (TypeError, ValueError):
+                upside = None
+            values = {'ticker': ticker, 'analyst_upside': upside}
+            for field in filter_fields:
+                if field == 'analyst_upside':
+                    continue
+                values[field] = d.get(field)
+            by_ticker[str(ticker)] = values
+    except sqlite3.OperationalError:
+        return empty
+    finally:
+        conn.close()
+
+    rows = []  # type: List[Dict[str, Any]]
+    for i, ticker in enumerate(ranked):
+        d = by_ticker.get(str(ticker))
+        if not d:
+            continue
+        item = dict(d)
+        item['rank'] = i + 1
+        rows.append(item)
+    return {
+        'filter': filter_name,
+        'filter_title': filter_title,
+        'ranking': 'analyst_upside',
+        'columns': columns,
+        'rows': rows,
+        'count': len(rows),
+    }
+
+
 def get_dashboard_portfolio() -> Dict[str, Any]:
-    """Trader page: positions, pending orders, totals (read-only)."""
+    """Trader page: positions, pending/open orders, watchlist, totals (read-only)."""
     init_database()
     # Do not await Schwab/DB writers here — that could stall Loading for ~60s
     # when the trader loop holds a write lock. Kick a background refresh instead.
@@ -10109,6 +10264,25 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
             'hold_hours_left': status_info['hold_hours_left'],
         })
 
+    # Resting STOP_LIMIT sells (same working orders Schwab shows as open).
+    limit_sells = []  # type: List[Dict[str, Any]]
+    for p in positions:
+        oid = p.get('stop_order_id')
+        if not oid:
+            continue
+        qty = p.get('stop_order_qty')
+        if qty is None:
+            qty = p.get('shares_owned')
+        limit_sells.append({
+            'ticker': p.get('ticker'),
+            'quantity': qty,
+            'order_id': oid,
+            'order_type': 'STOP_LIMIT',
+            'stop_price': p.get('stop_order_price'),
+            'limit_price': p.get('stop_limit_price'),
+            'source': 'limit_sell',
+        })
+
     pending = []  # type: List[Dict[str, Any]]
     try:
         cursor.execute(
@@ -10137,6 +10311,12 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
             open_orders = get_open_orders() or []
         except Exception:
             open_orders = []
+    limit_ids = {str(o.get('order_id')) for o in limit_sells if o.get('order_id')}
+    if limit_ids and open_orders:
+        open_orders = [
+            o for o in open_orders
+            if str(o.get('order_id') or '') not in limit_ids
+        ]
 
     sod = total_mv - total_day
     day_pct_total = (total_day / sod * 100.0) if sod and abs(sod) > 1e-9 else None
@@ -10211,6 +10391,8 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
         'next_tasks': get_next_scheduled_tasks(),
         'pending_orders': pending,
         'open_orders': open_orders,
+        'limit_sells': limit_sells,
+        'watchlist': get_dashboard_watchlist(),
         'totals': {
             'cost_basis': total_cost,
             'market_value': total_mv,

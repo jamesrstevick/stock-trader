@@ -119,7 +119,7 @@
 
       <section id="page-trader" class="page active">
         <h1>Trader</h1>
-        <p class="lead">Positions, open orders, and mark-to-market P/L from the local database (Schwab-synced when available).</p>
+        <p class="lead">Positions, open orders, watchlist, and mark-to-market P/L from the local database (Schwab-synced when available).</p>
         <div class="meta-row" id="trader-pills"></div>
         <div class="cards" id="trader-cards"></div>
 
@@ -197,6 +197,24 @@
               </thead>
               <tbody></tbody>
             </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Watchlist</h2>
+          <div class="scroll-x">
+            <table class="data sortable" id="watchlist-table">
+              <thead>
+                <tr></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="table-expand" id="watchlist-expand" hidden>
+            <button type="button" class="table-expand-btn" id="watchlist-expand-btn" aria-expanded="false" aria-controls="watchlist-table">
+              <span class="table-expand-arrow" aria-hidden="true">▼</span>
+              <span class="table-expand-label" id="watchlist-expand-label">Show all</span>
+            </button>
           </div>
         </div>
       </section>
@@ -396,6 +414,25 @@
             <button type="button" class="btn-ghost" id="host-restart-btn">Restart processes</button>
           </div>
           <p class="action-feedback" id="host-feedback" hidden></p>
+        </article>
+
+        <article class="action-card" id="reset-password-card">
+          <div class="action-card-head">
+            <h2>Reset password</h2>
+          </div>
+          <p class="action-card-desc" id="reset-password-desc">
+            Enter your current password. The field then switches so you can set a new one.
+          </p>
+          <label class="action-field">
+            <span id="reset-password-label">Current password</span>
+            <input type="password" id="reset-password-input" autocomplete="current-password"
+              spellcheck="false" />
+          </label>
+          <div class="action-row">
+            <button type="button" class="btn-primary" id="reset-password-save" disabled>Save</button>
+            <button type="button" class="btn-ghost" id="reset-password-cancel" hidden>Cancel</button>
+          </div>
+          <p class="action-feedback" id="reset-password-feedback" hidden></p>
         </article>
       </section>
     </main>
