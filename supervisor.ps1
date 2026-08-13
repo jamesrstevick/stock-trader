@@ -16,6 +16,20 @@ $ErrorActionPreference = 'Continue'
 $Root = $PSScriptRoot
 Set-Location $Root
 
+# One supervisor per Windows session. A second launch (Startup .cmd while
+# one is already open) exits instead of fighting over loop/dashboard/tunnel.
+$createdMutex = $false
+$script:SupervisorMutex = New-Object System.Threading.Mutex(
+    $true,
+    'Local\JameTraderSupervisor',
+    [ref]$createdMutex
+)
+if (-not $createdMutex) {
+    Write-Host 'Supervisor is already running in another window. Keep that one; close this.'
+    Start-Sleep -Seconds 3
+    exit 0
+}
+
 $DataDir = Join-Path $Root 'data'
 $LogDir = Join-Path $Root 'logs'
 $StatusPath = Join-Path $DataDir 'host_status.json'
@@ -427,4 +441,10 @@ try {
     if (Test-Path $StatusPath) {
         Remove-Item $StatusPath -Force -ErrorAction SilentlyContinue
     }
+    try {
+        if ($script:SupervisorMutex) {
+            $script:SupervisorMutex.ReleaseMutex() | Out-Null
+            $script:SupervisorMutex.Dispose()
+        }
+    } catch {}
 }
