@@ -358,14 +358,21 @@
     if (!iso) return '—';
     var t = Date.parse(iso);
     if (isNaN(t)) return String(iso);
-    var sec = Math.max(0, Math.round((Date.now() - t) / 1000));
-    if (sec < 60) return 'just now';
-    var min = Math.round(sec / 60);
-    if (min < 60) return min === 1 ? '1 minute ago' : min + ' minutes ago';
-    var hr = Math.round(min / 60);
-    if (hr < 48) return hr === 1 ? '1 hour ago' : hr + ' hours ago';
-    var day = Math.round(hr / 24);
-    return day === 1 ? '1 day ago' : day + ' days ago';
+    var sec = Math.max(0, Math.floor((Date.now() - t) / 1000));
+    var min = Math.floor(sec / 60);
+    if (min < 60) return min + ' min ago';
+    var hr = Math.floor(min / 60);
+    if (hr < 24) return hr + ' hrs ago';
+    var day = Math.floor(hr / 24);
+    return day + ' days ago';
+  }
+
+  /** Same units as timeAgo; empty string when there is no timestamp. */
+  function compactAgo(iso) {
+    if (!iso) return '';
+    var t = Date.parse(iso);
+    if (isNaN(t)) return '';
+    return timeAgo(iso);
   }
 
   function plClass(v) {
@@ -672,6 +679,18 @@
   function moneyHint(boundsKey, bounds, exclusiveMax) {
     if (!bounds || !bounds[boundsKey]) return '';
     var b = bounds[boundsKey];
+    if (boundsKey === 'minimum_cash') {
+      var cashMax = b.max_inclusive;
+      if (cashMax == null && bounds.cash != null) cashMax = bounds.cash;
+      return 'Between $0 and $' + Math.floor(Number(cashMax) || 0).toLocaleString();
+    }
+    if (boundsKey === 'minimum_liquidation_value') {
+      var liqMax = b.max_inclusive;
+      if (liqMax == null && bounds.liquidation_value != null) {
+        liqMax = bounds.liquidation_value;
+      }
+      return 'Between $0 and $' + Math.floor(Number(liqMax) || 0).toLocaleString();
+    }
     if (boundsKey === 'order_amount_dollars') {
       return 'More than $0, at most $' + Math.floor(b.max_inclusive || 0).toLocaleString();
     }
@@ -701,7 +720,7 @@
     var desc = document.getElementById('setup-card-desc');
     if (desc) {
       desc.textContent = done
-        ? 'Your cash floor, minimum account value, and buy size. Locked until you press the pencil to edit.'
+        ? 'Your cash floor, minimum account value, and buy size.'
         : 'After Schwab is linked, set your cash floor, minimum account value, and buy size. Bounds come from your live account balances.';
     }
 
@@ -732,11 +751,14 @@
     if (acctLine) {
       if (acct) {
         acctLine.hidden = false;
-        acctLine.textContent =
-          'Live from Schwab — cash $' +
+        var line =
+          'Schwab Account — cash $' +
           Math.round(acct.cash || 0).toLocaleString() +
           ' · account value $' +
           Math.round(acct.liquidation_value || 0).toLocaleString();
+        var ago = compactAgo(acct.as_of);
+        if (ago) line += ' (' + ago + ')';
+        acctLine.textContent = line;
       } else {
         acctLine.hidden = !schwabOk;
         acctLine.textContent = schwabOk
@@ -795,12 +817,22 @@
       }
     }
     if (cash && bounds.minimum_cash) {
-      cash.min = bounds.minimum_cash.min_exclusive;
-      cash.max = bounds.minimum_cash.max_exclusive;
+      var cashLo = bounds.minimum_cash.min_inclusive;
+      var cashHi = bounds.minimum_cash.max_inclusive;
+      if (cashLo == null) cashLo = 0;
+      if (cashHi == null && bounds.cash != null) cashHi = bounds.cash;
+      cash.min = cashLo;
+      if (cashHi != null) cash.max = cashHi;
     }
     if (liq && bounds.minimum_liquidation_value) {
-      liq.min = bounds.minimum_liquidation_value.min_exclusive;
-      liq.max = bounds.minimum_liquidation_value.max_exclusive;
+      var liqLo = bounds.minimum_liquidation_value.min_inclusive;
+      var liqHi = bounds.minimum_liquidation_value.max_inclusive;
+      if (liqLo == null) liqLo = 0;
+      if (liqHi == null && bounds.liquidation_value != null) {
+        liqHi = bounds.liquidation_value;
+      }
+      liq.min = liqLo;
+      if (liqHi != null) liq.max = liqHi;
     }
     if (ord && bounds.order_amount_dollars) {
       ord.min = 1;
@@ -1724,8 +1756,8 @@
     { title: 'Dry-run safety net', set_to: 'ON — no Schwab orders', why: 'Paper-trade by default; flip TRADE_DRY_RUN only when ready for real fills' },
     { title: 'Buys and sells only in regular hours', set_to: '9:30–16:00 America/New_York', why: 'Watchlist/buys and sell-check jobs skip when the US equity session is closed' },
     { title: 'No buy-and-sell the same day', set_to: 'No market sell or broker STOP_LIMIT until the next ET calendar day', why: 'FINRA day trade = same trading day (not 24h). Buy Mon 1pm / sell Tue 8am is fine; stops are deferred so a same-day fill cannot create a round trip' },
-    { title: 'Cash floor', set_to: 'config.MINIMUM_CASH (live API fills amount)', why: 'No buy may leave cash (minus pending buys) below this floor' },
-    { title: 'Account size floor', set_to: 'Liquidation value ≥ $25,000', why: 'Trading is blocked entirely while account value is under this threshold' },
+    { title: 'Cash floor', set_to: 'config.MINIMUM_CASH (live API fills amount)', why: 'No buy may leave cash (minus pending buys) below this floor. Sells still run.' },
+    { title: 'Account size floor', set_to: 'Liquidation value ≥ $25,000', why: 'No buy while account value is under this threshold. Sells still run.' },
     { title: 'Buy only from the active filter / watchlist', set_to: "Filter 'safe'", why: 'New buys must be on the current watchlist — no random tickers' },
     { title: 'Fixed buy size', set_to: '~$1,000 per new name', why: 'Keeps position sizing consistent and cash-floor math simple' },
     { title: 'Re-buy debounce after a sell', set_to: '≤ last sell price − 5%', why: 'Avoid immediately chasing the same name after a sell' },
@@ -1809,7 +1841,7 @@
           '<div>' + (j.due_now ? '<span class="pill warn">due</span>' : '<span class="pill">idle</span>') + '</div>' +
           '<div class="job-note">' +
             escapeHtml(j.progress_note || '—') +
-            (j.last_completed ? ' · last completed ' + escapeHtml(j.last_completed) : '') +
+            (j.last_completed ? ' · last completed ' + escapeHtml(timeAgo(j.last_completed)) : '') +
             (j.next_due ? ' · next ' + escapeHtml(j.next_due) : '') +
           '</div>';
         jobs.appendChild(li);

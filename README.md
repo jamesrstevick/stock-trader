@@ -17,7 +17,7 @@ A separate FastAPI dashboard (`python web_app.py`) uses **in-app login** (userna
 1. **Dry-run by default** — `TRADE_DRY_RUN = True` logs what would happen; no Schwab orders until you flip it.
 2. **Regular hours only** for buys/sells — 9:30–16:00 America/New_York.
 3. **Hold ≥ 16 hours** after purchase (avoid same-day round-trips).
-4. **Cash floor** and **account size floor** block trades that would breach them.
+4. **Cash floor** and **account size floor** block buys that would breach them; sells still run.
 5. **Buys only from the active watchlist filter**, sized ~$1,000 per new name.
 6. **Re-buy debounce** after a sell (e.g. ≤ last sell − 5%).
 7. **Trailing stop** arms at +10% peak; buffers tighten once off-watchlist; hard stops as catastrophe floor.

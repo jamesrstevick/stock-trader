@@ -514,6 +514,7 @@ def complete_schwab_oauth(
                 account_snap = {
                     'cash': float(acct.get('cash') or 0.0),
                     'liquidation_value': float(acct.get('liquidation_value') or 0.0),
+                    'as_of': datetime.now().isoformat(timespec='seconds'),
                 }
         except Exception:
             account_snap = None
@@ -5119,17 +5120,17 @@ def is_trading_allowed(
     extra_reserved_dollars: float = 0.0,
 ) -> Tuple[bool, str]:
     """
-    Safety check to determine if trading is allowed based on account information.
+    Buy-safety check. Cash and account-value floors block buys only; sells skip this.
     Both liquidation value and cash floor must pass. Cash check: we must not drop below
-    minimum_cash() after the trade, so effective_cash - trade_amount_dollars must be >= floor.
-    
+    minimum_cash() after the buy, so effective_cash - trade_amount_dollars must be >= floor.
+
     Args:
         account_data: Optional account data dict. If None, will fetch it automatically.
-        trade_amount_dollars: If placing a buy, pass the order amount so we block if the trade would
-            take effective cash below the cash floor. Use 0 for "can I trade at all?".
+        trade_amount_dollars: Order amount so we block if the buy would take effective cash
+            below the cash floor. Use 0 for "can I buy at all?".
         extra_reserved_dollars: Additional dollars already committed this pass (proposed buys not
             yet in pending_orders). Counted like pending against the cash floor.
-    
+
     Returns:
         Tuple of (is_allowed: bool, reason: str)
     """
@@ -5148,7 +5149,7 @@ def is_trading_allowed(
         liquidation_value = 0.0
     min_liquidation = minimum_liquidation_value()
     if liquidation_value < min_liquidation:
-        return False, f"Liquidation value (${liquidation_value:,.2f}) is below minimum (${min_liquidation:,.2f}); trading blocked."
+        return False, f"Liquidation value (${liquidation_value:,.2f}) is below minimum (${min_liquidation:,.2f}); buy blocked."
     
     # Effective cash = Schwab cash minus pending (unfilled) buy orders (+ this-pass reserves).
     # Must not drop below cash floor after this trade.
@@ -5162,8 +5163,8 @@ def is_trading_allowed(
     cash_after_trade = effective_cash - trade_amount_dollars
     if cash_after_trade < min_cash:
         if trade_amount_dollars > 0:
-            return False, f"This trade (${trade_amount_dollars:,.2f}) would leave effective cash at ${cash_after_trade:,.2f}, below minimum (${min_cash:,.2f}); trading blocked."
-        return False, f"Effective cash (${effective_cash:,.2f} = ${cash:,.2f} - ${pending_total:,.2f} pending) is below minimum (${min_cash:,.2f}); trading blocked."
+            return False, f"This buy (${trade_amount_dollars:,.2f}) would leave effective cash at ${cash_after_trade:,.2f}, below minimum (${min_cash:,.2f}); buy blocked."
+        return False, f"Effective cash (${effective_cash:,.2f} = ${cash:,.2f} - ${pending_total:,.2f} pending) is below minimum (${min_cash:,.2f}); buy blocked."
     
     # All safety checks passed
     if pending_total > 0:
@@ -6622,13 +6623,6 @@ def execute_sell(
         print(f"   Sell order for {quantity} shares of {ticker} cancelled.")
         return
 
-    # Safety check: Verify trading is allowed (for consistency and future safety rules)
-    is_allowed, reason = is_trading_allowed()
-    if not is_allowed:
-        print(f"⚠️  Trading blocked: {reason}")
-        print(f"   Sell order for {quantity} shares of {ticker} cancelled.")
-        return
-    
     if schwab_order_submit_allowed():
         if not SCHWAB_AVAILABLE:
             print(f"Error: Cannot execute real trade for {ticker} - Schwab API not available")
@@ -9580,13 +9574,13 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
             'id': 'cash_floor',
             'title': 'Cash floor',
             'set_to': 'Keep ≥ $%s effective cash' % '{:,.0f}'.format(min_cash),
-            'why': 'No buy may leave cash (minus pending buys) below this floor',
+            'why': 'No buy may leave cash (minus pending buys) below this floor. Sells still run.',
         },
         {
             'id': 'liquidation_floor',
             'title': 'Account size floor',
             'set_to': 'Liquidation value ≥ $%s' % '{:,.0f}'.format(min_liq),
-            'why': 'Trading is blocked entirely while account value is under this threshold',
+            'why': 'No buy while account value is under this threshold. Sells still run.',
         },
         {
             'id': 'watchlist_only',
@@ -10313,19 +10307,41 @@ def _schwab_linked_ok(auth: Optional[Dict[str, Any]] = None) -> bool:
     return auth.get('state') in ('connected', 'expiring')
 
 
-def fetch_setup_account_snapshot() -> Optional[Dict[str, float]]:
-    """Live cash + liquidation for setup bounds (None if Schwab unusable)."""
+def fetch_setup_account_snapshot(live: bool = False) -> Optional[Dict[str, Any]]:
+    """
+    Cash + liquidation for setup bounds, plus as_of for the age line.
+    Default: last persisted Schwab snapshot (so the UI can show min/hrs/days ago).
+    live=True: hit Schwab now (used when saving floors).
+    """
+    def _from_snap(snap: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not snap:
+            return None
+        cash = float(snap.get('cash') or 0.0)
+        liq = float(snap.get('liquidation_value') or 0.0)
+        if cash <= 0 and liq <= 0:
+            return None
+        return {
+            'cash': cash,
+            'liquidation_value': liq,
+            'as_of': snap.get('ts'),
+        }
+
     try:
         if not _schwab_linked_ok():
             return None
+        if not live:
+            from_db = _from_snap(get_latest_account_snapshot(exclude_fabricated=True))
+            if from_db:
+                return from_db
         maybe_reinit_schwab_client()
         acct = get_account_info() or {}
-        if not account_info_usable(acct):
-            return None
-        return {
-            'cash': float(acct.get('cash') or 0.0),
-            'liquidation_value': float(acct.get('liquidation_value') or 0.0),
-        }
+        if account_info_usable(acct):
+            return {
+                'cash': float(acct.get('cash') or 0.0),
+                'liquidation_value': float(acct.get('liquidation_value') or 0.0),
+                'as_of': datetime.now().isoformat(timespec='seconds'),
+            }
+        return _from_snap(get_latest_account_snapshot(exclude_fabricated=True))
     except Exception:
         return None
 
@@ -10336,34 +10352,34 @@ def compute_setup_bounds(
 ) -> Dict[str, Any]:
     """
     Bound floors/buy size from live Schwab balances.
-    Min cash: 500 < x < cash - 1000
-    Min account value: min_cash < x < liquidation - 1000
-    Buy size: 0 < x <= cash - min_cash (or cash - 1000 while min_cash unset)
+    Min cash: 0 <= x <= cash (same rule on first setup and later edits)
+    Min account value: 0 <= x <= liquidation (same rule on first setup and later edits)
+    Buy size: 0 < x <= cash - min_cash (or cash while min_cash unset)
     """
     cash = float((account or {}).get('cash') or 0.0)
     liq = float((account or {}).get('liquidation_value') or 0.0)
-    min_cash_lo = 500.0
-    min_cash_hi = cash - 1000.0
     mc = minimum_cash_value
     if mc is None:
-        spend_cap = max(0.0, cash - 1000.0)
+        spend_cap = max(0.0, cash)
     else:
         spend_cap = max(0.0, cash - float(mc))
+    # Floor = all cash → no spendable now; still allow a stored buy size for later.
+    order_max = spend_cap if spend_cap > 0.0 else max(cash, 1.0)
     return {
         'minimum_cash': {
-            'min_exclusive': min_cash_lo,
-            'max_exclusive': min_cash_hi,
-            'valid_range': min_cash_hi > min_cash_lo,
+            'min_inclusive': 0.0,
+            'max_inclusive': cash,
+            'valid_range': True,
         },
         'minimum_liquidation_value': {
-            'min_exclusive': float(mc) if mc is not None else min_cash_lo,
-            'max_exclusive': liq - 1000.0,
-            'valid_range': (liq - 1000.0) > (float(mc) if mc is not None else min_cash_lo),
+            'min_inclusive': 0.0,
+            'max_inclusive': liq,
+            'valid_range': True,
         },
         'order_amount_dollars': {
             'min_exclusive': 0.0,
-            'max_inclusive': spend_cap,
-            'valid_range': spend_cap > 0.0,
+            'max_inclusive': order_max,
+            'valid_range': order_max > 0.0,
         },
         'cash': cash,
         'liquidation_value': liq,
@@ -10383,29 +10399,14 @@ def validate_setup_values(
     bc = bounds['minimum_cash']
     bl = bounds['minimum_liquidation_value']
     bo = bounds['order_amount_dollars']
-    if not bc['valid_range']:
-        return (
-            'Account cash (%.0f) is too low to set a cash floor '
-            '(need cash > 1500)' % bounds['cash']
-        )
-    if not (bc['min_exclusive'] < minimum_cash_val < bc['max_exclusive']):
-        return (
-            'Minimum cash must be more than $%.0f and less than $%.0f '
-            '(cash − 1000)' % (bc['min_exclusive'], bc['max_exclusive'])
-        )
-    if not bl['valid_range']:
-        return 'Account value is too low to set a minimum account value'
-    if not (bl['min_exclusive'] < minimum_liq_val < bl['max_exclusive']):
-        return (
-            'Minimum account value must be more than your cash minimum ($%.0f) '
-            'and less than $%.0f (account − 1000)'
-            % (bl['min_exclusive'], bl['max_exclusive'])
-        )
+    cash_hi = float(bc.get('max_inclusive', bounds['cash']))
+    if not (0.0 <= minimum_cash_val <= cash_hi):
+        return 'Minimum cash must be between $0 and $%,.0f' % cash_hi
+    liq_hi = float(bl.get('max_inclusive', bounds['liquidation_value']))
+    if not (0.0 <= minimum_liq_val <= liq_hi):
+        return 'Minimum account value must be between $0 and $%,.0f' % liq_hi
     if not (bo['min_exclusive'] < order_amount_val <= bo['max_inclusive']):
-        return (
-            'Buy size must be more than $0 and at most $%.0f '
-            '(cash − minimum cash)' % bo['max_inclusive']
-        )
+        return 'Buy size must be more than $0 and at most $%,.0f' % bo['max_inclusive']
     return None
 
 
@@ -10419,20 +10420,17 @@ def suggest_setup_values(account: Optional[Dict[str, Any]]) -> Dict[str, float]:
         }
     cash = float(account.get('cash') or 0.0)
     liq = float(account.get('liquidation_value') or 0.0)
-    # Aim ~40% of (cash-1000) for floor, clamped into open interval.
-    hi_cash = cash - 1000.0
-    lo_cash = 500.0
-    if hi_cash > lo_cash:
-        mid = (lo_cash + hi_cash) / 2.0
-        min_cash = max(lo_cash + 1.0, min(hi_cash - 1.0, round(mid / 100.0) * 100.0))
+    # Mid-range floor, clamped to [0, cash].
+    if cash <= 0.0:
+        min_cash = 0.0
     else:
-        min_cash = lo_cash + 1.0
-    hi_liq = liq - 1000.0
-    if hi_liq > min_cash:
-        mid_liq = (min_cash + hi_liq) / 2.0
-        min_liq = max(min_cash + 1.0, min(hi_liq - 1.0, round(mid_liq / 100.0) * 100.0))
+        mid = cash / 2.0
+        min_cash = max(0.0, min(cash, round(mid / 100.0) * 100.0))
+    if liq <= 0.0:
+        min_liq = 0.0
     else:
-        min_liq = min_cash + 1.0
+        mid_liq = liq / 2.0
+        min_liq = max(0.0, min(liq, round(mid_liq / 100.0) * 100.0))
     buy_cap = max(1.0, cash - min_cash)
     order_amt = min(1000.0, buy_cap)
     if order_amt <= 0:
@@ -10576,7 +10574,7 @@ def save_account_setup(payload: Dict[str, Any]) -> Dict[str, Any]:
             'error': 'Link Schwab before setting floors and buy size',
             'setup': get_account_setup_status(),
         }
-    account = fetch_setup_account_snapshot()
+    account = fetch_setup_account_snapshot(live=True)
     kwargs = {}  # type: Dict[str, Any]
     try:
         if 'minimum_cash' in payload:

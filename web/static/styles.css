@@ -683,12 +683,89 @@ table.data .pos-status-muted { color: var(--muted); }
   gap: 0.35rem;
   margin-bottom: 0.3rem;
 }
+.action-field-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-width: 0;
+}
 .action-field-name {
   font-size: 0.78rem;
   font-weight: 600;
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+.info-tip {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+  cursor: help;
+  outline: none;
+}
+.info-tip-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 0.95rem;
+  height: 0.95rem;
+  border-radius: 50%;
+  background: #c5c0b4;
+  color: #fff;
+  font-size: 0.68rem;
+  font-weight: 700;
+  font-style: italic;
+  line-height: 1;
+  font-family: Georgia, 'Times New Roman', serif;
+}
+.info-tip:hover .info-tip-mark,
+.info-tip:focus .info-tip-mark {
+  background: var(--muted);
+}
+.info-tip-text {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 7px);
+  z-index: 30;
+  width: 15.5rem;
+  max-width: min(15.5rem, 70vw);
+  padding: 0.5rem 0.6rem;
+  border-radius: 8px;
+  background: #2a332f;
+  color: #f4f1ea;
+  font-size: 0.78rem;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  line-height: 1.4;
+  white-space: normal;
+  box-shadow: 0 8px 20px rgba(28, 36, 33, 0.18);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.12s ease, visibility 0.12s ease;
+}
+.info-tip-text::before {
+  content: '';
+  position: absolute;
+  left: 0.35rem;
+  top: -5px;
+  border: 5px solid transparent;
+  border-top-width: 0;
+  border-bottom-color: #2a332f;
+}
+.info-tip:hover .info-tip-text,
+.info-tip:focus .info-tip-text {
+  opacity: 1;
+  visibility: visible;
+}
+.setup-fields .action-field:last-child .info-tip-text {
+  left: auto;
+  right: 0;
+}
+.setup-fields .action-field:last-child .info-tip-text::before {
+  left: auto;
+  right: 0.35rem;
 }
 .action-field > span:not(.action-field-label):not(.field-hint) {
   display: block;
@@ -1164,9 +1241,13 @@ table.data .pos-status-muted { color: var(--muted); }
 .setup-checklist li.bad::before { content: '○ '; color: #a32020; }
 .setup-fields {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.75rem;
   margin-bottom: 1rem;
+}
+.setup-fields .action-field-name,
+.setup-fields .field-hint {
+  white-space: nowrap;
 }
 .filter-builder {
   margin: 0.75rem 0 1rem;

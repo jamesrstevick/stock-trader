@@ -245,13 +245,13 @@
         "id": "cash_floor",
         "title": "Cash floor",
         "set_to": "config.MINIMUM_CASH (live API fills amount)",
-        "why": "No buy may leave cash (minus pending buys) below this floor"
+        "why": "No buy may leave cash (minus pending buys) below this floor. Sells still run."
       },
       {
         "id": "liquidation_floor",
         "title": "Account size floor",
         "set_to": "Liquidation value ≥ $25,000",
-        "why": "Trading is blocked entirely while account value is under this threshold"
+        "why": "No buy while account value is under this threshold. Sells still run."
       },
       {
         "id": "watchlist_only",
