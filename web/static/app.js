@@ -12,6 +12,17 @@
     return !!window.TRADER_USE_MOCK;
   }
 
+  function payloadUserMismatch(data, response) {
+    if (!currentUser || currentUser.id == null) return false;
+    var id = null;
+    if (data && data.user && data.user.id != null) id = data.user.id;
+    if (id == null && response && response.headers) {
+      id = response.headers.get('X-Trader-User-Id');
+    }
+    if (id == null || id === '') return false;
+    return String(id) !== String(currentUser.id);
+  }
+
   async function fetchJson(path) {
     if (useMock()) {
       var mockPath = '/static/mock' + path.replace('/api', '') + '.json';
@@ -20,7 +31,7 @@
       if (path.indexOf('/api/performance') === 0) mockPath = '/static/mock/performance.json';
       if (path.indexOf('/api/schwab/auth') === 0) mockPath = '/static/mock/schwab_auth.json';
       if (path.indexOf('/api/host') === 0) mockPath = '/static/mock/host.json';
-      var mr = await fetch(mockPath);
+      var mr = await fetch(mockPath, { cache: 'no-store' });
       if (!mr.ok) throw new Error('Mock missing: ' + mockPath);
       var mockData = await mr.json();
       if (path.indexOf('/api/performance') === 0) {
@@ -28,13 +39,25 @@
       }
       return mockData;
     }
-    var r = await fetch(apiBase() + path, { credentials: 'include' });
+    var headers = window.traderAuthHeaders ? window.traderAuthHeaders() : {};
+    var r = await fetch(apiBase() + path, {
+      credentials: 'include',
+      cache: 'no-store',
+      headers: headers,
+    });
     if (r.status === 401) {
+      if (window.traderClearSessionToken) window.traderClearSessionToken();
       window.location.href = '/login';
       throw new Error('login_required');
     }
     if (!r.ok) throw new Error(path + ' → ' + r.status);
-    return r.json();
+    var data = await r.json();
+    if (payloadUserMismatch(data, r)) {
+      var err = new Error('stale_user');
+      err.staleUser = true;
+      throw err;
+    }
+    return data;
   }
 
   async function postJson(path, body) {
@@ -52,13 +75,17 @@
         schwab: await fetchJson('/api/schwab/auth'),
       };
     }
+    var headers = window.traderAuthHeaders ? window.traderAuthHeaders() : {};
+    headers['Content-Type'] = 'application/json';
     var r = await fetch(apiBase() + path, {
       method: 'POST',
       credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
+      cache: 'no-store',
+      headers: headers,
       body: JSON.stringify(body || {}),
     });
     if (r.status === 401) {
+      if (window.traderClearSessionToken) window.traderClearSessionToken();
       window.location.href = '/login';
       throw new Error('login_required');
     }
@@ -290,6 +317,7 @@
       var data = await fetchJson('/api/performance?range=' + encodeURIComponent(perfRange));
       renderPerfChart(data);
     } catch (e) {
+      if (e && e.staleUser) return;
       renderPerfChart({ ok: false, error: 'Could not load performance: ' + e.message, points: [] });
     }
     if (ranges) {
@@ -366,7 +394,7 @@
 
   function schwabSnoozeUntil() {
     try {
-      var v = parseInt(localStorage.getItem(SCHWAB_SNOOZE_KEY) || '0', 10);
+      var v = parseInt(localStorage.getItem(userScopedKey(SCHWAB_SNOOZE_KEY)) || '0', 10);
       return isNaN(v) ? 0 : v;
     } catch (e) {
       return 0;
@@ -376,12 +404,12 @@
   function setSchwabSnooze(hours) {
     var ms = (hours != null ? Number(hours) : 4) * 3600 * 1000;
     try {
-      localStorage.setItem(SCHWAB_SNOOZE_KEY, String(Date.now() + ms));
+      localStorage.setItem(userScopedKey(SCHWAB_SNOOZE_KEY), String(Date.now() + ms));
     } catch (e) {}
   }
 
   function clearSchwabSnooze() {
-    try { localStorage.removeItem(SCHWAB_SNOOZE_KEY); } catch (e) {}
+    try { localStorage.removeItem(userScopedKey(SCHWAB_SNOOZE_KEY)); } catch (e) {}
   }
 
   function schwabBannerSnoozed() {
@@ -420,9 +448,14 @@
   var filterBuilderState = { criteria: [], catalog: [], debounce: null };
   var ONBOARD_SNOOZE_KEY = 'onboardingGoLiveSnoozeUntil';
 
+  function userScopedKey(base) {
+    var id = currentUser && currentUser.id;
+    return base + (id != null ? ('.u' + id) : '');
+  }
+
   function onboardingGoLiveSnoozed() {
     try {
-      var v = parseInt(localStorage.getItem(ONBOARD_SNOOZE_KEY) || '0', 10);
+      var v = parseInt(localStorage.getItem(userScopedKey(ONBOARD_SNOOZE_KEY)) || '0', 10);
       return !isNaN(v) && Date.now() < v;
     } catch (e) {
       return false;
@@ -432,7 +465,7 @@
   function setOnboardingGoLiveSnooze(hours) {
     var ms = (hours != null ? Number(hours) : 4) * 3600 * 1000;
     try {
-      localStorage.setItem(ONBOARD_SNOOZE_KEY, String(Date.now() + ms));
+      localStorage.setItem(userScopedKey(ONBOARD_SNOOZE_KEY), String(Date.now() + ms));
     } catch (e) {}
   }
 
@@ -1906,10 +1939,27 @@
       var cashVal = snap.cash;
       var mvVal = t.market_value;
       var accountVal = snap.liquidation_value;
+      var posCount = (data.positions || []).length;
+      // Prefer the Schwab snapshot. Only sum when both parts are known
+      // (missing snapshot → "—" rather than $0 from empty positions).
       if (accountVal == null && mvVal != null && cashVal != null) {
         accountVal = Number(mvVal) + Number(cashVal);
-      } else if (accountVal == null) {
-        accountVal = mvVal;
+      } else if (
+        accountVal != null &&
+        cashVal != null &&
+        posCount === 0
+      ) {
+        // Empty book + equity >> cash is the leftover-other-account flash.
+        var cashN = Number(cashVal);
+        var accN = Number(accountVal);
+        var mvN = mvVal == null ? 0 : Number(mvVal);
+        if (
+          isFinite(cashN) &&
+          isFinite(accN) &&
+          Math.abs(accN - (cashN + mvN)) > Math.max(50, Math.abs(cashN) * 0.05)
+        ) {
+          accountVal = cashN + mvN;
+        }
       }
       var accountHint =
         'Market Value: ' + money(mvVal) + '\n' +
@@ -2014,6 +2064,7 @@
       }
     } catch (e) {
       stopLoadingDots();
+      if (e && e.staleUser) return;
       pills.innerHTML = '';
       pills.appendChild(pill('API error: ' + e.message, 'bad'));
       if (algoPills) algoPills.innerHTML = '';
@@ -2411,14 +2462,50 @@
     });
   });
 
+  function resetTraderView() {
+    stopLoadingDots();
+    traderLoadInFlight = false;
+    lastContentRev = null;
+    logEventsCache = [];
+    positionsRows = [];
+    var pills = document.getElementById('trader-pills');
+    var cards = document.getElementById('trader-cards');
+    var algoPills = document.getElementById('algo-pills');
+    var algoCards = document.getElementById('algo-cards');
+    var tbody = document.querySelector('#positions-table tbody');
+    var obody = document.querySelector('#orders-table tbody');
+    var nextList = document.getElementById('algo-next-tasks-list');
+    if (pills) pills.innerHTML = '';
+    if (cards) cards.innerHTML = '';
+    if (algoPills) algoPills.innerHTML = '';
+    if (algoCards) algoCards.innerHTML = '';
+    if (tbody) tbody.innerHTML = '';
+    if (obody) obody.innerHTML = '';
+    if (nextList) nextList.innerHTML = '';
+    var perfEmpty = document.getElementById('perf-empty');
+    var perfReturns = document.getElementById('perf-returns');
+    if (perfEmpty) {
+      perfEmpty.hidden = true;
+      perfEmpty.textContent = '';
+    }
+    if (perfReturns) perfReturns.innerHTML = '';
+    if (perfChart) {
+      try { perfChart.destroy(); } catch (e) {}
+      perfChart = null;
+    }
+  }
+
   var logoutBtn = document.getElementById('nav-logout');
   if (logoutBtn) {
     logoutBtn.addEventListener('click', function () {
       logoutBtn.disabled = true;
+      resetTraderView();
+      document.body.classList.remove('authed');
       var navigated = false;
       function goLogin() {
         if (navigated) return;
         navigated = true;
+        if (window.traderClearSessionToken) window.traderClearSessionToken();
         window.location.href = '/login';
       }
       postJson('/api/logout', {}).catch(function () {}).then(goLogin);
@@ -2427,19 +2514,32 @@
     });
   }
 
+  window.addEventListener('pageshow', function (ev) {
+    if (ev && ev.persisted) {
+      window.location.reload();
+    }
+  });
+
   fetchJson('/api/me').then(function (me) {
     currentUser = (me && me.user) || null;
+    if (!currentUser) {
+      window.location.href = '/login';
+      return;
+    }
+    document.body.classList.add('authed');
     var el = document.getElementById('brand-user');
-    if (el && currentUser) {
+    if (el) {
       var name = currentUser.display_name || currentUser.username || '';
       el.textContent = possessiveAccountLabel(name);
     }
-    if (currentUser) showWelcomeBanner(currentUser);
+    showWelcomeBanner(currentUser);
     loadHostCard();
-  }).catch(function () {});
-
-  fromHash();
-  refreshSchwabUi();
+    fromHash();
+    refreshSchwabUi();
+  }).catch(function () {
+    if (window.traderClearSessionToken) window.traderClearSessionToken();
+    window.location.href = '/login';
+  });
 
   // Poll: skip when tab hidden.
   // About: always refresh (job due clocks).

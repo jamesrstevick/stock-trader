@@ -43,6 +43,13 @@ body > .shell {
   min-height: 0;
 }
 
+body.dashboard:not(.authed) .shell,
+body.dashboard:not(.authed) .welcome-banner,
+body.dashboard:not(.authed) .onboarding-banner,
+body.dashboard:not(.authed) .schwab-banner {
+  visibility: hidden;
+}
+
 a { color: var(--accent); }
 
 .shell {

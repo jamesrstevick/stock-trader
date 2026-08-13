@@ -23,7 +23,7 @@ import user_context as uc
 try:
     from fastapi import FastAPI, Query, Request
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+    from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
     import uvicorn
 except ImportError as e:
@@ -46,7 +46,8 @@ if _origins:
         allow_origins=_origins,
         allow_credentials=True,
         allow_methods=['GET', 'POST', 'OPTIONS'],
-        allow_headers=['*'],
+        allow_headers=['*', 'Authorization'],
+        expose_headers=['X-Trader-User-Id'],
     )
 
 
@@ -59,6 +60,16 @@ def _asset_mtime(name: str) -> int:
 
 
 def _session_token(request: Request) -> Optional[str]:
+    """Prefer per-tab Bearer token so two windows can be two users."""
+    auth = (request.headers.get('authorization') or '').strip()
+    if len(auth) >= 7 and auth[:7].lower() == 'bearer ':
+        tok = auth[7:].strip()
+        if tok:
+            return tok
+    return request.cookies.get(uc.SESSION_COOKIE)
+
+
+def _cookie_token(request: Request) -> Optional[str]:
     return request.cookies.get(uc.SESSION_COOKIE)
 
 
@@ -117,7 +128,16 @@ async def auth_and_cache(request: Request, call_next):
         request.state.user = user
     response = await call_next(request)
 
-    if path == '/' or path == '/login' or path.endswith('.html') or path.startswith('/static/'):
+    if path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'private, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        user = getattr(request.state, 'user', None)
+        if user is None and path in PUBLIC_PATHS:
+            user = _current_user(request)
+        if user and user.get('id') is not None:
+            response.headers['X-Trader-User-Id'] = str(user['id'])
+    elif path == '/' or path == '/login' or path.endswith('.html') or path.startswith('/static/'):
         response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
         response.headers['Pragma'] = 'no-cache'
         response.headers['Expires'] = '0'
@@ -207,6 +227,7 @@ async def api_login(request: Request):
         resp = JSONResponse({
             'ok': True,
             'created': True,
+            'token': token,
             'user': {
                 'id': user['id'],
                 'username': user['username'],
@@ -236,6 +257,7 @@ async def api_login(request: Request):
         )
     resp = JSONResponse({
         'ok': True,
+        'token': token,
         'user': {
             'id': user['id'],
             'username': user['username'],
@@ -248,19 +270,23 @@ async def api_login(request: Request):
 
 @app.post('/api/logout')
 def api_logout(request: Request):
-    # Always clear the cookie even if the sessions row cannot be deleted
-    # (e.g. database locked by the trader loop).
+    # Destroy this tab's session. Only clear the shared cookie when this tab
+    # was using it — another window may still be signed in as someone else.
+    presented = _session_token(request)
+    cookie_tok = _cookie_token(request)
     try:
-        uc.destroy_session(_session_token(request))
+        uc.destroy_session(presented)
     except Exception as e:
         print('Warning: logout session cleanup: %s' % e)
     resp = JSONResponse({'ok': True})
-    resp.delete_cookie(
-        uc.SESSION_COOKIE,
-        path='/',
-        secure=_request_is_https(request),
-        samesite='lax',
-    )
+    if not presented or presented == cookie_tok:
+        resp.delete_cookie(
+            uc.SESSION_COOKIE,
+            path='/',
+            secure=_request_is_https(request),
+            httponly=True,
+            samesite='lax',
+        )
     return resp
 
 
@@ -503,9 +529,9 @@ def login_page():
 
 @app.get('/')
 def index(request: Request):
-    user = _current_user(request)
-    if not user:
-        return RedirectResponse(url='/login', status_code=302)
+    # Always serve the shell. Auth is cookie and/or per-tab Bearer; app.js
+    # sends 401 → /login. Server-side redirect would loop when only Bearer
+    # is set (other window overwrote the shared cookie).
     return HTMLResponse(_read_html('index.html'))
 
 

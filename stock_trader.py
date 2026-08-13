@@ -4501,7 +4501,10 @@ def update_watchlist(filter_name: str = 'safe') -> Dict[str, int]:
         cursor.execute('SELECT ticker FROM positions WHERE shares_owned > 0')
         owned_tickers_set = {row[0] for row in cursor.fetchall()}
         cursor.execute('PRAGMA table_info(watchlist)')
-        watchlist_columns = [row[1] for row in cursor.fetchall() if row[1] != 'ticker']
+        watchlist_columns = [
+            row[1] for row in cursor.fetchall()
+            if row[1] not in ('ticker', 'user_id')
+        ]
         date_added_map = {}  # type: Dict[str, Any]
         if 'date_added' in watchlist_columns:
             cursor.execute('SELECT ticker, date_added FROM watchlist')
@@ -4894,16 +4897,19 @@ def get_latest_account_snapshot(
 ) -> Optional[Dict[str, Any]]:
     """Most recent persisted account snapshot for the current user (or None)."""
     init_database()
+    uid = _uid()
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         '''
         SELECT ts, cash, effective_cash, liquidation_value, total_value, note
         FROM account_snapshots
-        WHERE COALESCE(liquidation_value, 0) > 0 OR COALESCE(total_value, 0) > 0
+        WHERE user_id = ?
+          AND (COALESCE(liquidation_value, 0) > 0 OR COALESCE(total_value, 0) > 0)
         ORDER BY id DESC
         LIMIT 40
-        '''
+        ''',
+        (uid,),
     )
     rows = cursor.fetchall()
     conn.close()
@@ -7290,21 +7296,26 @@ def purge_invalid_account_snapshots() -> int:
       - legacy offline sentinel cash=liq=total=10000
     """
     init_database()
+    uid = _uid()
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         '''
         DELETE FROM account_snapshots
-        WHERE (
-            COALESCE(liquidation_value, 0) <= 0
-            AND COALESCE(total_value, 0) <= 0
-        )
-        OR (
-            ABS(COALESCE(cash, 0) - 10000) < 0.01
-            AND ABS(COALESCE(liquidation_value, 0) - 10000) < 0.01
-            AND ABS(COALESCE(total_value, 0) - 10000) < 0.01
-        )
-        '''
+        WHERE user_id = ?
+          AND (
+            (
+                COALESCE(liquidation_value, 0) <= 0
+                AND COALESCE(total_value, 0) <= 0
+            )
+            OR (
+                ABS(COALESCE(cash, 0) - 10000) < 0.01
+                AND ABS(COALESCE(liquidation_value, 0) - 10000) < 0.01
+                AND ABS(COALESCE(total_value, 0) - 10000) < 0.01
+            )
+          )
+        ''',
+        (uid,),
     )
     removed = int(cursor.rowcount or 0)
     conn.commit()
@@ -9901,7 +9912,7 @@ def _dashboard_position_status(
 
 
 _dashboard_refresh_lock = threading.Lock()
-_dashboard_refresh_started = 0.0
+_dashboard_refresh_started = {}  # type: Dict[int, float]
 
 
 def _positions_sync_status_from_flags() -> Dict[str, Any]:
@@ -9933,17 +9944,18 @@ def _schedule_dashboard_schwab_refresh() -> None:
     The trader loop also syncs during sell_check; this keeps marks fresher while
     someone is watching the Trader page, without waiting on DB writers.
     """
-    global _dashboard_refresh_started
+    uid = uc.current_user_id()
     min_age = float(getattr(config, 'POSITIONS_SYNC_MIN_INTERVAL_SECONDS', 45))
     status = _positions_sync_status_from_flags()
     if status.get('reason') == 'fresh':
         return
+    key = int(uid) if uid is not None else 0
     now = time.time()
     with _dashboard_refresh_lock:
-        if now - _dashboard_refresh_started < min_age:
+        last = float(_dashboard_refresh_started.get(key) or 0.0)
+        if now - last < min_age:
             return
-        _dashboard_refresh_started = now
-    uid = uc.current_user_id()
+        _dashboard_refresh_started[key] = now
 
     def _worker():
         try:
@@ -10168,6 +10180,7 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
             'source': 'snapshot',
         }
 
+    port_user = uc.get_user_by_id(_uid()) or {}
     return {
         'ts': datetime.now().isoformat(timespec='seconds'),
         'positions': positions,
@@ -10204,6 +10217,12 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
             ),
         },
         'account_snapshot': account_snapshot,
+        'user': {
+            'id': _uid(),
+            'username': port_user.get('username'),
+            'display_name': port_user.get('display_name'),
+            'is_admin': bool(port_user.get('is_admin')),
+        },
     }
 
 

@@ -7,15 +7,28 @@
     return (window.TRADER_API_BASE || '').replace(/\/$/, '');
   }
 
-  // Already signed in? Go home.
-  fetch(apiBase() + '/api/me', { credentials: 'include' })
-    .then(function (r) { return r.ok ? r.json() : null; })
-    .then(function (data) {
-      if (data && data.authenticated) {
-        window.location.replace('/');
-      }
+  function authHeaders() {
+    return window.traderAuthHeaders ? window.traderAuthHeaders() : {};
+  }
+
+  // This tab already has a session? Go home.
+  // Cookie-only (another window's login) stays here so this tab can sign in
+  // as a different account.
+  var tabToken = window.traderGetSessionToken ? window.traderGetSessionToken() : '';
+  if (tabToken) {
+    fetch(apiBase() + '/api/me', {
+      credentials: 'include',
+      cache: 'no-store',
+      headers: authHeaders(),
     })
-    .catch(function () {});
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (data && data.authenticated) {
+          window.location.replace('/');
+        }
+      })
+      .catch(function () {});
+  }
 
   var form = document.getElementById('login-form');
   var errEl = document.getElementById('login-error');
@@ -98,6 +111,7 @@
     fetch(apiBase() + '/api/login', {
       method: 'POST',
       credentials: 'include',
+      cache: 'no-store',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     })
@@ -116,6 +130,9 @@
           return;
         }
         finished = true;
+        if (res.data.token && window.traderSetSessionToken) {
+          window.traderSetSessionToken(res.data.token);
+        }
         window.location.replace('/');
       })
       .catch(function () {

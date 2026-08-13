@@ -32,6 +32,12 @@ _SQL_KEYWORDS = frozenset([
     'NOT', 'IN', 'IS', 'NULL', 'DESC', 'ASC', 'UNION', 'ALL', 'DISTINCT',
 ])
 
+# Clauses that end a WHERE predicate (keep them outside the injected parens).
+_AFTER_WHERE = re.compile(
+    r'\b(ORDER\s+BY|GROUP\s+BY|LIMIT|HAVING|RETURNING)\b',
+    re.I,
+)
+
 _Params = Union[Sequence[Any], None]
 
 
@@ -80,12 +86,68 @@ def _fix_on_conflict_ticker(sql: str) -> str:
     )
 
 
+def _inject_user_pred(sql: str, where_match, pred: str) -> str:
+    """
+    Turn `WHERE <cond>` into `WHERE <pred> AND (<cond>)`.
+
+    Parentheses are required: `user_id = ? AND a OR b` is
+    `(user_id = ? AND a) OR b`, which leaks other users' rows (e.g.
+    account_snapshots with `liquidation_value > 0 OR total_value > 0`).
+    """
+    after = sql[where_match.end():]
+    tail_m = _AFTER_WHERE.search(after)
+    if tail_m:
+        body = after[: tail_m.start()]
+        tail = after[tail_m.start():]
+    else:
+        body = after
+        tail = ''
+    body = body.strip()
+    tail = tail.strip()
+    if not body:
+        injected = ' ' + pred
+    else:
+        injected = ' ' + pred + ' AND (' + body + ')'
+    if tail:
+        injected += ' ' + tail
+    return sql[: where_match.end()] + injected
+
+
 def rewrite_sql(sql: str, params: _Params, user_id: int) -> Tuple[str, List[Any]]:
     params_list = list(params) if params is not None else []
     if not sql:
         return sql, params_list
 
-    # Even if user_id already appears (e.g. log_event), still fix ON CONFLICT(ticker)
+    stripped = sql.strip()
+    upper = stripped.upper()
+
+    # INSERT must run before _already_scoped: PRAGMA-driven INSERTs include
+    # user_id in the column list with a NULL placeholder, which would otherwise
+    # skip injection and hit NOT NULL (watchlist.user_id).
+    m = re.match(
+        r'^(INSERT\s+(?:OR\s+\w+\s+)?)INTO\s+(\w+)\s*\(([^)]*)\)\s*VALUES\s*\(',
+        stripped,
+        re.I | re.S,
+    )
+    if m and m.group(2).lower() in USER_TABLES:
+        cols = [c.strip() for c in m.group(3).split(',') if c.strip()]
+        lower_cols = [c.lower() for c in cols]
+        if 'user_id' in lower_cols:
+            idx = lower_cols.index('user_id')
+            while len(params_list) <= idx:
+                params_list.append(None)
+            params_list[idx] = user_id
+            return _fix_on_conflict_ticker(stripped), params_list
+        rest = stripped[m.end():]
+        new_sql = '%sINTO %s (user_id, %s) VALUES (?, %s' % (
+            m.group(1),
+            m.group(2),
+            m.group(3).strip(),
+            rest,
+        )
+        return _fix_on_conflict_ticker(new_sql), [user_id] + params_list
+
+    # Even if user_id already appears (e.g. log_event SELECT), still fix ON CONFLICT(ticker)
     if _already_scoped(sql):
         if _touches_user_table(sql) and re.search(r'ON\s+CONFLICT\s*\(\s*ticker\s*\)', sql, re.I):
             return _fix_on_conflict_ticker(sql), params_list
@@ -94,36 +156,12 @@ def rewrite_sql(sql: str, params: _Params, user_id: int) -> Tuple[str, List[Any]
     if not _touches_user_table(sql):
         return sql, params_list
 
-    stripped = sql.strip()
-    upper = stripped.upper()
-
-    # INSERT INTO table (cols) VALUES (...)
-    m = re.match(
-        r'^(INSERT\s+(?:OR\s+\w+\s+)?)INTO\s+(\w+)\s*\(([^)]*)\)\s*VALUES\s*\(',
-        stripped,
-        re.I | re.S,
-    )
-    if m and m.group(2).lower() in USER_TABLES:
-        cols = m.group(3).strip()
-        rest = stripped[m.end():]
-        new_sql = '%sINTO %s (user_id, %s) VALUES (?, %s' % (
-            m.group(1),
-            m.group(2),
-            cols,
-            rest,
-        )
-        return _fix_on_conflict_ticker(new_sql), [user_id] + params_list
-
     # DELETE FROM table ...
     m = re.match(r'^DELETE\s+FROM\s+(\w+)\b', stripped, re.I)
     if m and m.group(1).lower() in USER_TABLES:
         wh = re.search(r'\bWHERE\b', stripped, re.I)
         if wh:
-            new_sql = (
-                stripped[: wh.end()]
-                + ' user_id = ? AND'
-                + stripped[wh.end():]
-            )
+            new_sql = _inject_user_pred(stripped, wh, 'user_id = ?')
             return new_sql, [user_id] + params_list
         new_sql = stripped + ' WHERE user_id = ?'
         return new_sql, params_list + [user_id]
@@ -135,11 +173,7 @@ def rewrite_sql(sql: str, params: _Params, user_id: int) -> Tuple[str, List[Any]
         if wh:
             before = stripped[: wh.start()]
             n_set = before.count('?')
-            new_sql = (
-                stripped[: wh.end()]
-                + ' user_id = ? AND'
-                + stripped[wh.end():]
-            )
+            new_sql = _inject_user_pred(stripped, wh, 'user_id = ?')
             return new_sql, params_list[:n_set] + [user_id] + params_list[n_set:]
         new_sql = stripped + ' WHERE user_id = ?'
         return new_sql, params_list + [user_id]
@@ -153,13 +187,7 @@ def rewrite_sql(sql: str, params: _Params, user_id: int) -> Tuple[str, List[Any]
         n = len(aliases)
         wh = re.search(r'\bWHERE\b', stripped, re.I)
         if wh:
-            new_sql = (
-                stripped[: wh.end()]
-                + ' '
-                + pred
-                + ' AND'
-                + stripped[wh.end():]
-            )
+            new_sql = _inject_user_pred(stripped, wh, pred)
             return new_sql, [user_id] * n + params_list
         ins = re.search(r'\b(ORDER\s+BY|GROUP\s+BY|LIMIT|HAVING)\b', stripped, re.I)
         clause = ' WHERE ' + pred
