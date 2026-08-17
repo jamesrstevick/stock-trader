@@ -1865,7 +1865,6 @@
     { title: 'Account size floor', set_to: 'Liquidation value ≥ $25,000', why: 'No buy while account value is under this threshold. Sells still run.' },
     { title: 'Buy only from the active filter / watchlist', set_to: "Filter 'safe'", why: 'New buys must be on the current watchlist — no random tickers' },
     { title: 'Fixed buy size', set_to: '~$1,000 per new name', why: 'Keeps position sizing consistent and cash-floor math simple' },
-    { title: 'Re-buy debounce after a sell', set_to: '≤ last sell price − 5%', why: 'Avoid immediately chasing the same name after a sell' },
     { title: 'Trailing stop arms after a gain', set_to: 'Arm at +10% peak unrealized', why: 'Protect winners once they have moved enough; ignore noise before that' },
     { title: 'Trail buffer below peak', set_to: '5% on watchlist · 3% once off', why: 'Stop ratchets up with new highs; tighter once the thesis (watchlist) breaks' },
     { title: 'Hard stop vs cost', set_to: '−10% on watchlist · −5% once off', why: 'Catastrophe floor when a trail never armed, or thesis is gone' },
@@ -2554,17 +2553,18 @@
     }
   }
 
-  // Four viewer tags. Activity (Buy/Sell/Watchlist) is the default view; Tasks is ops noise.
+  // Viewer tags. Activity (Buy/Sell/STOP-LIMIT/Watchlist) is the default view; Tasks is ops noise.
   var LOG_CATEGORIES = [
-    { id: 'buy', label: 'Buy', meaning: 'PLACING BUY → BOUGHT (fills). Money in.' },
-    { id: 'sell', label: 'Sell', meaning: 'PLACING MARKET SELL / STOP LIVE → SOLD (hard or trail). Money out.' },
+    { id: 'buy', label: 'Buy', meaning: 'Actual buys after the order fills.' },
+    { id: 'sell', label: 'Sell', meaning: 'Actual sales after the order fills.' },
+    { id: 'stop-limit', label: 'STOP-LIMIT', meaning: 'Protective stop set, moved, or deferred.' },
     { id: 'watchlist', label: 'Watchlist', meaning: 'Watchlist refresh from the filter (adds/removes).' },
     { id: 'task', label: 'Tasks', meaning: 'Scheduler noise: task start/finish, Yahoo batches, Schwab sync, account snapshots.' }
   ];
 
   var LOG_PAGE_SIZE = 50;
   // Default: activity only (not Tasks)
-  var logFilterSelected = { buy: true, sell: true, watchlist: true };
+  var logFilterSelected = { buy: true, sell: true, 'stop-limit': true, watchlist: true };
   var logEventsCache = [];
   var logHasMore = false;
   var logLoadingMore = false;
@@ -2572,16 +2572,26 @@
 
   function normalizeLogCategory(ev) {
     var c = String((ev && ev.category) || '').toLowerCase();
+    var m = String((ev && ev.message) || '').toUpperCase();
+    if (c === 'stop-limit' || c === 'stop_limit' || c === 'stoplimit' || c === 'stop') {
+      return 'stop-limit';
+    }
     if (c === 'buy') return 'buy';
-    if (c === 'sell' || c === 'order') return 'sell';
+    if (c === 'sell' || c === 'order') {
+      if (m.indexOf('SOLD') < 0 && (m.indexOf('STOP-LIMIT') >= 0 || m.indexOf('STOP LIVE') >= 0 ||
+          m.indexOf('STOP DEFERRED') >= 0 || m.indexOf('ARM STOP') >= 0)) {
+        return 'stop-limit';
+      }
+      return 'sell';
+    }
     if (c === 'watchlist') return 'watchlist';
     if (c === 'task' || c === 'job' || c === 'yahoo' || c === 'account' ||
         c === 'book' || c === 'algorithm' || c === 'web') {
       return 'task';
     }
     if (c === 'trade') {
-      var m = String((ev && ev.message) || '').toUpperCase();
-      if (m.indexOf('SOLD') >= 0 || m.indexOf('SELL') >= 0 || m.indexOf('STOP') >= 0) return 'sell';
+      if (m.indexOf('STOP') >= 0 && m.indexOf('SOLD') < 0) return 'stop-limit';
+      if (m.indexOf('SOLD') >= 0 || m.indexOf('SELL') >= 0) return 'sell';
       if (m.indexOf('BOUGHT') >= 0 || m.indexOf('BUY') >= 0) return 'buy';
       return 'task';
     }
@@ -2627,7 +2637,7 @@
     if (!hint) return;
     var keys = Object.keys(logFilterSelected);
     if (!keys.length) {
-      hint.textContent = 'Showing all. Tip: leave Buy + Sell + Watchlist on for the trading story; add Tasks for scheduler/Yahoo noise.';
+      hint.textContent = 'Showing all. Tip: leave Buy + Sell + STOP-LIMIT + Watchlist on for the trading story; add Tasks for scheduler/Yahoo noise.';
       return;
     }
     var labels = keys.map(logCategoryLabel);

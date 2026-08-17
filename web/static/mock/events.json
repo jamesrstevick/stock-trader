@@ -1,25 +1,32 @@
 {
   "events": [
     {
+      "id": 6,
+      "ts": "2026-08-03T17:55:00",
+      "level": "info",
+      "category": "sell",
+      "message": "SOLD 12 MET @ $70.20"
+    },
+    {
       "id": 5,
       "ts": "2026-08-03T17:52:00",
       "level": "info",
-      "category": "sell",
-      "message": "STOP LIVE 12 MET @ $70.20 (order 12345)"
+      "category": "stop-limit",
+      "message": "STOP-LIMIT moved from $68.00 to $70.20 for MET"
     },
     {
       "id": 4,
       "ts": "2026-08-03T17:51:00",
       "level": "info",
       "category": "buy",
-      "message": "BOUGHT RELX: fill confirmed — 27 sh @ ~$36.66 (order 999)"
+      "message": "BOUGHT 27 RELX @ $36.66"
     },
     {
       "id": 3,
-      "ts": "2026-08-03T17:50:00",
+      "ts": "2026-08-03T10:15:00",
       "level": "info",
-      "category": "task",
-      "message": "Sell check finished: sell_now=0, stop_limit=12"
+      "category": "stop-limit",
+      "message": "STOP-LIMIT set @ $36.10 for RELX (deferred to avoid same-day trading)"
     },
     {
       "id": 2,

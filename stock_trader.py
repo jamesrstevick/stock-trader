@@ -911,6 +911,7 @@ def _init_database_unlocked(
         ('stop_order_price', 'REAL'),   # last submitted stop trigger
         ('stop_limit_price', 'REAL'),   # last submitted limit price
         ('stop_order_qty', 'INTEGER'),  # qty on that resting order
+        ('stop_defer_logged', 'INTEGER'),  # 1 after same-day defer log (once)
     ]:
         if col not in pos_cols:
             try:
@@ -931,7 +932,7 @@ def _init_database_unlocked(
         )
     ''')
     
-    # After a sell: block re-buying the same ticker until price is cheap enough
+    # Unused leftover table (rebuy-discount rule removed). Keep so existing DBs stay valid.
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS rebuy_guards (
             ticker TEXT PRIMARY KEY,
@@ -1192,6 +1193,16 @@ def _init_database_unlocked(
         run_multi_user_migration(conn)
     except Exception as e:
         print('Warning: multi-user migration: %s' % e)
+        try:
+            conn.commit()
+        except Exception:
+            pass
+
+    try:
+        _rewrite_legacy_event_log(conn)
+        conn.commit()
+    except Exception as e:
+        print('Warning: event_log cleanup: %s' % e)
         try:
             conn.commit()
         except Exception:
@@ -1613,11 +1624,21 @@ _LOG_CATEGORY_ALIASES = {
     'web': 'task',
     'order': 'sell',
     'trade': 'task',
+    'stop-limit': 'stop-limit',
+    'stop_limit': 'stop-limit',
+    'stoplimit': 'stop-limit',
+    'stop': 'stop-limit',
 }
+
+_EVENT_LOG_CLEAN_FLAG = 'event_log_clean_v1'
+_LOG_TICKER_RE = re.compile(r'\b([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b')
+_LOG_MONEY_RE = re.compile(r'\$([0-9]+(?:\.[0-9]+)?)')
+_LOG_QTY_SH_RE = re.compile(r'(?:^|\s)(\d+)\s+sh\b', re.I)
+_LOG_WAS_SH_RE = re.compile(r'\bwas\s+(\d+)\s+sh\b', re.I)
 
 
 def normalize_log_category(category: Optional[str]) -> str:
-    """Map any event category into buy | sell | watchlist | task."""
+    """Map any event category into buy | sell | stop-limit | watchlist | task."""
     key = (category or 'task').strip().lower()
     return _LOG_CATEGORY_ALIASES.get(key, 'task')
 
@@ -1687,6 +1708,534 @@ def log_event(
         print(f"[{ts}] ERROR/{cat}: {message}")
     else:
         print(f"[{ts}] {cat}: {message}")
+
+
+def _fmt_log_px(price: Any) -> str:
+    return '$%.2f' % float(price)
+
+
+def format_bought_log_message(
+    ticker: str,
+    quantity: Optional[int] = None,
+    price: Optional[float] = None,
+    dry_run: bool = False,
+) -> str:
+    prefix = 'DRY-RUN ' if dry_run else ''
+    qty_s = ('%s ' % int(quantity)) if quantity is not None else ''
+    if price is not None:
+        try:
+            return '%sBOUGHT %s%s @ %s' % (prefix, qty_s, ticker, _fmt_log_px(price))
+        except (TypeError, ValueError):
+            pass
+    return '%sBOUGHT %s%s' % (prefix, qty_s, ticker)
+
+
+def format_sold_log_message(
+    ticker: str,
+    quantity: Optional[int] = None,
+    price: Optional[float] = None,
+    dry_run: bool = False,
+) -> str:
+    prefix = 'DRY-RUN ' if dry_run else ''
+    qty_s = ('%s ' % int(quantity)) if quantity is not None else ''
+    if price is not None:
+        try:
+            return '%sSOLD %s%s @ %s' % (prefix, qty_s, ticker, _fmt_log_px(price))
+        except (TypeError, ValueError):
+            pass
+    return '%sSOLD %s%s' % (prefix, qty_s, ticker)
+
+
+def format_stop_limit_log_message(
+    ticker: str,
+    stop_price: float,
+    previous_stop: Optional[float] = None,
+    deferred: bool = False,
+) -> str:
+    px = _fmt_log_px(stop_price)
+    if deferred:
+        return 'STOP-LIMIT set @ %s for %s (deferred to avoid same-day trading)' % (
+            px, ticker,
+        )
+    if previous_stop is not None:
+        try:
+            return 'STOP-LIMIT moved from %s to %s for %s' % (
+                _fmt_log_px(previous_stop), px, ticker,
+            )
+        except (TypeError, ValueError):
+            pass
+    return 'STOP-LIMIT set @ %s for %s' % (px, ticker)
+
+
+def log_stop_limit_event(
+    ticker: str,
+    stop_price: float,
+    previous_stop: Optional[float] = None,
+    deferred: bool = False,
+    dry_run: bool = False,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    msg = format_stop_limit_log_message(
+        ticker, stop_price, previous_stop=previous_stop, deferred=deferred,
+    )
+    detail = dict(extra) if extra else {}
+    detail['ticker'] = ticker
+    try:
+        detail['stop_price'] = float(stop_price)
+    except (TypeError, ValueError):
+        pass
+    if previous_stop is not None:
+        try:
+            detail['previous_stop'] = float(previous_stop)
+        except (TypeError, ValueError):
+            pass
+    detail['phase'] = (
+        'deferred' if deferred else ('moved' if previous_stop is not None else 'set')
+    )
+    detail['order_type'] = 'STOP_LIMIT'
+    if dry_run:
+        detail['dry_run'] = True
+    log_event('stop-limit', msg, detail=detail)
+
+
+def _emit_stop_limit_placed_or_moved(
+    ticker: str,
+    stop_price: float,
+    previous_stop: Optional[float] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """User log for a new or ratcheted stop. Same price (qty-only) is silent."""
+    new_px = round(float(stop_price), 2)
+    prev_px = None  # type: Optional[float]
+    if previous_stop is not None:
+        try:
+            prev_px = round(float(previous_stop), 2)
+        except (TypeError, ValueError):
+            prev_px = None
+    if prev_px is not None and abs(prev_px - new_px) < 0.01:
+        _set_stop_defer_logged(ticker, False)
+        return
+    log_stop_limit_event(
+        ticker,
+        new_px,
+        previous_stop=prev_px,
+        dry_run=trade_dry_run_enabled(),
+        extra=extra,
+    )
+    _set_stop_defer_logged(ticker, False)
+
+
+def _stop_defer_already_logged(ticker: str) -> bool:
+    init_database()
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            'SELECT stop_defer_logged FROM positions WHERE ticker = ?',
+            (ticker,),
+        )
+        row = cursor.fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    conn.close()
+    return bool(row and row[0])
+
+
+def _set_stop_defer_logged(ticker: str, value: bool) -> None:
+    init_database()
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            'UPDATE positions SET stop_defer_logged = ? WHERE ticker = ?',
+            (1 if value else 0, ticker),
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    conn.close()
+
+
+def _detail_float(detail: Dict[str, Any], *keys: str) -> Optional[float]:
+    for key in keys:
+        if key not in detail or detail.get(key) is None:
+            continue
+        try:
+            return float(detail.get(key))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _detail_int(detail: Dict[str, Any], *keys: str) -> Optional[int]:
+    for key in keys:
+        if key not in detail or detail.get(key) is None:
+            continue
+        try:
+            return int(float(detail.get(key)))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _first_money(text: str) -> Optional[float]:
+    m = _LOG_MONEY_RE.search(text or '')
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _qty_from_legacy_message(text: str, detail: Dict[str, Any]) -> Optional[int]:
+    qty = _detail_int(detail, 'quantity', 'shares_owned', 'qty')
+    if qty is not None:
+        return qty
+    was = _LOG_WAS_SH_RE.search(text or '')
+    if was:
+        try:
+            return int(was.group(1))
+        except (TypeError, ValueError):
+            pass
+    sh = _LOG_QTY_SH_RE.search(text or '')
+    if sh:
+        try:
+            return int(sh.group(1))
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _legacy_event_plan(
+    category: str,
+    message: str,
+    detail: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Map an old event_log row to keep / update / delete.
+
+    Returns keys: action ('keep'|'update'|'delete'), plus category/message/kind/ticker
+    when rewriting.
+    """
+    detail = detail if isinstance(detail, dict) else {}
+    msg = (message or '').strip()
+    cat = normalize_log_category(category)
+    upper = msg.upper()
+    ticker = detail.get('ticker')
+    if ticker:
+        ticker = str(ticker).strip().upper()
+    else:
+        ticker = None
+
+    if upper.startswith('STOP CANCELLED'):
+        return {'action': 'delete'}
+    if upper.startswith('PLACING BUY') or upper.startswith('PLACING MARKET SELL'):
+        return {'action': 'delete'}
+
+    if msg.startswith('STOP-LIMIT '):
+        tkr = ticker
+        if not tkr:
+            fm = re.search(r'\bfor\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\s*$', msg)
+            if fm:
+                tkr = fm.group(1)
+        kind = 'stop_set'
+        if '(deferred to avoid same-day trading)' in msg:
+            kind = 'stop_deferred'
+        elif ' moved from ' in msg:
+            kind = 'stop_moved'
+        return {
+            'action': 'update' if cat != 'stop-limit' else 'keep',
+            'category': 'stop-limit',
+            'message': msg,
+            'kind': kind,
+            'ticker': tkr,
+            'stop_px': _first_money(msg),
+        }
+
+    if upper.startswith('BOUGHT ') and ': FILL CONFIRMED' in upper:
+        m = re.match(
+            r'^BOUGHT\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\s*:',
+            msg,
+            re.I,
+        )
+        tkr = (m.group(1).upper() if m else ticker)
+        qty = _qty_from_legacy_message(msg, detail)
+        px = _detail_float(detail, 'price') or _first_money(msg)
+        if tkr:
+            return {
+                'action': 'update',
+                'category': 'buy',
+                'message': format_bought_log_message(tkr, qty, px),
+                'kind': 'bought',
+                'ticker': tkr,
+            }
+
+    dry = bool(detail.get('dry_run')) or upper.startswith('DRY-RUN')
+    arm = re.match(
+        r'^(?:DRY-RUN would ARM STOP|STOP LIVE)\s+(\d+)\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\s+@\s+\$([0-9.]+)',
+        msg,
+    )
+    if arm:
+        tkr = arm.group(2).upper()
+        try:
+            stop_px = float(arm.group(3))
+        except (TypeError, ValueError):
+            stop_px = _detail_float(detail, 'stop_price')
+        if tkr and stop_px is not None:
+            return {
+                'action': 'update',
+                'category': 'stop-limit',
+                'message': format_stop_limit_log_message(tkr, stop_px),
+                'kind': 'stop_set',
+                'ticker': tkr,
+                'stop_px': stop_px,
+                'replace': bool(detail.get('replace')) or '(replace' in msg.lower(),
+            }
+
+    deferred = re.match(
+        r'^STOP deferred for\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b',
+        msg,
+        re.I,
+    )
+    if deferred:
+        tkr = deferred.group(1).upper()
+        stop_px = _detail_float(detail, 'stop_price') or _first_money(msg)
+        if tkr and stop_px is not None:
+            return {
+                'action': 'update',
+                'category': 'stop-limit',
+                'message': format_stop_limit_log_message(
+                    tkr, stop_px, deferred=True,
+                ),
+                'kind': 'stop_deferred',
+                'ticker': tkr,
+                'stop_px': stop_px,
+            }
+        if tkr:
+            return {
+                'action': 'update',
+                'category': 'stop-limit',
+                'message': 'STOP-LIMIT for %s (deferred to avoid same-day trading)' % tkr,
+                'kind': 'stop_deferred',
+                'ticker': tkr,
+            }
+
+    failed = re.match(
+        r'^ARM STOP failed\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b',
+        msg,
+        re.I,
+    )
+    if failed:
+        tkr = failed.group(1).upper()
+        return {
+            'action': 'update',
+            'category': 'stop-limit',
+            'message': 'STOP-LIMIT failed for %s' % tkr,
+            'kind': 'stop_failed',
+            'ticker': tkr,
+        }
+
+    dry_buy = re.match(
+        r'^DRY-RUN would (?:PLACE )?BUY\s+(\d+)\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)(?:\s+@\s+~?\$([0-9.]+))?',
+        msg,
+        re.I,
+    )
+    if dry_buy:
+        tkr = dry_buy.group(2).upper()
+        qty = int(dry_buy.group(1))
+        px = float(dry_buy.group(3)) if dry_buy.group(3) else _detail_float(detail, 'price')
+        return {
+            'action': 'update',
+            'category': 'buy',
+            'message': format_bought_log_message(tkr, qty, px, dry_run=True),
+            'kind': 'bought',
+            'ticker': tkr,
+        }
+
+    dry_sell = re.match(
+        r'^DRY-RUN would PLACE MARKET SELL\s+(\d+)\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)(?:\s+@\s+~?\$([0-9.]+))?',
+        msg,
+        re.I,
+    )
+    if dry_sell:
+        tkr = dry_sell.group(2).upper()
+        qty = int(dry_sell.group(1))
+        px = float(dry_sell.group(3)) if dry_sell.group(3) else _detail_float(detail, 'price')
+        return {
+            'action': 'update',
+            'category': 'sell',
+            'message': format_sold_log_message(tkr, qty, px, dry_run=True),
+            'kind': 'sold',
+            'ticker': tkr,
+        }
+
+    sold = re.match(
+        r'^SOLD\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b',
+        msg,
+        re.I,
+    )
+    if sold:
+        tkr = sold.group(1).upper()
+        qty = _qty_from_legacy_message(msg, detail)
+        px = _detail_float(detail, 'price', 'stop_order_price')
+        if px is None:
+            stop_m = re.search(r'@ stop \$([0-9.]+)', msg, re.I)
+            if stop_m:
+                try:
+                    px = float(stop_m.group(1))
+                except (TypeError, ValueError):
+                    px = None
+        if px is None:
+            px = _first_money(msg)
+        return {
+            'action': 'update',
+            'category': 'sell',
+            'message': format_sold_log_message(tkr, qty, px, dry_run=dry),
+            'kind': 'sold',
+            'ticker': tkr,
+        }
+
+    if upper.startswith('BUY PASS SKIPPED') or upper.startswith('SELL PASS SKIPPED'):
+        return {
+            'action': 'update' if cat != 'task' else 'keep',
+            'category': 'task',
+            'message': msg,
+            'kind': 'task',
+        }
+
+    if cat in ('buy', 'sell') and 'STOP' in upper and 'SOLD' not in upper:
+        tkr = ticker
+        if not tkr:
+            tm = _LOG_TICKER_RE.search(msg.replace('STOP', ' ', 1))
+            if tm:
+                tkr = tm.group(1)
+        stop_px = _detail_float(detail, 'stop_price') or _first_money(msg)
+        if tkr and stop_px is not None:
+            deferred_bit = 'DEFER' in upper
+            return {
+                'action': 'update',
+                'category': 'stop-limit',
+                'message': format_stop_limit_log_message(
+                    tkr, stop_px, deferred=deferred_bit,
+                ),
+                'kind': 'stop_deferred' if deferred_bit else 'stop_set',
+                'ticker': tkr,
+                'stop_px': stop_px,
+            }
+
+    return {'action': 'keep', 'category': cat, 'message': msg, 'kind': cat, 'ticker': ticker}
+
+
+def _rewrite_legacy_event_log(conn: sqlite3.Connection) -> None:
+    """One-time cleanup of stored Log rows (set/moved copy, drop placing noise)."""
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            'SELECT value FROM runtime_flags WHERE key = ?',
+            (_EVENT_LOG_CLEAN_FLAG,),
+        )
+        flag = cursor.fetchone()
+        if flag and str(flag[0]) == '1':
+            return
+    except sqlite3.OperationalError:
+        return
+    try:
+        cursor.execute(
+            'SELECT id, user_id, category, message, detail_json FROM event_log ORDER BY id ASC'
+        )
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        try:
+            cursor.execute(
+                'SELECT id, category, message, detail_json FROM event_log ORDER BY id ASC'
+            )
+            rows = [(r[0], None, r[1], r[2], r[3]) for r in cursor.fetchall()]
+        except sqlite3.OperationalError:
+            return
+
+    # Per user: last armed stop price, and whether the last stop-limit row was deferred.
+    last_stop = {}  # type: Dict[Any, Dict[str, float]]
+    last_deferred = {}  # type: Dict[Any, Dict[str, bool]]
+    n_update = 0
+    n_delete = 0
+    for row in rows:
+        ev_id, user_id, category, message, detail_json = row
+        detail = {}  # type: Dict[str, Any]
+        if detail_json:
+            try:
+                parsed = json.loads(detail_json)
+                if isinstance(parsed, dict):
+                    detail = parsed
+            except Exception:
+                detail = {}
+        plan = _legacy_event_plan(category, message, detail)
+        action = plan.get('action')
+        uid = user_id
+        if uid not in last_stop:
+            last_stop[uid] = {}
+            last_deferred[uid] = {}
+        kind = plan.get('kind')
+        ticker = plan.get('ticker')
+        if action == 'delete':
+            cursor.execute('DELETE FROM event_log WHERE id = ?', (ev_id,))
+            n_delete += 1
+            continue
+        if kind == 'stop_deferred' and ticker:
+            if last_deferred[uid].get(ticker):
+                cursor.execute('DELETE FROM event_log WHERE id = ?', (ev_id,))
+                n_delete += 1
+                continue
+            last_deferred[uid][ticker] = True
+        elif kind in ('stop_set', 'stop_moved') and ticker:
+            prev = last_stop[uid].get(ticker)
+            stop_px = plan.get('stop_px')
+            if stop_px is None:
+                stop_px = _first_money(str(plan.get('message') or message))
+            if (
+                prev is not None
+                and stop_px is not None
+                and abs(float(prev) - float(stop_px)) >= 0.01
+                and kind == 'stop_set'
+            ):
+                plan['message'] = format_stop_limit_log_message(
+                    ticker, float(stop_px), previous_stop=float(prev),
+                )
+                plan['kind'] = 'stop_moved'
+                action = 'update'
+            if stop_px is not None:
+                last_stop[uid][ticker] = float(stop_px)
+            last_deferred[uid][ticker] = False
+        elif kind == 'sold' and ticker:
+            last_deferred[uid][ticker] = False
+            last_stop[uid].pop(ticker, None)
+
+        new_cat = plan.get('category')
+        new_msg = plan.get('message')
+        if action == 'update' and new_cat and new_msg:
+            if new_cat != category or new_msg != message:
+                cursor.execute(
+                    'UPDATE event_log SET category = ?, message = ? WHERE id = ?',
+                    (new_cat, new_msg, ev_id),
+                )
+                n_update += 1
+
+    cursor.execute(
+        '''
+        INSERT OR REPLACE INTO runtime_flags (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ''',
+        (
+            _EVENT_LOG_CLEAN_FLAG,
+            '1',
+            datetime.now().isoformat(timespec='seconds'),
+        ),
+    )
+    if n_update or n_delete:
+        print(
+            'Event log cleanup: updated %s, removed %s older rows'
+            % (n_update, n_delete)
+        )
 
 
 def get_runtime_flag(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -5321,6 +5870,7 @@ def _apply_schwab_positions_to_db(
             ('stop_gain_pct', 'REAL'), ('trail_active', 'INTEGER'),
             ('stop_order_id', 'TEXT'), ('stop_order_price', 'REAL'),
             ('stop_limit_price', 'REAL'), ('stop_order_qty', 'INTEGER'),
+            ('stop_defer_logged', 'INTEGER'),
         ]:
             if col not in pos_cols:
                 try:
@@ -5504,18 +6054,20 @@ def _log_position_closed_on_sync(ex: Dict[str, Any]) -> None:
     if not oid and stop_px is None:
         return
     exit_info = describe_sell_exit('trail' if trail else 'hard', trail)
-    stop_s = ''
-    if stop_px is not None:
-        try:
-            stop_s = ' @ stop $%.2f' % float(stop_px)
-        except (TypeError, ValueError):
-            stop_s = ''
-    sh_s = f' · was {int(shares)} sh' if shares else ''
-    msg = (
-        f"SOLD {ticker} via {exit_info['short_label']}"
-        f"{stop_s}{sh_s} — {exit_info['summary']}"
-    )
-    print(f"  {msg}")
+    qty = None  # type: Optional[int]
+    try:
+        if shares:
+            qty = int(shares)
+    except (TypeError, ValueError):
+        qty = None
+    px = None  # type: Optional[float]
+    try:
+        if stop_px is not None:
+            px = float(stop_px)
+    except (TypeError, ValueError):
+        px = None
+    msg = format_sold_log_message(ticker, qty, px)
+    print(f"  {msg} ({exit_info['short_label']})")
     log_event(
         'sell',
         msg,
@@ -5775,11 +6327,6 @@ def cancel_stop_order(order_id: str, account_hash: Optional[str] = None) -> bool
         ok = response.status_code in (200, 201, 204)
         if ok:
             print(f"✓ Cancelled stop order {order_id}")
-            log_event(
-                'sell',
-                f'STOP CANCELLED (order {order_id})',
-                detail={'phase': 'cancel', 'order_id': order_id},
-            )
         else:
             print(
                 f"✗ Cancel stop {order_id} failed: {response.status_code} {response.text}"
@@ -5811,23 +6358,9 @@ def place_stop_limit_sell(
         else stop_limit_price_from_stop(stop)
     )
     if trade_dry_run_enabled():
-        place_msg = (
-            f"DRY-RUN would ARM STOP {qty} {ticker} @ ${stop:.2f} "
+        print(
+            f"[DRY-RUN] STOP-LIMIT {qty} {ticker} @ ${stop:.2f} "
             f"(limit ${limit:.2f})"
-        )
-        print(f"[DRY-RUN] {place_msg}")
-        log_event(
-            'sell',
-            place_msg,
-            detail={
-                'ticker': ticker,
-                'quantity': qty,
-                'stop_price': stop,
-                'limit_price': limit,
-                'phase': 'armed',
-                'order_type': 'STOP_LIMIT',
-                'dry_run': True,
-            },
         )
         sync_position_stop_order(ticker, 'SIM-STOP', stop, limit, qty)
         return 'SIM-STOP'
@@ -5853,8 +6386,8 @@ def place_stop_limit_sell(
                 f"{response.status_code} {response.text}"
             )
             log_event(
-                'sell',
-                f'ARM STOP failed {ticker}',
+                'stop-limit',
+                f'STOP-LIMIT failed for {ticker}',
                 level='error',
                 detail={'status': response.status_code, 'body': response.text[:500]},
             )
@@ -5869,19 +6402,6 @@ def place_stop_limit_sell(
         else:
             print(f"✓ STOP_LIMIT placed for {ticker} order_id={order_id}")
         sync_position_stop_order(ticker, order_id, stop, limit, qty)
-        log_event(
-            'sell',
-            f"STOP LIVE {qty} {ticker} @ ${stop:.2f} (order {order_id})",
-            detail={
-                'ticker': ticker,
-                'order_id': order_id,
-                'stop_price': stop,
-                'limit_price': limit,
-                'quantity': qty,
-                'phase': 'live',
-                'order_type': 'STOP_LIMIT',
-            },
-        )
         return order_id
     except Exception as e:
         print(f"Error placing STOP_LIMIT for {ticker}: {e}")
@@ -5909,24 +6429,9 @@ def replace_stop_limit_sell(
         else stop_limit_price_from_stop(stop)
     )
     if trade_dry_run_enabled():
-        place_msg = (
-            f"DRY-RUN would ARM STOP {qty} {ticker} @ ${stop:.2f} "
+        print(
+            f"[DRY-RUN] STOP-LIMIT {qty} {ticker} @ ${stop:.2f} "
             f"(replace, limit ${limit:.2f})"
-        )
-        print(f"[DRY-RUN] {place_msg}")
-        log_event(
-            'sell',
-            place_msg,
-            detail={
-                'ticker': ticker,
-                'quantity': qty,
-                'stop_price': stop,
-                'limit_price': limit,
-                'phase': 'armed',
-                'order_type': 'STOP_LIMIT',
-                'replace': True,
-                'dry_run': True,
-            },
         )
         sync_position_stop_order(ticker, order_id or 'SIM-STOP', stop, limit, qty)
         return order_id or 'SIM-STOP'
@@ -5961,21 +6466,6 @@ def replace_stop_limit_sell(
         new_id = _extract_order_id(response) or order_id
         sync_position_stop_order(ticker, new_id, stop, limit, qty)
         print(f"✓ STOP_LIMIT replaced for {ticker} order_id={new_id}")
-        log_event(
-            'sell',
-            f"STOP LIVE {qty} {ticker} @ ${stop:.2f} (order {new_id})",
-            detail={
-                'ticker': ticker,
-                'order_id': new_id,
-                'old_order_id': order_id,
-                'stop_price': stop,
-                'limit_price': limit,
-                'quantity': qty,
-                'phase': 'live',
-                'order_type': 'STOP_LIMIT',
-                'replace': True,
-            },
-        )
         return new_id
     except Exception as e:
         print(f"Error replacing STOP_LIMIT for {ticker}: {e}")
@@ -6029,13 +6519,47 @@ def ensure_broker_stop_limit(
     existing_qty = stored.get('stop_order_qty')
     min_move = float(getattr(config, 'STOP_REPLACE_MIN_DOLLARS', 0.05))
     existing_s = str(existing_id) if existing_id else ''
-    is_sim_or_pending = (not existing_id) or existing_s in ('PENDING', 'SIM-STOP') or existing_s.startswith('SIM')
+    is_sim = existing_s in ('SIM-STOP',) or existing_s.startswith('SIM')
+    is_pending = existing_s == 'PENDING'
+    is_sim_or_pending = (not existing_id) or is_sim or is_pending
+
+    # Dry-run SIM stops: treat like live orders so we log set/moved once, not every pass.
+    # Live mode must still promote SIM → a real Schwab order.
+    if is_sim and trade_dry_run_enabled():
+        if existing_stop is not None and abs(float(existing_stop) - stop) < min_move:
+            if existing_qty is None or int(existing_qty) == qty:
+                return {
+                    'action': 'unchanged',
+                    'order_id': existing_id,
+                    'stop_price': float(existing_stop),
+                    'limit_price': stored.get('stop_limit_price'),
+                    'quantity': existing_qty,
+                }
+        order_id = place_stop_limit_sell(ticker, qty, stop, limit)
+        if order_id:
+            _emit_stop_limit_placed_or_moved(
+                ticker, stop, previous_stop=existing_stop,
+                extra={'order_id': order_id, 'quantity': qty, 'limit_price': limit},
+            )
+            return {
+                'action': 'replaced' if existing_stop is not None else 'placed',
+                'order_id': order_id,
+                'stop_price': stop,
+                'limit_price': limit,
+                'quantity': qty,
+            }
+        return {
+            'action': 'failed',
+            'reason': 'place failed',
+            'stop_price': stop,
+            'limit_price': limit,
+        }
 
     need_place = is_sim_or_pending or (
         existing_qty is not None and int(existing_qty) != qty
     )
     if need_place:
-        # Qty mismatch with live order, or promote SIM/PENDING → real place
+        # Qty mismatch with live order, or promote PENDING → real place
         if existing_id and not is_sim_or_pending:
             if existing_qty is not None and int(existing_qty) != qty:
                 cancel_stop_order(str(existing_id))
@@ -6044,6 +6568,10 @@ def ensure_broker_stop_limit(
             clear_position_stop_order(ticker)
         order_id = place_stop_limit_sell(ticker, qty, stop, limit)
         if order_id:
+            _emit_stop_limit_placed_or_moved(
+                ticker, stop, previous_stop=existing_stop,
+                extra={'order_id': order_id, 'quantity': qty, 'limit_price': limit},
+            )
             return {
                 'action': 'placed',
                 'order_id': order_id,
@@ -6069,6 +6597,10 @@ def ensure_broker_stop_limit(
 
     new_id = replace_stop_limit_sell(ticker, str(existing_id), qty, stop, limit)
     if new_id:
+        _emit_stop_limit_placed_or_moved(
+            ticker, stop, previous_stop=existing_stop,
+            extra={'order_id': new_id, 'quantity': qty, 'limit_price': limit},
+        )
         return {
             'action': 'replaced',
             'order_id': new_id,
@@ -6191,24 +6723,6 @@ def execute_buy(ticker: str, quantity: int):
                 else:
                     print(f"✓ Order placed successfully! (Response: {response.status_code})")
 
-                place_msg = (
-                    f"PLACING BUY {quantity} {ticker}"
-                    + (f" @ ~${float(price):.2f}" if price is not None else '')
-                    + (f" (order {order_id})" if order_id else '')
-                )
-                print(f"  {place_msg}")
-                log_event(
-                    'buy',
-                    place_msg,
-                    detail={
-                        'ticker': ticker,
-                        'quantity': quantity,
-                        'price': float(price) if price is not None else None,
-                        'order_id': order_id,
-                        'phase': 'placed',
-                    },
-                )
-
                 # Record as pending order (positions come from fetch_and_sync_schwab_positions when order fills)
                 order_amount_dollars = float(total) if total is not None else (float(price) * quantity) if price else 0.0
                 date_ordered = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
@@ -6265,20 +6779,18 @@ def execute_buy(ticker: str, quantity: int):
             traceback.print_exc()
             return
     else:
-        place_msg = (
-            f"DRY-RUN would PLACE BUY {quantity} {ticker}"
-            + (f" @ ~${float(price):.2f}" if price is not None else '')
+        print(
+            f"[DRY-RUN] {format_bought_log_message(ticker, quantity, price, dry_run=True)}"
         )
-        print(f"[DRY-RUN] {place_msg}")
         print(f"   (TRADE_DRY_RUN — no Schwab order; shares_owned not updated)")
         log_event(
             'buy',
-            place_msg,
+            format_bought_log_message(ticker, quantity, price, dry_run=True),
             detail={
                 'ticker': ticker,
                 'quantity': quantity,
                 'price': float(price) if price is not None else None,
-                'phase': 'placed',
+                'phase': 'filled',
                 'dry_run': True,
             },
         )
@@ -6521,91 +7033,6 @@ def summarize_trade_history(ticker: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
-def record_rebuy_guard(
-    ticker: str,
-    sell_price: Optional[float],
-    cost_basis: Optional[float] = None,
-) -> None:
-    """Remember last sell so we don't immediately re-buy the same name."""
-    init_database()
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        '''
-        INSERT INTO rebuy_guards (ticker, last_sell_price, last_cost_basis, last_sold_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(ticker) DO UPDATE SET
-            last_sell_price = excluded.last_sell_price,
-            last_cost_basis = COALESCE(excluded.last_cost_basis, rebuy_guards.last_cost_basis),
-            last_sold_at = excluded.last_sold_at
-        ''',
-        (ticker, sell_price, cost_basis, datetime.now().isoformat())
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_rebuy_guard(ticker: str) -> Optional[Dict[str, Any]]:
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            'SELECT last_sell_price, last_cost_basis, last_sold_at FROM rebuy_guards WHERE ticker = ?',
-            (ticker,)
-        )
-        row = cursor.fetchone()
-    except sqlite3.OperationalError:
-        row = None
-    conn.close()
-    if not row:
-        return None
-    return {
-        'last_sell_price': row[0],
-        'last_cost_basis': row[1],
-        'last_sold_at': row[2],
-    }
-
-
-def rebuy_allowed(ticker: str, price: float) -> Tuple[bool, str]:
-    """
-    After a sell, require a cheaper re-entry before buying again.
-    Default: price <= last_sell * (1 - REBUY_DISCOUNT_PCT).
-    Alternate: price < last cost basis (REBUY_RULE='below_cost').
-    """
-    guard = get_rebuy_guard(ticker)
-    if not guard:
-        return True, 'no prior sell guard'
-    rule = getattr(config, 'REBUY_RULE', 'below_sell_discount')
-    discount = float(getattr(config, 'REBUY_DISCOUNT_PCT', 0.05))
-    last_sell = guard.get('last_sell_price')
-    last_cost = guard.get('last_cost_basis')
-
-    if rule == 'below_cost':
-        if last_cost is None or float(last_cost) <= 0:
-            return True, 'no cost basis on guard'
-        ceiling = float(last_cost)
-        if price < ceiling:
-            return True, f'rebuy ok: ${price:.2f} < prior cost ${ceiling:.2f}'
-        return False, (
-            f'rebuy debounce: need price < prior cost ${ceiling:.2f} '
-            f'(now ${price:.2f}; sold {guard.get("last_sold_at")})'
-        )
-
-    # Default: below_sell_discount
-    if last_sell is None or float(last_sell) <= 0:
-        return True, 'no sell price on guard'
-    ceiling = float(last_sell) * (1.0 - discount)
-    if price <= ceiling:
-        return True, (
-            f'rebuy ok: ${price:.2f} <= {discount*100:.0f}% below sell '
-            f'(${float(last_sell):.2f} -> ceiling ${ceiling:.2f})'
-        )
-    return False, (
-        f'rebuy debounce: need <= ${ceiling:.2f} '
-        f'({discount*100:.0f}% below last sell ${float(last_sell):.2f}; now ${price:.2f})'
-    )
-
-
 def execute_sell(
     ticker: str,
     quantity: int,
@@ -6682,24 +7109,10 @@ def execute_sell(
                 'trail' if exit_kind == 'trail_stop' else 'hard',
                 trail_active=(exit_kind == 'trail_stop'),
             )
-            place_msg = (
-                f"PLACING MARKET SELL {quantity} {ticker}"
+            print(
+                f"  Placing market sell {quantity} {ticker}"
                 + (f" @ ~${float(sell_price):.2f}" if sell_price is not None else '')
-                + f" ({exit_info['short_label']}: {exit_info['summary']})"
-            )
-            print(f"  {place_msg}...")
-            log_event(
-                'sell',
-                place_msg,
-                detail={
-                    'ticker': ticker,
-                    'quantity': quantity,
-                    'price': sell_price,
-                    'exit_kind': exit_kind or exit_info['exit_kind'],
-                    'phase': 'placed',
-                    'order_type': 'MARKET',
-                    'reason': note,
-                },
+                + f" ({exit_info['short_label']})..."
             )
 
             response = SCHWAB_CLIENT.place_order(account_hash, order)
@@ -6724,7 +7137,6 @@ def execute_sell(
 
                 # Update watchlist shares owned (negative for sell, only after successful order)
                 update_shares_owned(ticker, -quantity)
-                record_rebuy_guard(ticker, sell_price=sell_price, cost_basis=cost_basis)
                 trade_note = (
                     f"PLACING MARKET SELL — order submitted "
                     f"({exit_info['short_label']})"
@@ -6742,10 +7154,9 @@ def execute_sell(
                     sync_schwab_account_after_order('sell')
                 except Exception as sync_err:
                     print(f"Warning: post-sell Schwab sync failed: {sync_err}")
-                sold_msg = (
-                    f"SOLD {ticker} via {exit_info['short_label']} — {quantity} sh"
-                    + (f" @ ~${float(sell_price):.2f}" if sell_price is not None else '')
-                    + (f" (order {order_id})" if order_id else '')
+                sold_msg = format_sold_log_message(
+                    ticker, quantity,
+                    float(sell_price) if sell_price is not None else None,
                 )
                 print(f"  {sold_msg}")
                 log_event(
@@ -6776,31 +7187,29 @@ def execute_sell(
             'trail' if exit_kind == 'trail_stop' else 'hard',
             trail_active=(exit_kind == 'trail_stop'),
         )
-        place_msg = (
-            f"DRY-RUN would PLACE MARKET SELL {quantity} {ticker}"
-            + (f" @ ~${float(sell_price):.2f}" if sell_price is not None else '')
-            + f" ({exit_info['short_label']}: {exit_info['summary']})"
+        sold_msg = format_sold_log_message(
+            ticker, quantity,
+            float(sell_price) if sell_price is not None else None,
+            dry_run=True,
         )
-        print(f"[DRY-RUN] {place_msg}")
+        print(f"[DRY-RUN] {sold_msg}")
         if note:
             print(f"   ({note})")
         print(f"   (TRADE_DRY_RUN — no Schwab order; shares_owned not updated)")
         log_event(
             'sell',
-            place_msg,
+            sold_msg,
             detail={
                 'ticker': ticker,
                 'quantity': quantity,
                 'price': sell_price,
                 'exit_kind': exit_kind or exit_info['exit_kind'],
-                'phase': 'placed',
+                'phase': 'filled',
                 'order_type': 'MARKET',
                 'dry_run': True,
                 'reason': note,
             },
         )
-        # Still record debounce so dry-run loops behave consistently
-        record_rebuy_guard(ticker, sell_price=sell_price, cost_basis=cost_basis)
         record_trade(
             'sell', ticker, quantity,
             price=float(sell_price) if sell_price is not None else None,
@@ -6960,24 +7369,28 @@ def reconcile_pending_orders(account_hash: Optional[str] = None) -> int:
         for row in cleared:
             qty = row.get('quantity')
             dollars = row.get('dollars')
-            px_s = ''
+            px = None  # type: Optional[float]
             try:
                 if qty and dollars and float(qty) > 0:
-                    px_s = f" @ ~${float(dollars) / float(qty):.2f}"
+                    px = float(dollars) / float(qty)
             except (TypeError, ValueError):
-                px_s = ''
-            msg = (
-                f"BOUGHT {row.get('ticker')}: fill confirmed — "
-                f"{qty} sh{px_s}"
-                + (f" (order {row.get('order_id')})" if row.get('order_id') else '')
-            )
+                px = None
+            ticker = row.get('ticker')
+            qty_i = None  # type: Optional[int]
+            try:
+                if qty is not None:
+                    qty_i = int(qty)
+            except (TypeError, ValueError):
+                qty_i = None
+            msg = format_bought_log_message(ticker, qty_i, px)
             print(f"  {msg}")
             log_event(
                 'buy',
                 msg,
                 detail={
-                    'ticker': row.get('ticker'),
+                    'ticker': ticker,
                     'quantity': qty,
+                    'price': px,
                     'order_id': row.get('order_id'),
                     'dollars': dollars,
                     'source': 'pending_reconcile',
@@ -8304,7 +8717,7 @@ def _update_position_trail_state(
 def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """
     Propose $ORDER_AMOUNT_DOLLARS buys from top of ranked watchlist.
-    Skips owned / pending / rebuy-debounce names; keeps proposing until cash floors block.
+    Skips owned / pending names; keeps proposing until cash floors block.
     Warns if cash can fund a buy but no watchlist name is eligible (loosen filter).
 
     Args:
@@ -8364,31 +8777,6 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
                     ),
                     'rank': rank,
                     'hint': 'schwab_price',
-                })
-            continue
-
-        ok_rebuy, rebuy_reason = rebuy_allowed(ticker, price)
-        if not ok_rebuy:
-            proposals.append({
-                'action': 'skip_buy',
-                'ticker': ticker,
-                'reason': rebuy_reason,
-                'price': price,
-                'rank': rank,
-            })
-            if top:
-                proposals.append({
-                    'action': 'warning',
-                    'ticker': ticker,
-                    'reason': (
-                        f"#{rank} watchlist {ticker} blocked by rebuy debounce "
-                        f"(@ ${price:.2f}) — {rebuy_reason}. "
-                        f"Still high by analyst upside; leave rule as-is or clear "
-                        f"rebuy_guards if you intentionally want back in sooner."
-                    ),
-                    'price': price,
-                    'rank': rank,
-                    'hint': 'rebuy_debounce',
                 })
             continue
 
@@ -8461,7 +8849,7 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         if can_fund:
             msg = (
                 f"Enough cash for a ${order_amount:.0f} buy, but no eligible "
-                f"watchlist names left (owned/pending/rebuy-debounce/no Schwab price). "
+                f"watchlist names left (owned/pending/no Schwab price). "
                 f"Consider loosening the '{active_watchlist_filter()}' filter "
                 f"or checking Schwab connectivity."
             )
@@ -8736,14 +9124,14 @@ def run_buy_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
             f"({sync.get('reason')}) — refusing stale owned/cash data"
         )
         print(f"  {msg}")
-        log_event('buy', msg, level='error', detail=sync)
+        log_event('task', msg, level='error', detail=sync)
         return [{
             'action': 'skip_buy',
             'ticker': None,
             'reason': msg,
         }]
     proposals = propose_buys()
-    emit_trade_pass_warnings(proposals, category='buy')
+    emit_trade_pass_warnings(proposals, category='task')
     for p in proposals:
         if p.get('action') == 'warning':
             print(f"  ⚠️  {p.get('reason')}")
@@ -8752,21 +9140,21 @@ def run_buy_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
         if p.get('action') == 'buy' and not dry_run:
             execute_buy(p['ticker'], int(p['quantity']))
         elif p.get('action') == 'buy' and dry_run:
-            msg = (
-                f"DRY-RUN would BUY {p.get('quantity')} {p.get('ticker')} "
-                f"@ ${p.get('price'):.2f}"
-            )
+            qty = p.get('quantity')
+            tkr = p.get('ticker')
+            px = p.get('price')
+            msg = format_bought_log_message(tkr, qty, px, dry_run=True)
             print(f"    ({msg})")
             log_event(
                 'buy',
                 msg,
                 detail={
-                    'ticker': p.get('ticker'),
-                    'quantity': p.get('quantity'),
-                    'price': p.get('price'),
+                    'ticker': tkr,
+                    'quantity': qty,
+                    'price': px,
                     'dollars': p.get('dollars'),
                     'reason': p.get('reason'),
-                    'phase': 'placed',
+                    'phase': 'filled',
                     'dry_run': True,
                 },
             )
@@ -8784,14 +9172,14 @@ def run_sell_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
             f"({sync.get('reason')}) — refusing stale shares/marks"
         )
         print(f"  {msg}")
-        log_event('sell', msg, level='error', detail=sync)
+        log_event('task', msg, level='error', detail=sync)
         return [{
             'action': 'skip_sell',
             'ticker': None,
             'reason': msg,
         }]
     proposals = propose_sells()
-    emit_trade_pass_warnings(proposals, category='sell')
+    emit_trade_pass_warnings(proposals, category='task')
     for p in proposals:
         if p.get('action') == 'warning':
             print(f"  ⚠️  {p.get('reason')}")
@@ -8802,7 +9190,7 @@ def run_sell_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
             exit_info = describe_sell_exit(p.get('stop_kind'), bool(p.get('trail_active')))
             exit_kind = p.get('exit_kind') or exit_info['exit_kind']
             qty = int(p.get('quantity') or 0)
-            # execute_sell logs PLACING / SOLD (or dry-run PLACE)
+            # execute_sell logs SOLD (or dry-run SOLD)
             if dry_run:
                 execute_sell(
                     ticker,
@@ -8822,53 +9210,46 @@ def run_sell_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
                 exit_kind=exit_kind,
             )
         elif p.get('action') == 'defer_stop_limit':
-            # Same-day purchase: cancel any resting stop; do not arm until next ET day.
-            msg = (
-                f"STOP deferred for {ticker} (PDT same-day rule) — {p.get('reason')}"
-            )
-            print(f"    ({msg})")
+            # Same-day purchase: cancel any resting stop; log once until it is placed.
+            stop_px = p.get('stop_price')
+            already = _stop_defer_already_logged(ticker)
             if not dry_run:
                 try:
                     cancel_position_broker_stop(ticker)
                 except Exception as e:
                     print(f"  Warning: cancel deferred stop for {ticker}: {e}")
-            log_event(
-                'sell',
-                msg,
-                detail={
-                    'ticker': ticker,
+            if already:
+                continue
+            if stop_px is None:
+                continue
+            log_stop_limit_event(
+                ticker,
+                float(stop_px),
+                deferred=True,
+                dry_run=bool(dry_run),
+                extra={
                     'quantity': p.get('quantity'),
-                    'stop_price': p.get('stop_price'),
                     'reason': p.get('reason'),
-                    'phase': 'deferred',
-                    'order_type': 'STOP_LIMIT',
-                    'dry_run': bool(dry_run),
                 },
             )
-        elif p.get('action') == 'place_stop_limit' and dry_run:
-            # Forced dry-run while live mode may be on — log explicitly.
-            limit = stop_limit_price_from_stop(float(p.get('stop_price') or 0))
-            msg = (
-                f"DRY-RUN would ARM STOP {p.get('quantity')} {ticker} "
-                f"@ ${p.get('stop_price'):.2f} (limit ${limit:.2f})"
-            )
-            print(f"    ({msg})")
-            log_event(
-                'sell',
-                msg,
-                detail={
-                    'ticker': ticker,
+            _set_stop_defer_logged(ticker, True)
+        elif p.get('action') == 'place_stop_limit' and dry_run and not trade_dry_run_enabled():
+            # Forced dry-run while live mode is on — log only, do not submit.
+            stop_px = p.get('stop_price')
+            if stop_px is None:
+                continue
+            stored = get_position_stop_order(ticker)
+            _emit_stop_limit_placed_or_moved(
+                ticker,
+                float(stop_px),
+                previous_stop=stored.get('stop_order_price'),
+                extra={
                     'quantity': p.get('quantity'),
-                    'stop_price': p.get('stop_price'),
-                    'limit_price': limit,
                     'reason': p.get('reason'),
-                    'phase': 'armed',
-                    'order_type': 'STOP_LIMIT',
                     'dry_run': True,
                 },
             )
-        elif p.get('action') == 'place_stop_limit' and not dry_run:
-            # place/replace helpers log PLACING STOP-LIMIT + resting ack
+        elif p.get('action') == 'place_stop_limit':
             result = ensure_broker_stop_limit(
                 ticker,
                 int(p['quantity']),
@@ -9538,8 +9919,6 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
     min_liq = minimum_liquidation_value()
     order_amt = order_amount_dollars()
     filter_name = str(active_watchlist_filter())
-    rebuy_rule = str(getattr(config, 'REBUY_RULE', 'below_sell_discount'))
-    rebuy_pct = float(getattr(config, 'REBUY_DISCOUNT_PCT', 0.05)) * 100.0
     trail_act = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10)) * 100.0
     trail_buf = float(getattr(config, 'TRAIL_BUFFER_PCT', 0.05)) * 100.0
     trail_off = float(getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.03)) * 100.0
@@ -9553,13 +9932,6 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
     close_m = int(getattr(config, 'MARKET_CLOSE_MINUTE', 0))
     tz = str(getattr(config, 'MARKET_TIMEZONE', 'America/New_York'))
     session = '%d:%02d–%d:%02d %s' % (open_h, open_m, close_h, close_m, tz)
-
-    if rebuy_rule == 'below_cost':
-        rebuy_set = 'Price must be below last cost basis'
-        rebuy_why = 'Wait for a cheaper re-entry after a sell vs original average'
-    else:
-        rebuy_set = '≤ last sell price − %.0f%%' % rebuy_pct
-        rebuy_why = 'Avoid immediately chasing the same name after a sell'
 
     rules = [
         {
@@ -9606,12 +9978,6 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
             'title': 'Fixed buy size',
             'set_to': '~$%s per new name' % '{:,.0f}'.format(order_amt),
             'why': 'Keeps position sizing consistent and cash-floor math simple',
-        },
-        {
-            'id': 'rebuy_debounce',
-            'title': 'Re-buy debounce after a sell',
-            'set_to': rebuy_set,
-            'why': rebuy_why,
         },
         {
             'id': 'trail_activate',
@@ -10431,7 +10797,7 @@ def get_dashboard_events(
     uid = _uid()
     user = uc.get_user_by_id(uid) or {}
 
-    allowed = {'buy', 'sell', 'watchlist', 'task'}
+    allowed = {'buy', 'sell', 'stop-limit', 'watchlist', 'task'}
     cats = []  # type: List[str]
     if categories:
         for raw in categories:

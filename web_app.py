@@ -448,7 +448,7 @@ def api_events(
     limit: int = Query(50, ge=1, le=500),
     categories: Optional[str] = Query(
         None,
-        description='Comma-separated: buy,sell,watchlist,task',
+        description='Comma-separated: buy,sell,stop-limit,watchlist,task',
     ),
     before_id: Optional[int] = Query(
         None,

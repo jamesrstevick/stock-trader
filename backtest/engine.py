@@ -37,7 +37,6 @@ class SimConfig:
     trail_activate_pct: float = 0.10
     trail_buffer_pct: float = 0.05
     hard_stop_pct: float = -0.10
-    rebuy_discount_pct: float = 0.05
 
 
 @dataclass
@@ -195,7 +194,6 @@ def run_daily_sim(
 
     cash = float(cfg.starting_cash)
     positions = {}  # type: Dict[str, Position]
-    last_sell_price = {}  # type: Dict[str, float]
     trade_count = 0
     equity_curve = []  # type: List[Dict[str, Any]]
 
@@ -224,10 +222,6 @@ def run_daily_sim(
             open_px = float(bar.get('Open') or 0)
             if open_px <= 0:
                 continue
-            if ticker in last_sell_price:
-                floor = last_sell_price[ticker] * (1.0 - float(cfg.rebuy_discount_pct))
-                if open_px > floor:
-                    continue
             shares = int(float(cfg.order_amount) // open_px)
             if shares < 1:
                 continue
@@ -303,7 +297,6 @@ def run_daily_sim(
             if pos is None:
                 continue
             cash += pos.shares * fill_px
-            last_sell_price[ticker] = fill_px
             trade_count += 1
 
         # Mark-to-market equity

@@ -141,7 +141,6 @@ def sim_config_from_live(cash: float) -> SimConfig:
         trail_activate_pct=float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10)),
         trail_buffer_pct=float(getattr(config, 'TRAIL_BUFFER_PCT', 0.05)),
         hard_stop_pct=float(getattr(config, 'HARD_STOP_ON_WATCHLIST_PCT', -0.10)),
-        rebuy_discount_pct=float(getattr(config, 'REBUY_DISCOUNT_PCT', 0.05)),
     )
 
 

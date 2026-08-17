@@ -416,7 +416,7 @@ table.data .pos-status-muted { color: var(--muted); }
 
 .event {
   display: grid;
-  grid-template-columns: 5.5rem 4.25rem 5.5rem 1fr;
+  grid-template-columns: 5.5rem 4.25rem 7.75rem 1fr;
   gap: 0.5rem 0.75rem;
   padding: 0.65rem 0;
   border-bottom: 1px solid var(--line);
@@ -424,7 +424,7 @@ table.data .pos-status-muted { color: var(--muted); }
   align-items: start;
 }
 .event.with-user {
-  grid-template-columns: 5.5rem 4.25rem 4.5rem 5.5rem 1fr;
+  grid-template-columns: 5.5rem 4.25rem 4.5rem 7.75rem 1fr;
 }
 .event:last-child { border-bottom: 0; }
 .event .ts { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 0.82rem; }
@@ -451,6 +451,7 @@ table.data .pos-status-muted { color: var(--muted); }
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--accent);
+  white-space: nowrap;
 }
 .event.warn { background: rgba(154, 52, 18, 0.04); }
 .event.error { background: rgba(159, 18, 57, 0.04); }
