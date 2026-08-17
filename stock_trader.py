@@ -1632,7 +1632,7 @@ _LOG_CATEGORY_ALIASES = {
 
 # Bump when user-facing event_log copy changes. Next process start rewrites stored rows
 # (DELL Pull from GitHub restarts the loop/dashboard, so this is "first pull").
-_EVENT_LOG_CLEAN_VERSION = 3
+_EVENT_LOG_CLEAN_VERSION = 4
 _EVENT_LOG_CLEAN_FLAG = 'event_log_clean_version'
 _LOG_TICKER_RE = re.compile(r'\b([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b')
 _LOG_MONEY_RE = re.compile(r'\$([0-9]+(?:\.[0-9]+)?)')
@@ -1765,8 +1765,9 @@ def format_stop_limit_log_message(
             prev = float(previous_stop)
             new = float(stop_price)
             verb = 'increased' if new >= prev else 'decreased'
+            delta = round(abs(new - prev), 2)
             return 'STOP-LIMIT %s %s to %s for %s' % (
-                verb, _fmt_log_px(prev), _fmt_log_px(new), ticker,
+                verb, _fmt_log_px(delta), _fmt_log_px(new), ticker,
             )
         except (TypeError, ValueError):
             pass
@@ -1971,7 +1972,22 @@ def _legacy_event_plan(
         )
         if bumped:
             tkr = bumped.group(3).upper()
+            first_px = float(bumped.group(1))
             new_px = float(bumped.group(2))
+            # Older copy used the previous stop as the first dollar amount.
+            # New copy uses the change size (usually much smaller than the stop).
+            if new_px > 0 and first_px >= new_px * 0.5:
+                prev_px = first_px
+                return {
+                    'action': 'update',
+                    'category': 'stop-limit',
+                    'message': format_stop_limit_log_message(
+                        tkr, new_px, previous_stop=prev_px,
+                    ),
+                    'kind': 'stop_moved',
+                    'ticker': tkr,
+                    'stop_px': new_px,
+                }
             return {
                 'action': 'update' if cat != 'stop-limit' else 'keep',
                 'category': 'stop-limit',
