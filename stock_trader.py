@@ -1630,7 +1630,10 @@ _LOG_CATEGORY_ALIASES = {
     'stop': 'stop-limit',
 }
 
-_EVENT_LOG_CLEAN_FLAG = 'event_log_clean_v1'
+# Bump when user-facing event_log copy changes. Next process start rewrites stored rows
+# (DELL Pull from GitHub restarts the loop/dashboard, so this is "first pull").
+_EVENT_LOG_CLEAN_VERSION = 2
+_EVENT_LOG_CLEAN_FLAG = 'event_log_clean_version'
 _LOG_TICKER_RE = re.compile(r'\b([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b')
 _LOG_MONEY_RE = re.compile(r'\$([0-9]+(?:\.[0-9]+)?)')
 _LOG_QTY_SH_RE = re.compile(r'(?:^|\s)(\d+)\s+sh\b', re.I)
@@ -1759,8 +1762,11 @@ def format_stop_limit_log_message(
         )
     if previous_stop is not None:
         try:
-            return 'STOP-LIMIT moved from %s to %s for %s' % (
-                _fmt_log_px(previous_stop), px, ticker,
+            prev = float(previous_stop)
+            new = float(stop_price)
+            verb = 'increased' if new >= prev else 'decreased'
+            return 'STOP-LIMIT %s %s to %s for %s' % (
+                verb, _fmt_log_px(prev), _fmt_log_px(new), ticker,
             )
         except (TypeError, ValueError):
             pass
@@ -1936,14 +1942,45 @@ def _legacy_event_plan(
     if msg.startswith('STOP-LIMIT '):
         tkr = ticker
         if not tkr:
-            fm = re.search(r'\bfor\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\s*$', msg)
+            fm = re.search(r'\bfor\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b', msg)
             if fm:
                 tkr = fm.group(1)
+        moved = re.match(
+            r'^STOP-LIMIT moved from \$([0-9.]+) to \$([0-9.]+) for ([A-Z]{1,6}(?:\.[A-Z]{1,2})?)',
+            msg,
+        )
+        if moved:
+            tkr = moved.group(3).upper()
+            prev_px = float(moved.group(1))
+            new_px = float(moved.group(2))
+            return {
+                'action': 'update',
+                'category': 'stop-limit',
+                'message': format_stop_limit_log_message(
+                    tkr, new_px, previous_stop=prev_px,
+                ),
+                'kind': 'stop_moved',
+                'ticker': tkr,
+                'stop_px': new_px,
+            }
+        bumped = re.match(
+            r'^STOP-LIMIT (?:increased|decreased) \$([0-9.]+) to \$([0-9.]+) for ([A-Z]{1,6}(?:\.[A-Z]{1,2})?)',
+            msg,
+        )
+        if bumped:
+            tkr = bumped.group(3).upper()
+            new_px = float(bumped.group(2))
+            return {
+                'action': 'update' if cat != 'stop-limit' else 'keep',
+                'category': 'stop-limit',
+                'message': msg,
+                'kind': 'stop_moved',
+                'ticker': tkr,
+                'stop_px': new_px,
+            }
         kind = 'stop_set'
         if '(deferred to avoid same-day trading)' in msg:
             kind = 'stop_deferred'
-        elif ' moved from ' in msg:
-            kind = 'stop_moved'
         return {
             'action': 'update' if cat != 'stop-limit' else 'keep',
             'category': 'stop-limit',
@@ -2128,15 +2165,28 @@ def _legacy_event_plan(
 
 
 def _rewrite_legacy_event_log(conn: sqlite3.Connection) -> None:
-    """One-time cleanup of stored Log rows (set/moved copy, drop placing noise)."""
+    """Rewrite stored Log rows when _EVENT_LOG_CLEAN_VERSION is bumped."""
     cursor = conn.cursor()
+    stored_ver = 0
     try:
         cursor.execute(
             'SELECT value FROM runtime_flags WHERE key = ?',
             (_EVENT_LOG_CLEAN_FLAG,),
         )
         flag = cursor.fetchone()
-        if flag and str(flag[0]) == '1':
+        if flag:
+            try:
+                stored_ver = int(flag[0])
+            except (TypeError, ValueError):
+                stored_ver = 0
+        if stored_ver < 1:
+            cursor.execute(
+                "SELECT value FROM runtime_flags WHERE key = 'event_log_clean_v1'"
+            )
+            legacy = cursor.fetchone()
+            if legacy and str(legacy[0]) == '1':
+                stored_ver = 1
+        if stored_ver >= int(_EVENT_LOG_CLEAN_VERSION):
             return
     except sqlite3.OperationalError:
         return
@@ -2227,7 +2277,7 @@ def _rewrite_legacy_event_log(conn: sqlite3.Connection) -> None:
         ''',
         (
             _EVENT_LOG_CLEAN_FLAG,
-            '1',
+            str(int(_EVENT_LOG_CLEAN_VERSION)),
             datetime.now().isoformat(timespec='seconds'),
         ),
     )

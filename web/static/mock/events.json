@@ -12,7 +12,7 @@
       "ts": "2026-08-03T17:52:00",
       "level": "info",
       "category": "stop-limit",
-      "message": "STOP-LIMIT moved from $68.00 to $70.20 for MET"
+      "message": "STOP-LIMIT increased $68.00 to $70.20 for MET"
     },
     {
       "id": 4,

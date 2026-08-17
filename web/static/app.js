@@ -2553,11 +2553,11 @@
     }
   }
 
-  // Viewer tags. Activity (Buy/Sell/STOP-LIMIT/Watchlist) is the default view; Tasks is ops noise.
+  // Viewer tags. Activity (Buy/Sell/Stop/Watchlist) is the default view; Tasks is ops noise.
   var LOG_CATEGORIES = [
     { id: 'buy', label: 'Buy', meaning: 'Actual buys after the order fills.' },
     { id: 'sell', label: 'Sell', meaning: 'Actual sales after the order fills.' },
-    { id: 'stop-limit', label: 'STOP-LIMIT', meaning: 'Protective stop set, moved, or deferred.' },
+    { id: 'stop-limit', label: 'Stop', meaning: 'Protective stop set, moved, or deferred.' },
     { id: 'watchlist', label: 'Watchlist', meaning: 'Watchlist refresh from the filter (adds/removes).' },
     { id: 'task', label: 'Tasks', meaning: 'Scheduler noise: task start/finish, Yahoo batches, Schwab sync, account snapshots.' }
   ];
@@ -2637,11 +2637,11 @@
     if (!hint) return;
     var keys = Object.keys(logFilterSelected);
     if (!keys.length) {
-      hint.textContent = 'Showing all. Tip: leave Buy + Sell + STOP-LIMIT + Watchlist on for the trading story; add Tasks for scheduler/Yahoo noise.';
+      hint.textContent = 'Showing everything. Click a pill to focus.';
       return;
     }
     var labels = keys.map(logCategoryLabel);
-    hint.textContent = 'Showing: ' + labels.join(' + ') + '. Click a pill again to remove it.';
+    hint.textContent = 'Showing ' + labels.join(', ') + '. Click a pill to hide it.';
   }
 
   function logDayKey(ts) {
@@ -2722,7 +2722,7 @@
     if (!logHasMore) {
       var end = document.createElement('span');
       end.className = 'log-end';
-      end.textContent = 'End of log';
+      end.textContent = 'End of events';
       foot.appendChild(end);
       return;
     }
@@ -2742,7 +2742,7 @@
       return Object.assign({}, ev, { _cat: normalizeLogCategory(ev) });
     });
     if (!logEventsCache.length) {
-      box.innerHTML = '<div class="empty">No events yet. Run the trader or Yahoo refresh to generate log rows.</div>';
+      box.innerHTML = '<div class="empty">No events yet.</div>';
       renderLogMore();
       return;
     }

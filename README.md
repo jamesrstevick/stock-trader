@@ -29,7 +29,7 @@ Exact values come from `config.py` and show live on the About page.
 | Page | Purpose |
 |------|---------|
 | **Trader** | Positions, orders, algo scorecard + next tasks, performance vs S&P 500 |
-| **Log** | Trading story by default (Buy / Sell / Watchlist); Tasks pill for scheduler noise |
+| **Events** | Buys, sells, stops, and watchlist changes |
 | **Actions** | **Schwab reconnect** (paste-back OAuth) and future remote controls |
 | **About** | System overview, active filter, jobs, trading rules |
 
@@ -141,7 +141,7 @@ stock-trader/
 ├── backtest_daily.py   # Side CLI: daily multi-start backtest vs SPY
 ├── backtest/           # Backtest engine (not used by live loop)
 ├── test_functions.py   # Function-level tests
-├── web/static/         # About / Trader / Log / Actions UI
+├── web/static/         # About / Trader / Events / Actions UI
 └── requirements.txt
 ```
 
