@@ -316,6 +316,31 @@ table.data tbody tr.watchlist-owned td {
 
 .prose p { line-height: 1.6; margin: 0 0 0.85rem; color: var(--ink); }
 .prose ul { margin: 0 0 1rem; padding-left: 1.2rem; color: var(--muted); line-height: 1.55; }
+.prose h3 {
+  font-family: var(--display);
+  font-size: 1.05rem;
+  font-weight: 700;
+  margin: 1.15rem 0 0.45rem;
+  color: var(--ink);
+}
+.how-flow {
+  list-style: none;
+  margin: 0.5rem 0 0.35rem;
+  padding: 0;
+}
+.how-flow > li {
+  padding: 0.85rem 0 0.15rem;
+  border-top: 1px solid var(--line);
+}
+.how-flow > li:first-child {
+  border-top: 0;
+  padding-top: 0.15rem;
+}
+.how-flow h3 {
+  margin: 0 0 0.4rem;
+}
+.how-flow p { color: var(--ink); }
+.how-flow ul { margin-bottom: 0.35rem; }
 
 table.data {
   width: 100%;

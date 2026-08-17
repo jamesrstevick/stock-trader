@@ -55,9 +55,10 @@
       <section id="page-about" class="page">
         <h1>What this system does</h1>
         <p class="lead">
-          An always-on trading assistant: it refreshes market fundamentals from Yahoo,
-          maintains a filtered watchlist, proposes buys under cash floors, and watches
-          open positions with trail / hard-stop rules — with dry-run as the default safety net.
+          An always-on trading assistant that runs on a home computer: it keeps market
+          data fresh, builds a watchlist from a filter you choose, buys under cash
+          rules, and protects open positions with stop orders — paper-trading first
+          until someone chooses to go live.
         </p>
         <div class="meta-row" id="home-pills"></div>
         <div class="cards" id="home-cards"></div>
@@ -65,28 +66,111 @@
         <div class="panel prose">
           <h2>How it runs</h2>
           <p>
-            On your home machine (or Pi), <code>python main.py --loop</code> wakes on a schedule:
+            The bot lives on a personal computer (or a small always-on machine at home).
+            Passwords, Schwab login tokens, and the trading database stay on that machine.
+            This page is only a window into it.
           </p>
-          <ul>
-            <li><strong>Yahoo refresh</strong> — oldest / missing tickers first (~150/hour), skips names already updated today, keeps the universe roughly within a few days.</li>
-            <li><strong>Watchlist + buys</strong> — re-ranks with the active filter below, then considers ~$1k buys when cash rules allow.</li>
-            <li><strong>Sell check</strong> — every ~15 minutes: arm trails after +10%, ratchet stops, hard stops when the thesis (watchlist) changes.</li>
-          </ul>
           <p>
-            This page is read-only. Live data comes from the local API behind Cloudflare Tunnel
-            (or mock fixtures when designing offline).
+            A scheduler wakes on a loop during the US stock session and walks the same
+            pipeline for each account: refresh data, rebuild the watchlist, consider buys,
+            then check stops and sells.
           </p>
+
+          <ol class="how-flow">
+            <li>
+              <h3>1. Set up an account</h3>
+              <p>
+                On <strong>Actions</strong>, each person connects their own Schwab account
+                and sets a few guardrails. Until those are set, the bot will not trade.
+              </p>
+              <ul>
+                <li><strong>Schwab link</strong> — so the bot can see cash, positions, and (later) place orders.</li>
+                <li><strong>Cash floor</strong> — never buy if the purchase would leave cash below this amount. Sells still run.</li>
+                <li><strong>Account-value floor</strong> — no new buys while the whole account (cash + positions) is below this. Sells still run.</li>
+                <li><strong>Buy size</strong> — how many dollars to spend on each new stock (whole shares only; it will not add to a name already owned).</li>
+                <li><strong>Watchlist filter</strong> — Safe Giant, Risky Momentum, or a custom recipe. That filter is the only source of new buys.</li>
+                <li><strong>Dry-run, then Go live</strong> — it starts by logging what it would do. Real Schwab orders wait until someone presses Go live.</li>
+              </ul>
+            </li>
+            <li>
+              <h3>2. Market data from Yahoo</h3>
+              <p>
+                Fundamentals for the US stock universe come from Yahoo Finance — things like
+                price, market cap, P/E, beta, short interest, dividend yield, and analyst targets.
+                That database is shared: every account reads the same numbers.
+              </p>
+              <p>
+                A background job works through the oldest or missing tickers first (about 150
+                per hour), skips names already updated today, and keeps the universe within a
+                few days of fresh. The cards above are that shared snapshot.
+              </p>
+            </li>
+            <li>
+              <h3>3. Filter into a watchlist</h3>
+              <p>
+                The chosen filter is applied to that Yahoo data. Names that fail a rule drop
+                out; the rest are ranked (usually by analyst upside — how far the consensus
+                target sits above the current price). The result is the watchlist: the only
+                list the bot is allowed to buy from. Built-in recipes are in the table below;
+                a custom filter can be built on Actions.
+              </p>
+            </li>
+            <li>
+              <h3>4. Buys</h3>
+              <p>
+                During regular hours (9:30–4:00 p.m. New York), the bot looks at the top of
+                the watchlist and, when cash and account-value floors allow, places one
+                buy of the chosen size. It will not pick random tickers, will not buy
+                after hours, and in dry-run it only writes a log of what it would have sent
+                to Schwab.
+              </p>
+            </li>
+            <li>
+              <h3>5. Stop limits</h3>
+              <p>
+                After a buy, the bot does not arm a broker stop on the same calendar day
+                (that would risk a same-day round trip). Starting the next trading day, a
+                protective <strong>STOP_LIMIT</strong> sits at Schwab so the position is
+                covered even if the home machine is briefly offline.
+              </p>
+              <ul>
+                <li><strong>Trailing stop</strong> — once a position is up enough from cost, the stop follows the peak down by a buffer; it only ratchets up, never down.</li>
+                <li><strong>Tighter off-watchlist</strong> — if the name later fails the filter, the buffer and hard floor tighten.</li>
+                <li><strong>Hard stop</strong> — a last-resort floor versus the purchase price if a trail never armed, or the thesis is gone.</li>
+              </ul>
+            </li>
+            <li>
+              <h3>6. Sells</h3>
+              <p>
+                About every 15 minutes while the market is open, a sell check looks at
+                enrolled positions: ratchet trails, honor hard stops, and update the resting
+                Schwab order. Holdings marked as legacy (owned before the algorithm) are left
+                alone until they are enrolled. Buys can be paused without turning off this
+                sell protection.
+              </p>
+            </li>
+          </ol>
+
+          <h3>Where to look</h3>
+          <ul>
+            <li><strong>Trader</strong> — positions, open orders, the live watchlist, and performance versus the S&amp;P 500.</li>
+            <li><strong>Events</strong> — a log of buys, sells, stops, and watchlist changes.</li>
+            <li><strong>Actions</strong> — Schwab connection, floors and buy size, filter choice, Run / Pause / Go live.</li>
+          </ul>
         </div>
 
         <div class="panel" id="filter-panel">
           <div class="filter-head">
-            <h2 id="filter-title">Watchlist filter</h2>
+            <h2 id="filter-title">Built-in filters</h2>
             <label class="filter-select-wrap">
               <span class="sr-only">Choose filter to view</span>
-              <select id="filter-select" aria-label="Watchlist filter"></select>
+              <select id="filter-select" aria-label="Built-in watchlist filter"></select>
             </label>
           </div>
-          <div class="meta-row" id="filter-pills"></div>
+          <p class="rules-intro">
+            These are the shared recipes, not anyone's live watchlist. Use the dropdown to
+            read each rule set.
+          </p>
           <p class="filter-summary" id="filter-summary"></p>
           <p class="filter-ranking" id="filter-ranking"></p>
           <div class="scroll-x">
@@ -103,17 +187,6 @@
             </table>
           </div>
           <div id="filter-disabled" class="filter-disabled" hidden></div>
-        </div>
-
-        <div class="panel">
-          <h2>Scheduled jobs</h2>
-          <ul class="job-list" id="home-jobs"></ul>
-        </div>
-
-        <div class="panel" id="rules-panel">
-          <h2>Trading rules</h2>
-          <p class="rules-intro">Guardrails the bot follows, from the basics up. Values come from live config.</p>
-          <ol class="rules-list" id="rules-list"></ol>
         </div>
       </section>
 

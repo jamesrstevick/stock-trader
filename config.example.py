@@ -106,6 +106,10 @@ SESSION_DAYS = 30
 BOOTSTRAP_USERNAME = 'jame'
 BOOTSTRAP_PASSWORD = 'change-me'
 BOOTSTRAP_DISPLAY_NAME = 'Jame'
+# View-only login: sees this user's live dashboard; Action buttons are no-ops.
+# Leave password empty to disable. Must differ from the owner's real password.
+DEMO_VIEWER_USERNAME = 'jame'
+DEMO_VIEWER_PASSWORD = ''
 
 # WATCHLIST_FILTER_NAME seeds each user's active_filter on first create.
 # New users always start with trade_dry_run=1 (Dry Run), regardless of TRADE_DRY_RUN.

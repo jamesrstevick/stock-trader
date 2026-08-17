@@ -12,6 +12,10 @@
     return !!window.TRADER_USE_MOCK;
   }
 
+  function isReadOnly() {
+    return !!(currentUser && currentUser.read_only);
+  }
+
   function payloadUserMismatch(data, response) {
     if (!currentUser || currentUser.id == null) return false;
     var id = null;
@@ -61,6 +65,9 @@
   }
 
   async function postJson(path, body) {
+    if (isReadOnly() && String(path || '').indexOf('/api/logout') !== 0) {
+      return { ok: false, noop: true, error: 'read_only' };
+    }
     if (useMock()) {
       if (path.indexOf('/api/host') === 0) {
         return {
@@ -456,6 +463,40 @@
 
   var lastStatusPayload = null;
   var currentUser = null;
+
+  function mergeSessionUser(next) {
+    if (!next) return;
+    var keepRo = isReadOnly() || !!next.read_only;
+    currentUser = next;
+    if (keepRo) currentUser.read_only = true;
+  }
+
+  function isViewOnlyControl(btn) {
+    if (!btn) return false;
+    if (btn.getAttribute('data-page')) return true;
+    if (btn.getAttribute('data-range')) return true;
+    if (btn.getAttribute('data-cat')) return true;
+    var id = btn.id || '';
+    if (
+      id === 'nav-logout' ||
+      id === 'btn-refresh-log' ||
+      id === 'watchlist-expand-btn' ||
+      id === 'watchlist-owned-filter'
+    ) {
+      return true;
+    }
+    if (btn.closest && btn.closest('#log-more')) return true;
+    return false;
+  }
+
+  document.addEventListener('click', function (ev) {
+    if (!isReadOnly()) return;
+    var btn = ev.target && ev.target.closest ? ev.target.closest('button') : null;
+    if (!btn) return;
+    if (isViewOnlyControl(btn)) return;
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+  }, true);
   var hostBusy = false;
   var lastOnboardingStage = 'done';
   var setupEditing = false;
@@ -650,7 +691,7 @@
     try {
       var data = await fetchJson('/api/status');
       lastStatusPayload = data;
-      if (data.user) currentUser = data.user;
+      if (data.user) mergeSessionUser(data.user);
       var schwab = data.schwab || await fetchJson('/api/schwab/auth');
       var stage = data.onboarding_stage ||
         (data.account_setup && data.account_setup.onboarding_stage) ||
@@ -978,6 +1019,7 @@
   }
 
   function scheduleFilterPreview() {
+    if (isReadOnly()) return;
     var el = document.getElementById('filter-match-count');
     if (filterBuilderState.debounce) clearTimeout(filterBuilderState.debounce);
     filterBuilderState.debounce = setTimeout(async function () {
@@ -1164,6 +1206,7 @@
   }
 
   async function runHostAction(action) {
+    if (isReadOnly()) return;
     var confirmMsg = action === 'pull'
       ? 'Pull the latest GitHub commit onto this machine and restart the trader, dashboard, and tunnel? The site will drop for a few seconds.'
       : 'Restart the trader loop, dashboard, and tunnel on this machine? The site will drop for a few seconds.';
@@ -1209,6 +1252,7 @@
   }
 
   function openSchwabLogin() {
+    if (isReadOnly()) return;
     var url = (lastSchwabStatus && lastSchwabStatus.authorize_url) || '';
     if (!url) {
       setSchwabFeedback('Authorize URL not loaded yet — refresh and try again.', false);
@@ -1229,6 +1273,7 @@
   }
 
   async function copySchwabLoginLink() {
+    if (isReadOnly()) return;
     var url = (lastSchwabStatus && lastSchwabStatus.authorize_url) || '';
     if (!url) {
       setSchwabFeedback('Authorize URL not loaded yet.', false);
@@ -1248,6 +1293,7 @@
   }
 
   async function submitSchwabCallback() {
+    if (isReadOnly()) return;
     var input = document.getElementById('schwab-callback-input');
     var submit = document.getElementById('schwab-submit');
     var redirect = (lastSchwabStatus && lastSchwabStatus.redirect_uri) || 'https://127.0.0.1';
@@ -1441,6 +1487,7 @@
     }
 
     async function algoAction(action) {
+      if (isReadOnly()) return;
       setActionFeedback('algo-feedback', 'Working…', true);
       var filter = (document.getElementById('algo-filter-select') || {}).value || null;
       try {
@@ -1596,6 +1643,7 @@
     }
 
     async function submitResetPassword() {
+      if (isReadOnly()) return;
       if (!hasValue() || saveBtn.disabled) return;
       var value = input.value;
       saveBtn.disabled = true;
@@ -1743,7 +1791,7 @@
     if (!title || !tbody) return;
 
     if (!filter) {
-      title.textContent = 'Watchlist filter';
+      if (title) title.textContent = 'Built-in filters';
       if (summary) summary.textContent = 'Filter description unavailable.';
       if (ranking) ranking.textContent = '';
       tbody.innerHTML = '<tr><td colspan="4" class="empty">No filter metadata.</td></tr>';
@@ -1754,8 +1802,7 @@
       return;
     }
 
-    var label = filter.title || filter.name || 'Watchlist';
-    title.textContent = 'Watchlist filter';
+    if (title) title.textContent = 'Built-in filters';
     if (summary) summary.textContent = filter.summary || '';
     if (ranking) {
       ranking.textContent = filter.ranking ? 'Ranking: ' + filter.ranking : '';
@@ -1772,7 +1819,7 @@
       tbody.appendChild(tr);
     });
     if (!(filter.criteria || []).length) {
-      tbody.innerHTML = '<tr><td colspan="4" class="empty">No active criteria listed.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">No criteria listed.</td></tr>';
     }
 
     if (disabledBox) {
@@ -1799,22 +1846,6 @@
     }
   }
 
-  function renderFilterPills() {
-    var box = document.getElementById('filter-pills');
-    if (!box) return;
-    box.innerHTML = '';
-    var active = findFilter(filterState.active);
-    var viewing = findFilter(filterState.viewing);
-    var activeLabel = active
-      ? (active.title || active.name) + ' (' + active.name + ')'
-      : filterState.active;
-    box.appendChild(pill('Active: ' + activeLabel, 'ok'));
-    box.appendChild(pill(filterState.list.length + ' filters', ''));
-    if (viewing && viewing.name !== filterState.active) {
-      box.appendChild(pill('Viewing: ' + (viewing.title || viewing.name), 'warn'));
-    }
-  }
-
   function populateFilterSelect() {
     var sel = document.getElementById('filter-select');
     if (!sel) return;
@@ -1822,8 +1853,7 @@
     filterState.list.forEach(function (f) {
       var opt = document.createElement('option');
       opt.value = f.name;
-      opt.textContent = (f.title || f.name) +
-        (f.name === filterState.active ? ' — active' : '');
+      opt.textContent = f.title || f.name;
       sel.appendChild(opt);
     });
     sel.value = filterState.viewing;
@@ -1838,13 +1868,12 @@
       if (f && f.name) filterState.byName[f.name] = f;
     });
     if (!filterState.byName[filterState.viewing]) {
-      filterState.viewing = filterState.active;
+      filterState.viewing = filterState.byName.safe ? 'safe' : '';
     }
     if (!filterState.byName[filterState.viewing] && filterState.list.length) {
       filterState.viewing = filterState.list[0].name;
     }
     populateFilterSelect();
-    renderFilterPills();
     renderFilterDetail(findFilter(filterState.viewing));
   }
 
@@ -1852,52 +1881,13 @@
   if (filterSelect) {
     filterSelect.addEventListener('change', function () {
       filterState.viewing = filterSelect.value;
-      renderFilterPills();
       renderFilterDetail(findFilter(filterState.viewing));
     });
-  }
-
-  var RULES_FALLBACK = [
-    { title: 'Dry-run safety net', set_to: 'ON — no Schwab orders', why: 'Paper-trade by default; flip TRADE_DRY_RUN only when ready for real fills' },
-    { title: 'Buys and sells only in regular hours', set_to: '9:30–16:00 America/New_York', why: 'Watchlist/buys and sell-check jobs skip when the US equity session is closed' },
-    { title: 'No buy-and-sell the same day', set_to: 'No market sell or broker STOP_LIMIT until the next ET calendar day', why: 'FINRA day trade = same trading day (not 24h). Buy Mon 1pm / sell Tue 8am is fine; stops are deferred so a same-day fill cannot create a round trip' },
-    { title: 'Cash floor', set_to: 'config.MINIMUM_CASH (live API fills amount)', why: 'No buy may leave cash (minus pending buys) below this floor. Sells still run.' },
-    { title: 'Account size floor', set_to: 'Liquidation value ≥ $25,000', why: 'No buy while account value is under this threshold. Sells still run.' },
-    { title: 'Buy only from the active filter / watchlist', set_to: "Filter 'safe'", why: 'New buys must be on the current watchlist — no random tickers' },
-    { title: 'Fixed buy size', set_to: '~$1,000 per new name', why: 'Keeps position sizing consistent and cash-floor math simple' },
-    { title: 'Trailing stop arms after a gain', set_to: 'Arm at +10% peak unrealized', why: 'Protect winners once they have moved enough; ignore noise before that' },
-    { title: 'Trail buffer below peak', set_to: '5% on watchlist · 3% once off', why: 'Stop ratchets up with new highs; tighter once the thesis (watchlist) breaks' },
-    { title: 'Hard stop vs cost', set_to: '−10% on watchlist · −5% once off', why: 'Catastrophe floor when a trail never armed, or thesis is gone' },
-    { title: 'Resting broker STOP_LIMIT', set_to: 'Arm after next ET day · limit 0.50% below stop · GOOD_TILL_CANCEL', why: 'Protective sell sits at Schwab once past the purchase day; never armed same day so a stop fill cannot create a PDT round trip' },
-    { title: 'Sell check cadence', set_to: 'Every 15 minutes (RTH)', why: 'Re-evaluate trails / hard stops while the market is open' },
-    { title: 'Legacy holdings are sell-skipped', set_to: 'Only algorithm / enrolled books get auto sells', why: 'Pre-marked legacy carve-outs stay human-managed until enrolled' },
-    { title: 'Buys can be paused', set_to: 'Allowed (runtime flag)', why: 'A runtime pause blocks new buys without changing the rest of the system' }
-  ];
-
-  function renderTradingRules(payload) {
-    var list = document.getElementById('rules-list');
-    if (!list) return;
-    var rules = (payload && payload.rules && payload.rules.length)
-      ? payload.rules
-      : RULES_FALLBACK;
-    list.innerHTML = rules.map(function (r, i) {
-      return (
-        '<li>' +
-          '<div class="rule-num">' + (i + 1) + '</div>' +
-          '<div class="rule-body">' +
-            '<div class="rule-title">' + escapeHtml(r.title || '') + '</div>' +
-            '<div class="rule-set"><span class="rule-label">Set to</span> ' + escapeHtml(r.set_to || '') + '</div>' +
-            '<div class="rule-why"><span class="rule-label">Why</span> ' + escapeHtml(r.why || '') + '</div>' +
-          '</div>' +
-        '</li>'
-      );
-    }).join('');
   }
 
   async function loadAbout() {
     var pills = document.getElementById('home-pills');
     var cards = document.getElementById('home-cards');
-    var jobs = document.getElementById('home-jobs');
     try {
       var data = await fetchJson('/api/status');
       if (data.dashboard_rev != null) lastContentRev = data.dashboard_rev;
@@ -1906,26 +1896,9 @@
       applyActionsBadge(data);
       if (data.schwab) applySchwabChrome(data.schwab, stage);
       var y = data.yahoo || {};
-      var filterPayload = data.watchlist_filter || null;
-      setupFilterPanel(filterPayload);
-      renderTradingRules(data.trading_rules);
+      setupFilterPanel(data.watchlist_filter || null);
 
-      var activeFilter = findFilter(filterState.active);
       pills.innerHTML = '';
-      if (stage === 'schwab') {
-        pills.appendChild(pill('Setup: link Schwab', 'bad'));
-      } else if (stage === 'settings') {
-        pills.appendChild(pill('Setup: floors & buy size', 'warn'));
-      } else if (stage === 'algorithm') {
-        pills.appendChild(pill('Algorithm not started', 'warn'));
-      } else if (stage === 'go_live') {
-        pills.appendChild(pill('Dry-run', 'warn'));
-      } else {
-        pills.appendChild(pill(data.trade_dry_run ? 'TRADE_DRY_RUN on' : 'LIVE trades', data.trade_dry_run ? 'ok' : 'warn'));
-      }
-      if (activeFilter && (stage === 'done' || stage === 'go_live' || stage === 'algorithm')) {
-        pills.appendChild(pill('Filter: ' + (activeFilter.title || activeFilter.name), 'ok'));
-      }
       if (data.last_loop_wake) {
         pills.appendChild(pill('Last wake ' + timeAgo(data.last_loop_wake), ''));
       }
@@ -1934,32 +1907,12 @@
       cards.innerHTML =
         card('Updated today', String(y.updated_today != null ? y.updated_today : '—'), 'Yahoo last_updated = today') +
         card('Stale / overdue', String(y.overdue_or_stale != null ? y.overdue_or_stale : '—'), 'SLA ' + (y.sla_days || 7) + 'd') +
-        card('In database', String(y.in_db != null ? y.in_db : '—'), 'Universe ~' + (y.universe_size || '—')) +
-        card('Jobs due now', String((data.jobs || []).filter(function (j) { return j.due_now; }).length), 'This scheduler pass');
-
-      jobs.innerHTML = '';
-      (data.jobs || []).forEach(function (j) {
-        var li = document.createElement('li');
-        li.innerHTML =
-          '<div class="job-name">' + escapeHtml(j.job_name) + '</div>' +
-          '<div>' + (j.due_now ? '<span class="pill warn">due</span>' : '<span class="pill">idle</span>') + '</div>' +
-          '<div class="job-note">' +
-            escapeHtml(j.progress_note || '—') +
-            (j.last_completed ? ' · last completed ' + escapeHtml(timeAgo(j.last_completed)) : '') +
-            (j.next_due ? ' · next ' + escapeHtml(j.next_due) : '') +
-          '</div>';
-        jobs.appendChild(li);
-      });
-      if (!(data.jobs || []).length) {
-        jobs.innerHTML = '<li class="empty">No job rows yet — run the trader once.</li>';
-      }
+        card('In database', String(y.in_db != null ? y.in_db : '—'), 'Universe ~' + (y.universe_size || '—'));
     } catch (e) {
       pills.innerHTML = '';
       pills.appendChild(pill('API error: ' + e.message, 'bad'));
       cards.innerHTML = '';
-      jobs.innerHTML = '<li class="empty">Could not load status. Is web_app.py running? Try ?mock=1</li>';
       setupFilterPanel(null);
-      renderTradingRules(null);
     }
   }
 
@@ -3020,12 +2973,13 @@
   });
 
   fetchJson('/api/me').then(function (me) {
-    currentUser = (me && me.user) || null;
+    mergeSessionUser((me && me.user) || null);
     if (!currentUser) {
       window.location.href = '/login';
       return;
     }
     document.body.classList.add('authed');
+    if (isReadOnly()) document.body.classList.add('read-only');
     var el = document.getElementById('brand-user');
     if (el) {
       var name = currentUser.display_name || currentUser.username || '';
@@ -3041,7 +2995,7 @@
   });
 
   // Poll: skip when tab hidden.
-  // About: always refresh (job due clocks).
+  // About: refresh shared Yahoo freshness + last wake.
   // Trader: always refresh so Price/Status stay downstream of Schwab position sync.
   // Actions: refresh Schwab auth status / urgent card.
   // Log: only when dashboard_rev changes.

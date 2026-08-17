@@ -116,20 +116,40 @@ def init_sessions_table() -> None:
                 token_hash TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL
+                expires_at TEXT NOT NULL,
+                read_only INTEGER NOT NULL DEFAULT 0
             )
             '''
         )
         conn.commit()
+        _ensure_sessions_read_only_column(conn)
         try:
             n = conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]
         except Exception:
             n = 0
         if not n:
             _migrate_sessions_from_main(conn)
+            _ensure_sessions_read_only_column(conn)
     finally:
         conn.close()
     _SESSIONS_TABLE_READY = True
+
+
+def _ensure_sessions_read_only_column(conn: sqlite3.Connection) -> None:
+    """Add sessions.read_only for DBs created before the view-only login."""
+    try:
+        cols = [r[1] for r in conn.execute('PRAGMA table_info(sessions)').fetchall()]
+    except Exception:
+        return
+    if 'read_only' in cols:
+        return
+    try:
+        conn.execute(
+            'ALTER TABLE sessions ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0'
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
 
 def _migrate_sessions_from_main(sessions_conn: sqlite3.Connection) -> None:
@@ -541,33 +561,106 @@ def authenticate(username: str, password: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _secret_equals(left: str, right: str) -> bool:
+    a = str(left or '')
+    b = str(right or '')
+    if len(a) != len(b):
+        return False
+    try:
+        return hmac.compare_digest(a, b)
+    except TypeError:
+        return False
+
+
+def authenticate_demo_viewer(username: str, password: str) -> Optional[Dict[str, Any]]:
+    """
+    Special password that opens DEMO_VIEWER_USERNAME's live dashboard as read-only.
+    Does not use the owner's password hash. Empty DEMO_VIEWER_PASSWORD disables this.
+    """
+    want_user = (getattr(config, 'DEMO_VIEWER_USERNAME', None) or '').strip().lower()
+    want_pass = str(getattr(config, 'DEMO_VIEWER_PASSWORD', None) or '')
+    if not want_user or not want_pass:
+        return None
+    got_user = (username or '').strip().lower()
+    got_pass = str(password or '')
+    if not _secret_equals(got_user, want_user) or not _secret_equals(got_pass, want_pass):
+        return None
+    init_auth_tables()
+    user = get_user_by_username(want_user)
+    if not user or not user.get('is_active'):
+        return None
+    return {
+        'id': user['id'],
+        'username': user['username'],
+        'display_name': user['display_name'],
+        'is_admin': user['is_admin'],
+        'read_only': True,
+    }
+
+
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode('utf-8')).hexdigest()
 
 
-def create_session(user_id: int) -> str:
+def create_session(user_id: int, read_only: bool = False) -> str:
     init_sessions_table()
     token = secrets.token_urlsafe(32)
     now = datetime.now(timezone.utc)
     expires = now + timedelta(days=session_days())
     conn = get_sessions_connection()
     try:
-        conn.execute(
-            '''
-            INSERT INTO sessions (token_hash, user_id, created_at, expires_at)
-            VALUES (?, ?, ?, ?)
-            ''',
-            (
-                _hash_token(token),
-                user_id,
-                now.isoformat(),
-                expires.isoformat(),
-            ),
-        )
+        try:
+            conn.execute(
+                '''
+                INSERT INTO sessions (token_hash, user_id, created_at, expires_at, read_only)
+                VALUES (?, ?, ?, ?, ?)
+                ''',
+                (
+                    _hash_token(token),
+                    user_id,
+                    now.isoformat(),
+                    expires.isoformat(),
+                    1 if read_only else 0,
+                ),
+            )
+        except sqlite3.OperationalError:
+            _ensure_sessions_read_only_column(conn)
+            conn.execute(
+                '''
+                INSERT INTO sessions (token_hash, user_id, created_at, expires_at, read_only)
+                VALUES (?, ?, ?, ?, ?)
+                ''',
+                (
+                    _hash_token(token),
+                    user_id,
+                    now.isoformat(),
+                    expires.isoformat(),
+                    1 if read_only else 0,
+                ),
+            )
         conn.commit()
     finally:
         conn.close()
     return token
+
+
+def _load_session_row(conn: sqlite3.Connection, token_hash: str):
+    try:
+        return conn.execute(
+            '''
+            SELECT user_id, expires_at, read_only
+            FROM sessions WHERE token_hash = ?
+            ''',
+            (token_hash,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = conn.execute(
+            'SELECT user_id, expires_at FROM sessions WHERE token_hash = ?',
+            (token_hash,),
+        ).fetchone()
+        if not row:
+            return None
+        return (row[0], row[1], 0)
 
 
 def user_from_session_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -576,15 +669,14 @@ def user_from_session_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
     init_sessions_table()
     th = _hash_token(token)
     user_id = None  # type: Optional[int]
+    read_only = False
     conn = get_sessions_connection()
     try:
-        row = conn.execute(
-            'SELECT user_id, expires_at FROM sessions WHERE token_hash = ?',
-            (th,),
-        ).fetchone()
+        row = _load_session_row(conn, th)
         if not row:
             return None
         user_id, expires_at = int(row[0]), row[1]
+        read_only = bool(row[2]) if len(row) > 2 else False
         try:
             exp = datetime.fromisoformat(str(expires_at))
             if exp.tzinfo is None:
@@ -606,6 +698,7 @@ def user_from_session_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
         'username': user['username'],
         'display_name': user.get('display_name'),
         'is_admin': bool(user.get('is_admin')),
+        'read_only': bool(read_only),
     }
 
 

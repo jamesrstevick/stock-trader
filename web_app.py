@@ -84,6 +84,27 @@ def _require_admin(request: Request):
     return None
 
 
+def _public_user(user) -> dict:
+    return {
+        'id': user['id'],
+        'username': user['username'],
+        'display_name': user.get('display_name'),
+        'is_admin': bool(user.get('is_admin')),
+        'read_only': bool(user.get('read_only')),
+    }
+
+
+def _overlay_session_user(data, request: Request):
+    """Keep nested user objects in sync with the session (incl. read_only)."""
+    user = getattr(request.state, 'user', None)
+    if not isinstance(data, dict) or not user:
+        return data
+    nested = data.get('user')
+    if isinstance(nested, dict):
+        nested.update(_public_user(user))
+    return data
+
+
 def _request_is_https(request: Request) -> bool:
     forwarded = (request.headers.get('x-forwarded-proto') or '').split(',')[0].strip().lower()
     if forwarded:
@@ -126,6 +147,11 @@ async def auth_and_cache(request: Request, call_next):
         if not user:
             return JSONResponse({'ok': False, 'error': 'login_required'}, status_code=401)
         request.state.user = user
+        if user.get('read_only') and request.method not in ('GET', 'HEAD', 'OPTIONS'):
+            return JSONResponse(
+                {'ok': False, 'error': 'read_only', 'noop': True},
+                status_code=403,
+            )
     response = await call_next(request)
 
     if path.startswith('/api/'):
@@ -184,12 +210,7 @@ def api_me(request: Request):
     return {
         'ok': True,
         'authenticated': True,
-        'user': {
-            'id': user['id'],
-            'username': user['username'],
-            'display_name': user.get('display_name'),
-            'is_admin': bool(user.get('is_admin')),
-        },
+        'user': _public_user(user),
     }
 
 
@@ -228,16 +249,16 @@ async def api_login(request: Request):
             'ok': True,
             'created': True,
             'token': token,
-            'user': {
-                'id': user['id'],
-                'username': user['username'],
-                'display_name': user.get('display_name'),
-            },
+            'user': _public_user(user),
         })
         _set_session_cookie(resp, token, request)
         return resp
+    # jame / trader (DEMO_VIEWER_*) → same live dashboard, session is read-only.
     try:
-        user = uc.authenticate(str(username), str(password))
+        user = uc.authenticate_demo_viewer(str(username), str(password))
+        read_only = bool(user)
+        if not user:
+            user = uc.authenticate(str(username), str(password))
     except Exception as e:
         return JSONResponse(
             {'ok': False, 'error': 'Sign in temporarily unavailable — try again (%s)' % e},
@@ -249,20 +270,19 @@ async def api_login(request: Request):
             status_code=401,
         )
     try:
-        token = uc.create_session(int(user['id']))
+        token = uc.create_session(int(user['id']), read_only=read_only)
     except Exception as e:
         return JSONResponse(
             {'ok': False, 'error': 'Could not create session — try again (%s)' % e},
             status_code=503,
         )
+    payload = _public_user(user)
+    payload['read_only'] = bool(read_only)
     resp = JSONResponse({
         'ok': True,
         'token': token,
-        'user': {
-            'id': user['id'],
-            'username': user['username'],
-            'display_name': user.get('display_name'),
-        },
+        'read_only': bool(read_only),
+        'user': payload,
     })
     _set_session_cookie(resp, token, request)
     return resp
@@ -310,7 +330,7 @@ def api_logout(request: Request):
 @app.get('/api/status')
 def api_status(request: Request):
     with uc.use_user(int(request.state.user['id'])):
-        return st.get_dashboard_status()
+        return _overlay_session_user(st.get_dashboard_status(), request)
 
 
 @app.get('/api/account/setup')
@@ -430,7 +450,7 @@ async def api_schwab_auth_post(request: Request):
 @app.get('/api/portfolio')
 def api_portfolio(request: Request):
     with uc.use_user(int(request.state.user['id'])):
-        return st.get_dashboard_portfolio()
+        return _overlay_session_user(st.get_dashboard_portfolio(), request)
 
 
 @app.get('/api/performance')
