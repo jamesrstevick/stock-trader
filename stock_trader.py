@@ -1632,7 +1632,7 @@ _LOG_CATEGORY_ALIASES = {
 
 # Bump when user-facing event_log copy changes. Next process start rewrites stored rows
 # (DELL Pull from GitHub restarts the loop/dashboard, so this is "first pull").
-_EVENT_LOG_CLEAN_VERSION = 2
+_EVENT_LOG_CLEAN_VERSION = 3
 _EVENT_LOG_CLEAN_FLAG = 'event_log_clean_version'
 _LOG_TICKER_RE = re.compile(r'\b([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b')
 _LOG_MONEY_RE = re.compile(r'\$([0-9]+(?:\.[0-9]+)?)')
@@ -1937,6 +1937,8 @@ def _legacy_event_plan(
     if upper.startswith('STOP CANCELLED'):
         return {'action': 'delete'}
     if upper.startswith('PLACING BUY') or upper.startswith('PLACING MARKET SELL'):
+        return {'action': 'delete'}
+    if 'REBUY DEBOUNCE' in upper or str(detail.get('hint') or '') == 'rebuy_debounce':
         return {'action': 'delete'}
 
     if msg.startswith('STOP-LIMIT '):
