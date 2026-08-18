@@ -35,8 +35,10 @@ class SimConfig:
     order_amount: float = 1000.0
     min_cash: float = 15000.0
     trail_activate_pct: float = 0.10
-    trail_buffer_pct: float = 0.05
-    hard_stop_pct: float = -0.10
+    trail_buffer_pct: float = 0.10
+    hard_stop_pct: float = -0.15
+    rebuy_cooldown_trading_days: int = 5
+    rebuy_discount_pct: float = 0.05
 
 
 @dataclass
@@ -125,6 +127,41 @@ def max_drawdown_pct(equities: Sequence[float]) -> float:
     return float(worst)
 
 
+def weekdays_between_exclusive_start(start: date, end: date) -> int:
+    """Mon–Fri dates strictly after start through end inclusive (holidays count)."""
+    if end <= start:
+        return 0
+    count = 0
+    d = start + timedelta(days=1)
+    while d <= end:
+        if d.weekday() < 5:
+            count += 1
+        d += timedelta(days=1)
+    return count
+
+
+def rebuy_unlocked(
+    ticker: str,
+    open_px: float,
+    day: date,
+    last_sell_price: Dict[str, float],
+    last_sell_day: Dict[str, date],
+    cfg: SimConfig,
+) -> bool:
+    """True if no prior sell, or cooldown weekdays OR discount vs last sell."""
+    if ticker not in last_sell_price and ticker not in last_sell_day:
+        return True
+    last_px = last_sell_price.get(ticker)
+    discount = float(cfg.rebuy_discount_pct)
+    if last_px is not None and last_px > 0 and open_px <= last_px * (1.0 - discount):
+        return True
+    sold_day = last_sell_day.get(ticker)
+    if sold_day is None:
+        return True
+    elapsed = weekdays_between_exclusive_start(sold_day, day)
+    return elapsed >= int(cfg.rebuy_cooldown_trading_days)
+
+
 def _bar(ohlc: Dict[str, pd.DataFrame], ticker: str, day: date) -> Optional[pd.Series]:
     df = ohlc.get(ticker)
     if df is None or df.empty:
@@ -194,6 +231,8 @@ def run_daily_sim(
 
     cash = float(cfg.starting_cash)
     positions = {}  # type: Dict[str, Position]
+    last_sell_price = {}  # type: Dict[str, float]
+    last_sell_day = {}  # type: Dict[str, date]
     trade_count = 0
     equity_curve = []  # type: List[Dict[str, Any]]
 
@@ -222,6 +261,10 @@ def run_daily_sim(
             open_px = float(bar.get('Open') or 0)
             if open_px <= 0:
                 continue
+            if not rebuy_unlocked(
+                ticker, open_px, day, last_sell_price, last_sell_day, cfg
+            ):
+                continue
             shares = int(float(cfg.order_amount) // open_px)
             if shares < 1:
                 continue
@@ -238,6 +281,8 @@ def run_daily_sim(
                 stop_gain_pct=float(cfg.hard_stop_pct),
                 trail_active=False,
             )
+            last_sell_price.pop(ticker, None)
+            last_sell_day.pop(ticker, None)
             trade_count += 1
 
         # --- Manage positions: High updates peak; Low may stop out; else Close mark ---
@@ -297,6 +342,8 @@ def run_daily_sim(
             if pos is None:
                 continue
             cash += pos.shares * fill_px
+            last_sell_price[ticker] = float(fill_px)
+            last_sell_day[ticker] = day
             trade_count += 1
 
         # Mark-to-market equity

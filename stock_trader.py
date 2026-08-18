@@ -932,7 +932,7 @@ def _init_database_unlocked(
         )
     ''')
     
-    # Unused leftover table (rebuy-discount rule removed). Keep so existing DBs stay valid.
+    # After a sell: block re-buying until cooldown OR discount unlocks (see rebuy_allowed).
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS rebuy_guards (
             ticker TEXT PRIMARY KEY,
@@ -6832,6 +6832,7 @@ def execute_buy(ticker: str, quantity: int):
                     note='PLACING BUY — order submitted, awaiting fill',
                     scorecard='algorithm',
                 )
+                clear_rebuy_guard(ticker)
                 try:
                     sync_schwab_account_after_order('buy')
                 except Exception as sync_err:
@@ -6878,6 +6879,7 @@ def execute_buy(ticker: str, quantity: int):
             note='DRY-RUN PLACING BUY — not submitted',
             scorecard='algorithm',
         )
+        clear_rebuy_guard(ticker)
 
 
 def get_position_origin(ticker: str) -> Optional[str]:
@@ -7101,6 +7103,155 @@ def summarize_trade_history(ticker: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
+def record_rebuy_guard(
+    ticker: str,
+    sell_price: Optional[float],
+    cost_basis: Optional[float] = None,
+) -> None:
+    """Remember last sell so we don't immediately re-buy the same name."""
+    init_database()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        INSERT INTO rebuy_guards (ticker, last_sell_price, last_cost_basis, last_sold_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(ticker) DO UPDATE SET
+            last_sell_price = excluded.last_sell_price,
+            last_cost_basis = COALESCE(excluded.last_cost_basis, rebuy_guards.last_cost_basis),
+            last_sold_at = excluded.last_sold_at
+        ''',
+        (ticker, sell_price, cost_basis, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_rebuy_guard(ticker: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            'SELECT last_sell_price, last_cost_basis, last_sold_at FROM rebuy_guards WHERE ticker = ?',
+            (ticker,)
+        )
+        row = cursor.fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    conn.close()
+    if not row:
+        return None
+    return {
+        'last_sell_price': row[0],
+        'last_cost_basis': row[1],
+        'last_sold_at': row[2],
+    }
+
+
+def clear_rebuy_guard(ticker: str) -> None:
+    """Drop debounce after a successful buy so the next sell starts a fresh window."""
+    init_database()
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('DELETE FROM rebuy_guards WHERE ticker = ?', (ticker,))
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+
+
+def _rebuy_sell_market_date(last_sold_at: Any) -> Optional[date]:
+    """ET calendar date of last sell from rebuy_guards.last_sold_at."""
+    parsed = _parse_purchased_at(last_sold_at)
+    if parsed is None and last_sold_at:
+        raw = str(last_sold_at).strip()
+        if len(raw) >= 10:
+            try:
+                return datetime.strptime(raw[:10], '%Y-%m-%d').date()
+            except ValueError:
+                return None
+        return None
+    if parsed is None:
+        return None
+    return _as_market_datetime(parsed).date()
+
+
+def weekdays_between_exclusive_start(
+    start: date,
+    end: date,
+) -> int:
+    """
+    Count Mon–Fri dates strictly after `start` through `end` inclusive.
+    Exchange holidays count as trading days (no holiday calendar).
+    """
+    if end <= start:
+        return 0
+    count = 0
+    d = start + timedelta(days=1)
+    while d <= end:
+        if d.weekday() < 5:
+            count += 1
+        d += timedelta(days=1)
+    return count
+
+
+def rebuy_allowed(ticker: str, price: float) -> Tuple[bool, str]:
+    """
+    After a sell, unlock rebuy when either:
+      - price <= last_sell * (1 - REBUY_DISCOUNT_PCT), or
+      - >= REBUY_COOLDOWN_TRADING_DAYS weekdays have elapsed since sell date (ET).
+    """
+    guard = get_rebuy_guard(ticker)
+    if not guard:
+        return True, 'no prior sell guard'
+
+    discount = float(getattr(config, 'REBUY_DISCOUNT_PCT', 0.05))
+    cooldown_days = int(getattr(config, 'REBUY_COOLDOWN_TRADING_DAYS', 5))
+    last_sell = guard.get('last_sell_price')
+    sold_at = guard.get('last_sold_at')
+
+    if last_sell is not None and float(last_sell) > 0:
+        ceiling = float(last_sell) * (1.0 - discount)
+        if float(price) <= ceiling:
+            return True, (
+                f'rebuy ok: ${float(price):.2f} <= {discount * 100:.0f}% below sell '
+                f'(${float(last_sell):.2f} -> ceiling ${ceiling:.2f})'
+            )
+    else:
+        ceiling = None
+
+    sell_day = _rebuy_sell_market_date(sold_at)
+    today = _now_market().date()
+    elapsed = weekdays_between_exclusive_start(sell_day, today) if sell_day else 0
+    if sell_day is not None and elapsed >= cooldown_days:
+        return True, (
+            f'rebuy ok: {elapsed} weekdays since sell on {sell_day.isoformat()} '
+            f'(need {cooldown_days})'
+        )
+
+    parts = []
+    if sell_day is not None:
+        left = max(0, cooldown_days - elapsed)
+        parts.append(
+            f'{left} weekday(s) left of {cooldown_days}-day cooldown '
+            f'(sold {sell_day.isoformat()} ET)'
+        )
+    else:
+        parts.append(f'need {cooldown_days} weekdays since sell (unknown sell date)')
+    if ceiling is not None:
+        parts.append(
+            f'or price <= ${ceiling:.2f} ({discount * 100:.0f}% below '
+            f'last sell ${float(last_sell):.2f}; now ${float(price):.2f})'
+        )
+    elif last_sell is None or float(last_sell) <= 0:
+        # No usable sell price — only time can unlock; if sell_day missing, allow.
+        if sell_day is None:
+            return True, 'no sell price or date on guard'
+    return False, 'rebuy debounce: ' + '; '.join(parts)
+
+
 def execute_sell(
     ticker: str,
     quantity: int,
@@ -7205,6 +7356,7 @@ def execute_sell(
 
                 # Update watchlist shares owned (negative for sell, only after successful order)
                 update_shares_owned(ticker, -quantity)
+                record_rebuy_guard(ticker, sell_price=sell_price, cost_basis=cost_basis)
                 trade_note = (
                     f"PLACING MARKET SELL — order submitted "
                     f"({exit_info['short_label']})"
@@ -7285,6 +7437,8 @@ def execute_sell(
             mode='simulation',
             note='DRY-RUN PLACE MARKET SELL — not submitted',
         )
+        # Still record debounce so dry-run loops behave consistently
+        record_rebuy_guard(ticker, sell_price=sell_price, cost_basis=cost_basis)
         clear_position_stop_order(ticker)
 
 
@@ -7971,10 +8125,10 @@ def compute_trail_state_for_position(
     Returns peak/stop/kind without writing proposals. Caller may persist.
     """
     activate = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10))
-    buffer_on = float(getattr(config, 'TRAIL_BUFFER_PCT', 0.05))
-    buffer_off = float(getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.03))
-    hard_on = float(getattr(config, 'HARD_STOP_ON_WATCHLIST_PCT', -0.10))
-    hard_off = float(getattr(config, 'HARD_STOP_OFF_WATCHLIST_PCT', -0.05))
+    buffer_on = float(getattr(config, 'TRAIL_BUFFER_PCT', 0.10))
+    buffer_off = float(getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.07))
+    hard_on = float(getattr(config, 'HARD_STOP_ON_WATCHLIST_PCT', -0.15))
+    hard_off = float(getattr(config, 'HARD_STOP_OFF_WATCHLIST_PCT', -0.08))
 
     gain = (price - purchase) / purchase
     peak = float(peak_gain) if peak_gain is not None else gain
@@ -8785,7 +8939,7 @@ def _update_position_trail_state(
 def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """
     Propose $ORDER_AMOUNT_DOLLARS buys from top of ranked watchlist.
-    Skips owned / pending names; keeps proposing until cash floors block.
+    Skips owned / pending / rebuy-debounce names; keeps proposing until cash floors block.
     Warns if cash can fund a buy but no watchlist name is eligible (loosen filter).
 
     Args:
@@ -8845,6 +8999,30 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
                     ),
                     'rank': rank,
                     'hint': 'schwab_price',
+                })
+            continue
+
+        ok_rebuy, rebuy_reason = rebuy_allowed(ticker, price)
+        if not ok_rebuy:
+            proposals.append({
+                'action': 'skip_buy',
+                'ticker': ticker,
+                'reason': rebuy_reason,
+                'price': price,
+                'rank': rank,
+            })
+            if top:
+                proposals.append({
+                    'action': 'warning',
+                    'ticker': ticker,
+                    'reason': (
+                        f"#{rank} watchlist {ticker} blocked by rebuy debounce "
+                        f"(@ ${price:.2f}) — {rebuy_reason}. "
+                        f"Wait for cooldown or a deeper discount."
+                    ),
+                    'price': price,
+                    'rank': rank,
+                    'hint': 'rebuy_debounce',
                 })
             continue
 
@@ -8917,7 +9095,7 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         if can_fund:
             msg = (
                 f"Enough cash for a ${order_amount:.0f} buy, but no eligible "
-                f"watchlist names left (owned/pending/no Schwab price). "
+                f"watchlist names left (owned/pending/rebuy-debounce/no Schwab price). "
                 f"Consider loosening the '{active_watchlist_filter()}' filter "
                 f"or checking Schwab connectivity."
             )
@@ -8975,8 +9153,8 @@ def propose_sells() -> List[Dict[str, Any]]:
     - place_stop_limit: protective stop-limit at computed stop price (not yet hit)
     - defer_stop_limit: would place stop but same ET purchase day (PDT) — wait until next day
     - skip_sell: would sell but min-hold blocks
-    Trail: peak +10% activate, 5% buffer on-list / 3% off-list (ratchet up only).
-    Hard stop: -10% on-list / -5% off-list (also used as stop-limit while in work mode).
+    Trail: peak +10% activate, 10% buffer on-list / 7% off-list (ratchet up only).
+    Hard stop: -15% on-list / -8% off-list (also used as stop-limit while in work mode).
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -9046,9 +9224,9 @@ def propose_sells() -> List[Dict[str, Any]]:
         gain = state['gain_pct']
         on_wl = state['on_watchlist']
         buffer = float(
-            getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.03)
+            getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.07)
             if not on_wl
-            else getattr(config, 'TRAIL_BUFFER_PCT', 0.05)
+            else getattr(config, 'TRAIL_BUFFER_PCT', 0.10)
         )
 
         # Persist peak/stop state so dry-runs and live checks stay consistent
@@ -9226,6 +9404,8 @@ def run_buy_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
                     'dry_run': True,
                 },
             )
+            if tkr:
+                clear_rebuy_guard(str(tkr))
     return proposals
 
 
@@ -9987,11 +10167,13 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
     min_liq = minimum_liquidation_value()
     order_amt = order_amount_dollars()
     filter_name = str(active_watchlist_filter())
+    rebuy_days = int(getattr(config, 'REBUY_COOLDOWN_TRADING_DAYS', 5))
+    rebuy_pct = float(getattr(config, 'REBUY_DISCOUNT_PCT', 0.05)) * 100.0
     trail_act = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10)) * 100.0
-    trail_buf = float(getattr(config, 'TRAIL_BUFFER_PCT', 0.05)) * 100.0
-    trail_off = float(getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.03)) * 100.0
-    hard_on = abs(float(getattr(config, 'HARD_STOP_ON_WATCHLIST_PCT', -0.10))) * 100.0
-    hard_off = abs(float(getattr(config, 'HARD_STOP_OFF_WATCHLIST_PCT', -0.05))) * 100.0
+    trail_buf = float(getattr(config, 'TRAIL_BUFFER_PCT', 0.10)) * 100.0
+    trail_off = float(getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.07)) * 100.0
+    hard_on = abs(float(getattr(config, 'HARD_STOP_ON_WATCHLIST_PCT', -0.15))) * 100.0
+    hard_off = abs(float(getattr(config, 'HARD_STOP_OFF_WATCHLIST_PCT', -0.08))) * 100.0
     slip = float(getattr(config, 'STOP_LIMIT_SLIPPAGE_PCT', 0.005)) * 100.0
     sell_mins = int(getattr(config, 'SELL_CHECK_INTERVAL_MINUTES', 15))
     open_h = int(getattr(config, 'MARKET_OPEN_HOUR', 9))
@@ -10046,6 +10228,18 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
             'title': 'Fixed buy size',
             'set_to': '~$%s per new name' % '{:,.0f}'.format(order_amt),
             'why': 'Keeps position sizing consistent and cash-floor math simple',
+        },
+        {
+            'id': 'rebuy_debounce',
+            'title': 'Re-buy debounce after a sell',
+            'set_to': (
+                '%d weekdays after sell OR ≤ last sell − %.0f%%'
+                % (rebuy_days, rebuy_pct)
+            ),
+            'why': (
+                'Avoid immediately rebuying the same name after a stop; unlock on '
+                'cooldown or a meaningful discount'
+            ),
         },
         {
             'id': 'trail_activate',

@@ -19,8 +19,9 @@ A separate FastAPI dashboard (`python web_app.py`) uses **in-app login** (userna
 3. **Hold ≥ 16 hours** after purchase (avoid same-day round-trips).
 4. **Cash floor** and **account size floor** block buys that would breach them; sells still run.
 5. **Buys only from the active watchlist filter**, sized ~$1,000 per new name.
-6. **Trailing stop** arms at +10% peak; buffers tighten once off-watchlist; hard stops as catastrophe floor.
-7. **Resting STOP_LIMIT** at Schwab so protection remains if the bot is briefly offline.
+6. **Rebuy debounce** — after a sell, wait 5 weekdays **or** a ≥5% drop below last sell (whichever first).
+7. **Trailing stop** arms at +10% peak; ~10% / ~7% buffers (on / off watchlist); hard stops ~−15% / −8%.
+8. **Resting STOP_LIMIT** at Schwab so protection remains if the bot is briefly offline.
 
 Exact values come from `config.py` and show live on the About page.
 

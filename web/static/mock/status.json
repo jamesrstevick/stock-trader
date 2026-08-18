@@ -266,6 +266,12 @@
         "why": "Keeps position sizing consistent and cash-floor math simple"
       },
       {
+        "id": "rebuy_debounce",
+        "title": "Re-buy debounce after a sell",
+        "set_to": "5 weekdays after sell OR ≤ last sell − 5%",
+        "why": "Avoid immediately rebuying the same name after a stop; unlock on cooldown or a meaningful discount"
+      },
+      {
         "id": "trail_activate",
         "title": "Trailing stop arms after a gain",
         "set_to": "Arm at +10% peak unrealized",
@@ -274,13 +280,13 @@
       {
         "id": "trail_buffer",
         "title": "Trail buffer below peak",
-        "set_to": "5% on watchlist · 3% once off",
+        "set_to": "10% on watchlist · 7% once off",
         "why": "Stop ratchets up with new highs; tighter once the thesis (watchlist) breaks"
       },
       {
         "id": "hard_stop",
         "title": "Hard stop vs cost",
-        "set_to": "−10% on watchlist · −5% once off",
+        "set_to": "−15% on watchlist · −8% once off",
         "why": "Catastrophe floor when a trail never armed, or thesis is gone"
       },
       {

@@ -139,8 +139,12 @@ def sim_config_from_live(cash: float) -> SimConfig:
         order_amount=float(getattr(config, 'ORDER_AMOUNT_DOLLARS', 1000.0)),
         min_cash=float(getattr(config, 'MINIMUM_CASH', 15000.0)),
         trail_activate_pct=float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10)),
-        trail_buffer_pct=float(getattr(config, 'TRAIL_BUFFER_PCT', 0.05)),
-        hard_stop_pct=float(getattr(config, 'HARD_STOP_ON_WATCHLIST_PCT', -0.10)),
+        trail_buffer_pct=float(getattr(config, 'TRAIL_BUFFER_PCT', 0.10)),
+        hard_stop_pct=float(getattr(config, 'HARD_STOP_ON_WATCHLIST_PCT', -0.15)),
+        rebuy_cooldown_trading_days=int(
+            getattr(config, 'REBUY_COOLDOWN_TRADING_DAYS', 5)
+        ),
+        rebuy_discount_pct=float(getattr(config, 'REBUY_DISCOUNT_PCT', 0.05)),
     )
 
 
