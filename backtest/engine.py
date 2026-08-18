@@ -85,11 +85,11 @@ def compute_trail_state_on_list(
     active = bool(trail_active) or peak >= activate
     new_stop = float(stop_gain) if stop_gain is not None else None
     if active:
+        # Mirror live: always peak − buffer so config/buffer changes re-sync.
         candidate = peak - buffer
         if candidate < 0:
             candidate = 0.0
-        if new_stop is None or candidate > new_stop:
-            new_stop = candidate
+        new_stop = candidate
         if purchase * (1.0 + float(new_stop)) > price * 1.2 and gain < activate:
             peak = gain
             active = False

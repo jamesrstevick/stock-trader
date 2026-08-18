@@ -281,7 +281,7 @@
         "id": "trail_buffer",
         "title": "Trail buffer below peak",
         "set_to": "10% on watchlist · 7% once off",
-        "why": "Stop ratchets up with new highs; tighter once the thesis (watchlist) breaks"
+        "why": "Stop sits at peak minus buffer and rises with new highs; re-syncs when buffers change; tighter once the thesis (watchlist) breaks"
       },
       {
         "id": "hard_stop",

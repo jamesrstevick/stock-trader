@@ -905,7 +905,7 @@ def _init_database_unlocked(
         ('open_pct', 'REAL'),
         ('purchased_at', 'TEXT'),       # ISO datetime for min-hold checks
         ('peak_gain_pct', 'REAL'),      # high-water unrealized gain vs purchase (fraction)
-        ('stop_gain_pct', 'REAL'),      # ratcheting trail stop level (fraction vs purchase)
+        ('stop_gain_pct', 'REAL'),      # trail stop level vs purchase (peak − buffer when armed)
         ('trail_active', 'INTEGER'),    # 1 once peak hit TRAIL_ACTIVATE_PCT
         ('stop_order_id', 'TEXT'),      # Schwab resting STOP_LIMIT order id
         ('stop_order_price', 'REAL'),   # last submitted stop trigger
@@ -8147,11 +8147,13 @@ def compute_trail_state_for_position(
 
     new_stop = float(stop_gain) if stop_gain is not None else None
     if active:
+        # Always peak − buffer (current config / on-off watchlist). Peak only rises
+        # with price, so the stop still climbs on new highs; allowing the level to
+        # fall means buffer widen / off→on list and config edits re-sync broker stops.
         candidate = peak - buffer
         if candidate < 0:
             candidate = 0.0
-        if new_stop is None or candidate > new_stop:
-            new_stop = candidate
+        new_stop = candidate
         if purchase * (1.0 + float(new_stop)) > price * 1.2 and gain < activate:
             peak = gain
             active = False
@@ -9153,7 +9155,7 @@ def propose_sells() -> List[Dict[str, Any]]:
     - place_stop_limit: protective stop-limit at computed stop price (not yet hit)
     - defer_stop_limit: would place stop but same ET purchase day (PDT) — wait until next day
     - skip_sell: would sell but min-hold blocks
-    Trail: peak +10% activate, 10% buffer on-list / 7% off-list (ratchet up only).
+    Trail: peak +10% activate, 10% buffer on-list / 7% off-list (stop = peak − buffer).
     Hard stop: -15% on-list / -8% off-list (also used as stop-limit while in work mode).
     """
     conn = get_connection()
@@ -10251,7 +10253,10 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
             'id': 'trail_buffer',
             'title': 'Trail buffer below peak',
             'set_to': '%.0f%% on watchlist · %.0f%% once off' % (trail_buf, trail_off),
-            'why': 'Stop ratchets up with new highs; tighter once the thesis (watchlist) breaks',
+            'why': (
+                'Stop sits at peak minus buffer and rises with new highs; '
+                're-syncs when buffers change; tighter once the thesis (watchlist) breaks'
+            ),
         },
         {
             'id': 'hard_stop',
