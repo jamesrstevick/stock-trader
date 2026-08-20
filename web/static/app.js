@@ -2632,6 +2632,126 @@
     return s;
   }
 
+  function formatEventMessage(ev) {
+    var msg = String((ev && ev.message) || '');
+    var movesHtml = '';
+    var mm = msg.match(/^(.*)(\s+\(\d+ moves\))$/);
+    if (mm) {
+      msg = mm[1];
+      movesHtml = ' <span class="log-moves">' + escapeHtml(mm[2].trim()) + '</span>';
+    }
+    var m = msg.match(/^(.*?)(\s*)(\([+\-] \$[0-9,]+\.\d{2}(?: \| [0-9.]+%)?\))$/);
+    if (!m) return escapeHtml(msg) + movesHtml;
+    var tone = m[3].indexOf('(-') === 0 ? 'neg' : 'pos';
+    return escapeHtml(m[1]) + '<span class="pl ' + tone + '">' + escapeHtml(m[3]) + '</span>' + movesHtml;
+  }
+
+  function stopEventMeta(ev) {
+    var cat = ev && ev._cat ? ev._cat : normalizeLogCategory(ev);
+    if (cat !== 'stop-limit') return null;
+    var d = (ev && ev.detail) || {};
+    var msg = String((ev && ev.message) || '');
+    var ticker = String(d.ticker || '').trim().toUpperCase();
+    var forM = msg.match(/\bfor\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b/i);
+    if (!ticker && forM) ticker = forM[1].toUpperCase();
+    var stopPx = d.stop_price != null ? Number(d.stop_price) : NaN;
+    var prevPx = d.previous_stop != null ? Number(d.previous_stop) : NaN;
+    var bumped = msg.match(
+      /STOP-LIMIT\s+(increased|decreased)\s+\$([0-9.]+)\s+to\s+\$([0-9.]+)/i
+    );
+    var moved = msg.match(
+      /STOP-LIMIT\s+moved from\s+\$([0-9.]+)\s+to\s+\$([0-9.]+)/i
+    );
+    var verb = '';
+    var delta = NaN;
+    if (bumped) {
+      verb = bumped[1].toLowerCase();
+      delta = Number(bumped[2]);
+      if (isNaN(stopPx)) stopPx = Number(bumped[3]);
+      if (isNaN(prevPx) && !isNaN(stopPx) && !isNaN(delta)) {
+        prevPx = verb === 'decreased' ? stopPx + delta : stopPx - delta;
+      }
+    } else if (moved) {
+      if (isNaN(prevPx)) prevPx = Number(moved[1]);
+      if (isNaN(stopPx)) stopPx = Number(moved[2]);
+      if (!isNaN(stopPx) && !isNaN(prevPx)) {
+        delta = Math.abs(stopPx - prevPx);
+        verb = stopPx + 0.005 < prevPx ? 'decreased' : 'increased';
+      }
+    }
+    var upper = msg.toUpperCase();
+    var phase = String(d.phase || '').toLowerCase();
+    var deferred = phase === 'deferred' || upper.indexOf('DEFERRED') >= 0;
+    var increased = !deferred && (
+      verb === 'increased' ||
+      (phase === 'moved' && !isNaN(stopPx) && !isNaN(prevPx) && stopPx >= prevPx - 0.005)
+    );
+    var decreased = !deferred && (
+      verb === 'decreased' ||
+      (phase === 'moved' && !isNaN(stopPx) && !isNaN(prevPx) && stopPx < prevPx - 0.005)
+    );
+    if (deferred || decreased) increased = false;
+    if (increased && (delta == null || isNaN(delta)) && !isNaN(stopPx) && !isNaN(prevPx)) {
+      delta = Math.round((stopPx - prevPx) * 100) / 100;
+    }
+    return {
+      ticker: ticker,
+      day: logDayKey(ev && ev.ts),
+      increased: !!increased && !!ticker,
+      stopPx: isNaN(stopPx) ? null : stopPx,
+      prevPx: isNaN(prevPx) ? null : prevPx,
+      delta: isNaN(delta) ? null : delta,
+      dryRun: !!(d.dry_run || /^DRY-RUN\s/i.test(msg))
+    };
+  }
+
+  function collapseStopIncreases(events) {
+    var groups = {};
+    var hide = {};
+    events.forEach(function (ev, i) {
+      var meta = stopEventMeta(ev);
+      if (!meta || !meta.increased || !meta.day) return;
+      var key = meta.day + '|' + meta.ticker + (meta.dryRun ? '|dry' : '');
+      var g = groups[key];
+      if (!g) {
+        groups[key] = {
+          n: 1,
+          latestPx: meta.stopPx,
+          oldestPrev: meta.prevPx,
+          sumDelta: meta.delta != null ? meta.delta : 0
+        };
+        return;
+      }
+      g.n += 1;
+      if (meta.prevPx != null) g.oldestPrev = meta.prevPx;
+      if (meta.delta != null) g.sumDelta += meta.delta;
+      hide[i] = true;
+    });
+    return events.map(function (ev, i) {
+      if (hide[i]) return null;
+      var meta = stopEventMeta(ev);
+      if (!meta || !meta.increased || !meta.day) return ev;
+      var key = meta.day + '|' + meta.ticker + (meta.dryRun ? '|dry' : '');
+      var g = groups[key];
+      if (!g || g.n < 2) return ev;
+      var total = g.sumDelta ? Math.round(g.sumDelta * 100) / 100 : null;
+      if (total == null && g.latestPx != null && g.oldestPrev != null) {
+        total = Math.round((g.latestPx - g.oldestPrev) * 100) / 100;
+      }
+      var prefix = meta.dryRun ? 'DRY-RUN ' : '';
+      var toPx = g.latestPx != null ? ('$' + Number(g.latestPx).toFixed(2)) : '';
+      var lift = total != null ? ('$' + Math.abs(total).toFixed(2)) : '';
+      var msg;
+      if (lift && toPx) {
+        msg = prefix + 'STOP-LIMIT increased ' + lift + ' to ' + toPx + ' for ' + meta.ticker;
+      } else {
+        msg = String(ev.message || '');
+      }
+      msg += ' (' + g.n + ' moves)';
+      return Object.assign({}, ev, { message: msg, _collapsedMoves: g.n });
+    }).filter(function (ev) { return !!ev; });
+  }
+
   function mergeLogHead(fresh) {
     if (!Array.isArray(fresh) || !fresh.length) {
       if (!logEventsCache.length) logEventsCache = [];
@@ -2691,9 +2811,9 @@
     var box = document.getElementById('event-list');
     if (!box) return;
     updateLogFilterHint();
-    var events = logEventsCache.map(function (ev) {
+    var events = collapseStopIncreases(logEventsCache.map(function (ev) {
       return Object.assign({}, ev, { _cat: normalizeLogCategory(ev) });
-    });
+    }));
     if (!logEventsCache.length) {
       box.innerHTML = '<div class="empty">No events yet.</div>';
       renderLogMore();
@@ -2735,7 +2855,7 @@
           '<div class="ts">' + escapeHtml(tsText) + '</div>' +
           '<div class="lvl' + lvlClass + '">' + lvlLabel + '</div>' +
           '<div class="cat">' + escapeHtml(logCategoryLabel(ev._cat)) + '</div>' +
-          '<div>' + escapeHtml(ev.message || '') + '</div>' +
+          '<div class="msg">' + formatEventMessage(ev) + '</div>' +
         '</div>'
       );
     });

@@ -482,6 +482,10 @@ table.data .pos-status-muted { color: var(--muted); }
 .event.error { background: rgba(159, 18, 57, 0.04); }
 .event.error .cat { color: var(--bad); }
 .event.warn .cat { color: var(--warn); }
+.event .pl { font-variant-numeric: tabular-nums; font-weight: 600; }
+.event .pl.pos { color: var(--good); }
+.event .pl.neg { color: var(--bad); }
+.event .log-moves { color: var(--muted); font-weight: 500; }
 
 .empty {
   color: var(--muted);

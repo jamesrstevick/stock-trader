@@ -1632,7 +1632,7 @@ _LOG_CATEGORY_ALIASES = {
 
 # Bump when user-facing event_log copy changes. Next process start rewrites stored rows
 # (DELL Pull from GitHub restarts the loop/dashboard, so this is "first pull").
-_EVENT_LOG_CLEAN_VERSION = 4
+_EVENT_LOG_CLEAN_VERSION = 5
 _EVENT_LOG_CLEAN_FLAG = 'event_log_clean_version'
 _LOG_TICKER_RE = re.compile(r'\b([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b')
 _LOG_MONEY_RE = re.compile(r'\$([0-9]+(?:\.[0-9]+)?)')
@@ -1717,6 +1717,69 @@ def _fmt_log_px(price: Any) -> str:
     return '$%.2f' % float(price)
 
 
+def _sold_pl_pair(
+    price: Optional[float] = None,
+    quantity: Optional[int] = None,
+    cost_basis: Optional[float] = None,
+    realized_pl: Optional[float] = None,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Return (realized_pl, realized_pct vs cost). Percent is unsigned in the log suffix."""
+    pl = None  # type: Optional[float]
+    if realized_pl is not None:
+        try:
+            pl = float(realized_pl)
+        except (TypeError, ValueError):
+            pl = None
+    if (
+        pl is None
+        and price is not None
+        and cost_basis is not None
+        and quantity is not None
+    ):
+        try:
+            pl = (float(price) - float(cost_basis)) * float(quantity)
+        except (TypeError, ValueError):
+            pl = None
+    pct = None  # type: Optional[float]
+    if price is not None and cost_basis is not None:
+        try:
+            basis = float(cost_basis)
+            if abs(basis) > 1e-9:
+                pct = (float(price) / basis - 1.0) * 100.0
+        except (TypeError, ValueError):
+            pct = None
+    if pct is None and pl is not None and cost_basis is not None and quantity is not None:
+        try:
+            cost = float(cost_basis) * float(quantity)
+            if abs(cost) > 1e-9:
+                pct = float(pl) / cost * 100.0
+        except (TypeError, ValueError):
+            pct = None
+    return pl, pct
+
+
+def _fmt_sold_pl_suffix(
+    realized_pl: Optional[float],
+    realized_pct: Optional[float] = None,
+) -> str:
+    """Parenthetical: (+ $12.50 | 1.23%) or (- $8.00 | 8.00%)."""
+    if realized_pl is None:
+        return ''
+    try:
+        n = float(realized_pl)
+    except (TypeError, ValueError):
+        return ''
+    sign = '+' if n >= 0 else '-'
+    dollar = '$%.2f' % abs(n)
+    if realized_pct is None:
+        return ' (%s %s)' % (sign, dollar)
+    try:
+        pct_s = '%.2f' % abs(float(realized_pct))
+    except (TypeError, ValueError):
+        return ' (%s %s)' % (sign, dollar)
+    return ' (%s %s | %s%%)' % (sign, dollar, pct_s)
+
+
 def format_bought_log_message(
     ticker: str,
     quantity: Optional[int] = None,
@@ -1738,15 +1801,20 @@ def format_sold_log_message(
     quantity: Optional[int] = None,
     price: Optional[float] = None,
     dry_run: bool = False,
+    cost_basis: Optional[float] = None,
+    realized_pl: Optional[float] = None,
 ) -> str:
     prefix = 'DRY-RUN ' if dry_run else ''
     qty_s = ('%s ' % int(quantity)) if quantity is not None else ''
     if price is not None:
         try:
-            return '%sSOLD %s%s @ %s' % (prefix, qty_s, ticker, _fmt_log_px(price))
+            base = '%sSOLD %s%s @ %s' % (prefix, qty_s, ticker, _fmt_log_px(price))
         except (TypeError, ValueError):
-            pass
-    return '%sSOLD %s%s' % (prefix, qty_s, ticker)
+            base = '%sSOLD %s%s' % (prefix, qty_s, ticker)
+    else:
+        base = '%sSOLD %s%s' % (prefix, qty_s, ticker)
+    pl, pct = _sold_pl_pair(price, quantity, cost_basis, realized_pl)
+    return base + _fmt_sold_pl_suffix(pl, pct)
 
 
 def format_stop_limit_log_message(
@@ -2123,22 +2191,39 @@ def _legacy_event_plan(
             'message': format_sold_log_message(tkr, qty, px, dry_run=True),
             'kind': 'sold',
             'ticker': tkr,
+            'qty': qty,
+            'px': px,
+            'dry_run': True,
         }
 
     sold = re.match(
-        r'^SOLD\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b',
+        r'^(?:DRY-RUN\s+)?SOLD\s+(?:(\d+)\s+)?([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b',
         msg,
         re.I,
     )
     if sold:
-        tkr = sold.group(1).upper()
-        qty = _qty_from_legacy_message(msg, detail)
-        px = _detail_float(detail, 'price', 'stop_order_price')
+        tkr = sold.group(2).upper()
+        qty = None  # type: Optional[int]
+        if sold.group(1):
+            try:
+                qty = int(sold.group(1))
+            except (TypeError, ValueError):
+                qty = None
+        if qty is None:
+            qty = _qty_from_legacy_message(msg, detail)
+        px = _detail_float(detail, 'price', 'stop_order_price', 'stop_limit_price')
         if px is None:
             stop_m = re.search(r'@ stop \$([0-9.]+)', msg, re.I)
             if stop_m:
                 try:
                     px = float(stop_m.group(1))
+                except (TypeError, ValueError):
+                    px = None
+        if px is None:
+            at_m = re.search(r'@\s+\$([0-9.]+)', msg, re.I)
+            if at_m:
+                try:
+                    px = float(at_m.group(1))
                 except (TypeError, ValueError):
                     px = None
         if px is None:
@@ -2149,6 +2234,9 @@ def _legacy_event_plan(
             'message': format_sold_log_message(tkr, qty, px, dry_run=dry),
             'kind': 'sold',
             'ticker': tkr,
+            'qty': qty,
+            'px': px,
+            'dry_run': dry,
         }
 
     if upper.startswith('BUY PASS SKIPPED') or upper.startswith('SELL PASS SKIPPED'):
@@ -2182,6 +2270,39 @@ def _legacy_event_plan(
     return {'action': 'keep', 'category': cat, 'message': msg, 'kind': cat, 'ticker': ticker}
 
 
+def _nearest_sell_trade(
+    sells_by_key: Dict[Any, List[Dict[str, Any]]],
+    user_id: Any,
+    ticker: str,
+    event_ts: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    tkr = str(ticker or '').strip().upper()
+    rows = list(sells_by_key.get((user_id, tkr)) or [])
+    if not rows:
+        rows = list(sells_by_key.get((None, tkr)) or [])
+    if not rows:
+        return None
+    ev = _parse_trade_ts(event_ts)
+    if ev is None:
+        return rows[-1]
+    best = None  # type: Optional[Dict[str, Any]]
+    best_dt = None  # type: Optional[float]
+    for row in rows:
+        tt = _parse_trade_ts(row.get('ts'))
+        if tt is None:
+            continue
+        dt = abs((tt - ev).total_seconds())
+        if best is None or best_dt is None or dt < best_dt:
+            best = row
+            best_dt = dt
+    if best is None:
+        return rows[-1]
+    # Same-name round-trips: ignore a ledger sell more than 2 days from the event.
+    if best_dt is not None and best_dt > 172800:
+        return None
+    return best
+
+
 def _rewrite_legacy_event_log(conn: sqlite3.Connection) -> None:
     """Rewrite stored Log rows when _EVENT_LOG_CLEAN_VERSION is bumped."""
     cursor = conn.cursor()
@@ -2210,25 +2331,69 @@ def _rewrite_legacy_event_log(conn: sqlite3.Connection) -> None:
         return
     try:
         cursor.execute(
-            'SELECT id, user_id, category, message, detail_json FROM event_log ORDER BY id ASC'
+            'SELECT id, user_id, ts, category, message, detail_json FROM event_log ORDER BY id ASC'
         )
         rows = cursor.fetchall()
     except sqlite3.OperationalError:
         try:
             cursor.execute(
-                'SELECT id, category, message, detail_json FROM event_log ORDER BY id ASC'
+                'SELECT id, ts, category, message, detail_json FROM event_log ORDER BY id ASC'
             )
-            rows = [(r[0], None, r[1], r[2], r[3]) for r in cursor.fetchall()]
+            rows = [(r[0], None, r[1], r[2], r[3], r[4]) for r in cursor.fetchall()]
         except sqlite3.OperationalError:
-            return
+            try:
+                cursor.execute(
+                    'SELECT id, user_id, category, message, detail_json FROM event_log ORDER BY id ASC'
+                )
+                rows = [(r[0], r[1], None, r[2], r[3], r[4]) for r in cursor.fetchall()]
+            except sqlite3.OperationalError:
+                return
 
     # Per user: last armed stop price, and whether the last stop-limit row was deferred.
     last_stop = {}  # type: Dict[Any, Dict[str, float]]
     last_deferred = {}  # type: Dict[Any, Dict[str, bool]]
+    sells_by_key = {}  # type: Dict[Any, List[Dict[str, Any]]]
+    try:
+        cursor.execute(
+            '''
+            SELECT user_id, ts, ticker, quantity, price, cost_basis_per_share, realized_pl
+            FROM trade_history WHERE side = 'sell'
+            ORDER BY ts ASC
+            '''
+        )
+        for uid_t, ts_t, tkr_t, qty_t, px_t, basis_t, rpl_t in cursor.fetchall():
+            key = (uid_t, str(tkr_t or '').strip().upper())
+            sells_by_key.setdefault(key, []).append({
+                'ts': ts_t,
+                'quantity': qty_t,
+                'price': px_t,
+                'cost_basis_per_share': basis_t,
+                'realized_pl': rpl_t,
+            })
+    except sqlite3.OperationalError:
+        try:
+            cursor.execute(
+                '''
+                SELECT ts, ticker, quantity, price, cost_basis_per_share, realized_pl
+                FROM trade_history WHERE side = 'sell'
+                ORDER BY ts ASC
+                '''
+            )
+            for ts_t, tkr_t, qty_t, px_t, basis_t, rpl_t in cursor.fetchall():
+                key = (None, str(tkr_t or '').strip().upper())
+                sells_by_key.setdefault(key, []).append({
+                    'ts': ts_t,
+                    'quantity': qty_t,
+                    'price': px_t,
+                    'cost_basis_per_share': basis_t,
+                    'realized_pl': rpl_t,
+                })
+        except sqlite3.OperationalError:
+            sells_by_key = {}
     n_update = 0
     n_delete = 0
     for row in rows:
-        ev_id, user_id, category, message, detail_json = row
+        ev_id, user_id, ev_ts, category, message, detail_json = row
         detail = {}  # type: Dict[str, Any]
         if detail_json:
             try:
@@ -2277,15 +2442,62 @@ def _rewrite_legacy_event_log(conn: sqlite3.Connection) -> None:
         elif kind == 'sold' and ticker:
             last_deferred[uid][ticker] = False
             last_stop[uid].pop(ticker, None)
+            trade = _nearest_sell_trade(sells_by_key, uid, ticker, ev_ts)
+            qty = plan.get('qty')
+            if qty is None:
+                qty = _qty_from_legacy_message(str(plan.get('message') or message), detail)
+            px = plan.get('px')
+            basis = _detail_float(
+                detail, 'average_price', 'cost_basis', 'cost_basis_per_share',
+            )
+            rpl = _detail_float(detail, 'realized_pl')
+            if trade:
+                if qty is None:
+                    qty = trade.get('quantity')
+                if px is None:
+                    px = trade.get('price')
+                if basis is None:
+                    basis = trade.get('cost_basis_per_share')
+                if rpl is None:
+                    rpl = trade.get('realized_pl')
+            dry = bool(plan.get('dry_run'))
+            plan['message'] = format_sold_log_message(
+                ticker, qty, px, dry_run=dry, cost_basis=basis, realized_pl=rpl,
+            )
+            action = 'update'
+            pl, pct = _sold_pl_pair(px, qty, basis, rpl)
+            if pl is not None:
+                detail['realized_pl'] = pl
+                if pct is not None:
+                    detail['realized_pct'] = pct
+                if basis is not None:
+                    detail['average_price'] = basis
+                if qty is not None:
+                    detail['quantity'] = qty
+                if px is not None:
+                    detail['price'] = px
+                plan['detail'] = detail
+                plan['update_detail'] = True
 
         new_cat = plan.get('category')
         new_msg = plan.get('message')
         if action == 'update' and new_cat and new_msg:
-            if new_cat != category or new_msg != message:
-                cursor.execute(
-                    'UPDATE event_log SET category = ?, message = ? WHERE id = ?',
-                    (new_cat, new_msg, ev_id),
-                )
+            new_detail = plan.get('detail') if plan.get('update_detail') else None
+            if new_cat != category or new_msg != message or new_detail is not None:
+                if new_detail is not None:
+                    cursor.execute(
+                        '''
+                        UPDATE event_log
+                        SET category = ?, message = ?, detail_json = ?
+                        WHERE id = ?
+                        ''',
+                        (new_cat, new_msg, json.dumps(new_detail), ev_id),
+                    )
+                else:
+                    cursor.execute(
+                        'UPDATE event_log SET category = ?, message = ? WHERE id = ?',
+                        (new_cat, new_msg, ev_id),
+                    )
                 n_update += 1
 
     cursor.execute(
@@ -3689,6 +3901,10 @@ def _run_trader_pass_for_user(
         print_loop_status('Starting pass for %s…' % uname)
         maybe_reinit_schwab_client(uid)
         maybe_reset_jobs_at_market_open()
+        try:
+            maybe_backfill_stop_fill_trades()
+        except Exception as e:
+            print('maybe_backfill_stop_fill_trades (%s): %s' % (uname, e))
         try:
             maybe_record_daily_equity_close()
         except Exception as e:
@@ -6062,19 +6278,21 @@ def _apply_schwab_positions_to_db(
             cursor.execute(
                 """
                 SELECT ticker, stop_order_id, trail_active, stop_order_price,
-                       shares_owned, average_price
+                       stop_limit_price, shares_owned, average_price, market_value
                 FROM positions WHERE shares_owned > 0
                 """
             )
-            for tkr, oid, trail_a, stop_px, sh, avg in cursor.fetchall():
+            for tkr, oid, trail_a, stop_px, limit_px, sh, avg, mv in cursor.fetchall():
                 if tkr not in seen_tickers:
                     closed_exits.append({
                         'ticker': tkr,
                         'stop_order_id': oid,
                         'trail_active': bool(trail_a),
                         'stop_order_price': stop_px,
+                        'stop_limit_price': limit_px,
                         'shares_owned': sh,
                         'average_price': avg,
+                        'market_value': mv,
                     })
                     if oid and not str(oid).startswith('SIM'):
                         cancel_stop_order(str(oid), account_hash=account_hash)
@@ -6109,8 +6327,86 @@ def _apply_schwab_positions_to_db(
     return synced_count
 
 
+def _positive_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    return n
+
+
+def _sync_close_fill_price(ex: Dict[str, Any]) -> Optional[float]:
+    """Best fill estimate: stop limit, stop trigger, then last mark."""
+    px = _positive_float(ex.get('stop_limit_price'))
+    if px is not None:
+        return px
+    px = _positive_float(ex.get('stop_order_price'))
+    if px is not None:
+        return px
+    mv = _positive_float(ex.get('market_value'))
+    shares = ex.get('shares_owned')
+    try:
+        qty = float(shares) if shares is not None else 0.0
+    except (TypeError, ValueError):
+        qty = 0.0
+    if mv is not None and qty > 0:
+        return mv / qty
+    return None
+
+
+def _trade_mode_is_simulation(mode: Any) -> bool:
+    return str(mode or '').strip().lower() == 'simulation'
+
+
+def _latest_real_trade(ticker: str) -> Optional[Dict[str, Any]]:
+    real = []  # type: List[Dict[str, Any]]
+    for t in get_trade_history(ticker=ticker, limit=50):
+        if _trade_mode_is_simulation(t.get('mode')):
+            continue
+        real.append(t)
+    if not real:
+        return None
+    real.sort(key=lambda row: ((row.get('ts') or ''), row.get('id') or 0), reverse=True)
+    return real[0]
+
+
+def _should_record_sync_close(ticker: str) -> bool:
+    """Skip if execute_sell (or a prior backfill) already ledgered this close."""
+    last = _latest_real_trade(ticker)
+    if last is None:
+        return True
+    return str(last.get('side') or '').strip().lower() != 'sell'
+
+
+def _realized_pl_for_trade(t: Dict[str, Any]) -> Optional[float]:
+    if t.get('realized_pl') is not None:
+        try:
+            return float(t['realized_pl'])
+        except (TypeError, ValueError):
+            pass
+    if str(t.get('side') or '').strip().lower() != 'sell':
+        return None
+    px = t.get('price')
+    basis = t.get('cost_basis_per_share')
+    qty = t.get('quantity')
+    if px is None or basis is None or qty is None:
+        return None
+    try:
+        return (float(px) - float(basis)) * float(qty)
+    except (TypeError, ValueError):
+        return None
+
+
 def _log_position_closed_on_sync(ex: Dict[str, Any]) -> None:
-    """Log when a managed position disappears — distinguish hard vs trail stop fills."""
+    """
+    Broker stop (or other) fill: shares vanished on Schwab sync.
+
+    Must write trade_history — the event log alone does not feed the scorecard.
+    """
     ticker = ex.get('ticker')
     if not ticker:
         return
@@ -6118,37 +6414,64 @@ def _log_position_closed_on_sync(ex: Dict[str, Any]) -> None:
     trail = bool(ex.get('trail_active'))
     stop_px = ex.get('stop_order_price')
     shares = ex.get('shares_owned')
-    # Only attribute to stop-limit when we had a resting protective order tracked
-    if not oid and stop_px is None:
-        return
-    exit_info = describe_sell_exit('trail' if trail else 'hard', trail)
+    had_stop = bool(oid) or stop_px is not None or ex.get('stop_limit_price') is not None
     qty = None  # type: Optional[int]
     try:
         if shares:
             qty = int(shares)
     except (TypeError, ValueError):
         qty = None
-    px = None  # type: Optional[float]
-    try:
-        if stop_px is not None:
-            px = float(stop_px)
-    except (TypeError, ValueError):
-        px = None
-    msg = format_sold_log_message(ticker, qty, px)
-    print(f"  {msg} ({exit_info['short_label']})")
+    px = _sync_close_fill_price(ex)
+    basis = _positive_float(ex.get('average_price'))
+    if had_stop:
+        exit_info = describe_sell_exit('trail' if trail else 'hard', trail)
+        label = exit_info['short_label']
+        source = 'stop_limit_fill'
+        trade_note = 'STOP_LIMIT fill detected on Schwab sync (%s)' % label
+    else:
+        exit_info = {
+            'exit_kind': 'unknown_close',
+            'short_label': 'CLOSED',
+        }
+        label = exit_info['short_label']
+        source = 'sync_close'
+        trade_note = 'Position closed on Schwab sync (no local stop tracked)'
+    recorded = False
+    if qty and _should_record_sync_close(str(ticker)):
+        record_trade(
+            'sell',
+            str(ticker),
+            qty,
+            price=px,
+            order_id=str(oid) if oid else None,
+            cost_basis_per_share=basis,
+            mode='real',
+            note=trade_note,
+        )
+        recorded = True
+    if not had_stop and not recorded:
+        return
+    msg = format_sold_log_message(ticker, qty, px, cost_basis=basis)
+    print(f"  {msg} ({label})")
+    pl, pct = _sold_pl_pair(px, qty, basis)
     log_event(
         'sell',
         msg,
         detail={
             'ticker': ticker,
+            'quantity': qty,
+            'price': px,
             'exit_kind': exit_info['exit_kind'],
-            'source': 'stop_limit_fill',
+            'source': source,
             'phase': 'filled',
             'stop_order_id': oid,
             'stop_order_price': stop_px,
+            'stop_limit_price': ex.get('stop_limit_price'),
             'trail_active': trail,
             'shares_owned': shares,
-            'average_price': ex.get('average_price'),
+            'average_price': basis,
+            'realized_pl': pl,
+            'realized_pct': pct,
         },
     )
 
@@ -6945,6 +7268,7 @@ def record_trade(
     mode: Optional[str] = None,
     note: Optional[str] = None,
     scorecard: Optional[str] = None,
+    ts: Optional[str] = None,
 ) -> Optional[int]:
     """
     Append one row to trade_history for model/performance tracking.
@@ -6954,6 +7278,7 @@ def record_trade(
     cost_basis_per_share: for sells, average cost used for realized_pl
     scorecard: 'algorithm' counts on algo-only scorecard; 'excluded' does not
                (legacy / enrolled sells). Auto-detected from position origin if None.
+    ts: ISO timestamp; default now. Pass original event time when backfilling.
     """
     side_norm = (side or '').strip().lower()
     if side_norm not in ('buy', 'sell'):
@@ -6967,7 +7292,8 @@ def record_trade(
         scorecard = str(scorecard).strip().lower()
         if scorecard not in ('algorithm', 'excluded'):
             scorecard = 'excluded'
-    ts = datetime.now().isoformat(timespec='seconds')
+    ts_in = (ts or '').strip()
+    ts = ts_in or datetime.now().isoformat(timespec='seconds')
     qty = int(quantity)
     px = float(price) if price is not None else None
     dollars = (px * qty) if px is not None else None
@@ -7059,6 +7385,129 @@ def get_trade_history(
         'scorecard',
     ]
     return [dict(zip(cols, r)) for r in rows]
+
+
+def _parse_trade_ts(value: Any) -> Optional[datetime]:
+    text = str(value or '').strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace('Z', '+00:00')[:19])
+    except (TypeError, ValueError):
+        return None
+
+
+def _has_real_sell_near(ticker: str, event_ts: str, before_hours: float = 1.0, after_hours: float = 24.0) -> bool:
+    ev = _parse_trade_ts(event_ts)
+    ev_key = (event_ts or '')[:19]
+    for t in get_trade_history(ticker=ticker, limit=50):
+        if _trade_mode_is_simulation(t.get('mode')):
+            continue
+        if str(t.get('side') or '').strip().lower() != 'sell':
+            continue
+        ts = (t.get('ts') or '')[:19]
+        if ev is None:
+            if ts == ev_key:
+                return True
+            continue
+        tt = _parse_trade_ts(ts)
+        if tt is None:
+            continue
+        if (ev - timedelta(hours=before_hours)) <= tt <= (ev + timedelta(hours=after_hours)):
+            return True
+    return False
+
+
+def backfill_stop_fill_trades() -> int:
+    """
+    Write trade_history sells for stop-limit fills that were only logged as events.
+
+    Idempotent. Uses the original event timestamp so the row counts since algorithm_start.
+    """
+    init_database()
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            '''
+            SELECT ts, message, detail_json FROM event_log
+            WHERE category = 'sell'
+            ORDER BY ts ASC
+            '''
+        )
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+
+    inserted = 0
+    for ts, _message, detail_json in rows:
+        detail = {}  # type: Dict[str, Any]
+        if detail_json:
+            try:
+                parsed = json.loads(detail_json)
+                if isinstance(parsed, dict):
+                    detail = parsed
+            except (TypeError, ValueError):
+                detail = {}
+        if str(detail.get('source') or '') != 'stop_limit_fill':
+            continue
+        ticker = str(detail.get('ticker') or '').strip().upper()
+        if not ticker:
+            continue
+        if _has_real_sell_near(ticker, str(ts or '')):
+            continue
+        qty = detail.get('shares_owned')
+        try:
+            qty_i = int(qty) if qty else 0
+        except (TypeError, ValueError):
+            qty_i = 0
+        if qty_i <= 0:
+            continue
+        px = _sync_close_fill_price({
+            'stop_limit_price': detail.get('stop_limit_price'),
+            'stop_order_price': detail.get('stop_order_price'),
+            'market_value': detail.get('market_value'),
+            'shares_owned': qty_i,
+        })
+        basis = _positive_float(detail.get('average_price'))
+        oid = detail.get('stop_order_id')
+        trail = bool(detail.get('trail_active'))
+        exit_info = describe_sell_exit(
+            'trail' if trail else 'hard', trail
+        )
+        note = 'STOP_LIMIT fill detected on Schwab sync (%s)' % exit_info['short_label']
+        trade_id = record_trade(
+            'sell',
+            ticker,
+            qty_i,
+            price=px,
+            order_id=str(oid) if oid else None,
+            cost_basis_per_share=basis,
+            mode='real',
+            note=note,
+            ts=str(ts)[:19] if ts else None,
+        )
+        if trade_id:
+            inserted += 1
+            print(
+                'Backfilled STOP_LIMIT fill for %s (trade id=%s, ts=%s)'
+                % (ticker, trade_id, ts)
+            )
+    return inserted
+
+
+def maybe_backfill_stop_fill_trades() -> int:
+    if get_runtime_flag('stop_fill_trades_backfilled') == '1':
+        return 0
+    try:
+        n = backfill_stop_fill_trades()
+        set_runtime_flag('stop_fill_trades_backfilled', '1')
+        return n
+    except Exception as e:
+        print('Warning: stop-fill trade backfill failed: %s' % e)
+        return 0
 
 
 def summarize_trade_history(ticker: Optional[str] = None) -> Dict[str, Any]:
@@ -7377,8 +7826,14 @@ def execute_sell(
                 sold_msg = format_sold_log_message(
                     ticker, quantity,
                     float(sell_price) if sell_price is not None else None,
+                    cost_basis=cost_basis,
                 )
                 print(f"  {sold_msg}")
+                pl, pct = _sold_pl_pair(
+                    float(sell_price) if sell_price is not None else None,
+                    quantity,
+                    cost_basis,
+                )
                 log_event(
                     'sell',
                     sold_msg,
@@ -7390,6 +7845,9 @@ def execute_sell(
                         'exit_kind': exit_kind or exit_info['exit_kind'],
                         'phase': 'filled',
                         'order_type': 'MARKET',
+                        'average_price': cost_basis,
+                        'realized_pl': pl,
+                        'realized_pct': pct,
                     },
                 )
             else:
@@ -7411,11 +7869,17 @@ def execute_sell(
             ticker, quantity,
             float(sell_price) if sell_price is not None else None,
             dry_run=True,
+            cost_basis=cost_basis,
         )
         print(f"[DRY-RUN] {sold_msg}")
         if note:
             print(f"   ({note})")
         print(f"   (TRADE_DRY_RUN — no Schwab order; shares_owned not updated)")
+        pl, pct = _sold_pl_pair(
+            float(sell_price) if sell_price is not None else None,
+            quantity,
+            cost_basis,
+        )
         log_event(
             'sell',
             sold_msg,
@@ -7428,6 +7892,9 @@ def execute_sell(
                 'order_type': 'MARKET',
                 'dry_run': True,
                 'reason': note,
+                'average_price': cost_basis,
+                'realized_pl': pl,
+                'realized_pct': pct,
             },
         )
         record_trade(
@@ -8371,13 +8838,15 @@ def get_algorithm_performance() -> Dict[str, Any]:
     Soft-reset performance since algorithm_start.
 
     Primary (algo-only scorecard):
-      - Realized P/L on trades with scorecard='algorithm' (algo buys + their sells)
+      - Realized P/L on real (not dry-run) trades with scorecard='algorithm'
       - Unrealized P/L on open positions with origin='algo_buy'
       - Legacy / enrolled names never count (even if later sold)
+      - Broker STOP_LIMIT fills are ledgered (and backfilled from the event log)
 
     Secondary (account context only):
       - Whole-account equity vs start snapshot (includes legacy MTM)
     """
+    maybe_backfill_stop_fill_trades()
     start = get_algorithm_start()
     snap = get_algorithm_start_snapshot()
     books = list_position_books()
@@ -8428,6 +8897,8 @@ def get_algorithm_performance() -> Dict[str, Any]:
     origins = books.get('all_origins') or {}
     if start_key:
         for t in get_trade_history(limit=5000):
+            if _trade_mode_is_simulation(t.get('mode')):
+                continue
             ts = (t.get('ts') or '')[:19]
             if ts < start_key:
                 continue
@@ -8441,13 +8912,14 @@ def get_algorithm_performance() -> Dict[str, Any]:
                     sc = 'algorithm'
                 else:
                     sc = 'excluded'
+            realized = _realized_pl_for_trade(t)
             if sc != 'algorithm':
-                if t.get('side') == 'sell' and t.get('realized_pl') is not None:
-                    excluded_realized += float(t['realized_pl'])
+                if t.get('side') == 'sell' and realized is not None:
+                    excluded_realized += realized
                 continue
             algo_trades.append(t)
-            if t.get('side') == 'sell' and t.get('realized_pl') is not None:
-                algo_realized += float(t['realized_pl'])
+            if t.get('side') == 'sell' and realized is not None:
+                algo_realized += realized
             if t.get('side') == 'buy' and t.get('dollars') is not None:
                 algo_buy_dollars += float(t['dollars'])
             if t.get('side') == 'sell' and t.get('dollars') is not None:
@@ -8531,7 +9003,8 @@ def get_algorithm_performance() -> Dict[str, Any]:
             'untagged': books['untagged'],
         },
         'note': (
-            'Algo scorecard = origin=algo_buy only. '
+            'Algo scorecard = origin=algo_buy only (live fills, not dry-run). '
+            'STOP_LIMIT fills are recorded on the trade ledger. '
             'Legacy and enrolled sells are excluded even if the bot sells them. '
             'equity_delta_since_start is whole-account context (includes legacy MTM).'
         ),
