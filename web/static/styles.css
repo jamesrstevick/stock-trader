@@ -890,20 +890,37 @@ table.data .pos-status-muted { color: var(--muted); }
   color: var(--muted);
   cursor: not-allowed;
 }
-.buy-limit-row {
+.buy-limit-fields {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  max-width: 22rem;
+}
+.buy-limit-switch-wrap {
   display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: 0.85rem 1.25rem;
-  margin-bottom: 0.85rem;
+  align-items: center;
+  min-height: 2.55rem;
+  padding: 0 2.15rem 0 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+.buy-limit-switch-wrap.is-locked {
+  background: #f6f3ec;
+}
+.buy-limit-switch-wrap.is-disabled {
+  background: #f0ede6;
 }
 .buy-limit-switch {
   display: inline-flex;
   align-items: center;
   gap: 0.55rem;
-  margin: 0 0 0.35rem;
+  margin: 0;
   cursor: pointer;
   user-select: none;
+  width: 100%;
+}
+.buy-limit-switch-wrap.is-locked .buy-limit-switch,
+.buy-limit-switch-wrap.is-disabled .buy-limit-switch {
+  cursor: default;
 }
 .buy-limit-switch input {
   position: absolute;
@@ -941,22 +958,16 @@ table.data .pos-status-muted { color: var(--muted); }
   transform: translateX(1.05rem);
 }
 .buy-limit-switch input:disabled + .buy-limit-switch-ui {
-  opacity: 0.72;
+  opacity: 0.85;
 }
 .buy-limit-switch input:focus-visible + .buy-limit-switch-ui {
   outline: 2px solid var(--accent-soft);
   outline-offset: 2px;
 }
 .buy-limit-switch-label {
-  font-size: 0.92rem;
+  font-size: 0.95rem;
   font-weight: 500;
   color: var(--ink);
-}
-.buy-limit-pct-field {
-  margin-bottom: 0;
-  min-width: 7.5rem;
-  max-width: 9rem;
-  flex: 0 1 auto;
 }
 .btn-icon {
   flex-shrink: 0;
