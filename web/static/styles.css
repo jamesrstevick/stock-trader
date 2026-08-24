@@ -898,16 +898,14 @@ table.data .pos-status-muted { color: var(--muted); }
   display: flex;
   align-items: center;
   min-height: 2.55rem;
-  padding: 0 2.15rem 0 0.7rem;
+  padding: 0 0.7rem;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fff;
+  transition: box-shadow 0.15s ease, border-color 0.15s ease;
 }
-.buy-limit-switch-wrap.is-locked {
+.buy-limit-switch-wrap.is-readonly-ui {
   background: #f6f3ec;
-}
-.buy-limit-switch-wrap.is-disabled {
-  background: #f0ede6;
 }
 .buy-limit-switch {
   display: inline-flex;
@@ -918,8 +916,7 @@ table.data .pos-status-muted { color: var(--muted); }
   user-select: none;
   width: 100%;
 }
-.buy-limit-switch-wrap.is-locked .buy-limit-switch,
-.buy-limit-switch-wrap.is-disabled .buy-limit-switch {
+.buy-limit-switch-wrap.is-readonly-ui .buy-limit-switch {
   cursor: default;
 }
 .buy-limit-switch input {
@@ -968,6 +965,33 @@ table.data .pos-status-muted { color: var(--muted); }
   font-size: 0.95rem;
   font-weight: 500;
   color: var(--ink);
+}
+#buy-limit-pct-wrap {
+  transition: box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.setup-input-wrap .field-edit-btn {
+  position: absolute;
+  right: 0.3rem;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1.45rem;
+  height: 1.45rem;
+  border: none;
+  background: transparent;
+}
+.buy-limit-unsaved {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 2px rgba(15, 110, 86, 0.28), 0 0 16px rgba(15, 110, 86, 0.22);
+  animation: buy-limit-unsaved-pulse 2.2s ease-in-out infinite;
+}
+#buy-limit-save-btn.buy-limit-unsaved {
+  border-color: transparent;
+  box-shadow: 0 0 0 2px rgba(15, 110, 86, 0.35), 0 0 18px rgba(15, 110, 86, 0.4);
+  animation: buy-limit-unsaved-pulse 2.2s ease-in-out infinite;
+}
+@keyframes buy-limit-unsaved-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(15, 110, 86, 0.22), 0 0 10px rgba(15, 110, 86, 0.16); }
+  50% { box-shadow: 0 0 0 3px rgba(15, 110, 86, 0.4), 0 0 22px rgba(15, 110, 86, 0.35); }
 }
 .btn-icon {
   flex-shrink: 0;

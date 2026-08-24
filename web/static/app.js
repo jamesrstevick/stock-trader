@@ -515,7 +515,8 @@
   var lastOnboardingStage = 'done';
   var setupEditing = false;
   var lastSetupPayload = null;
-  var buyLimitEditing = false;
+  var buyLimitPctEditing = false;
+  var buyLimitLocalDraft = false;
   var lastBuyLimitPayload = null;
   var filterBuilderState = { criteria: [], catalog: [], debounce: null };
   var ONBOARD_SNOOZE_KEY = 'onboardingGoLiveSnoozeUntil';
@@ -923,91 +924,137 @@
     if (hOrd) hOrd.textContent = fieldHint('order_amount_dollars');
   }
 
-  function renderBuyLimitCard(buyLimit) {
-    var card = document.getElementById('buy-limit-card');
-    if (!card) return;
-    buyLimit = buyLimit || {};
-    lastBuyLimitPayload = buyLimit;
-    var enabled = !!buyLimit.enabled;
-    var defaultPct = buyLimit.default_pct != null ? Number(buyLimit.default_pct) : 10;
-    var pct = buyLimit.discount_pct;
-    if (pct == null || pct === '') pct = enabled ? defaultPct : '';
+  function buyLimitDefaultPct() {
+    return (lastBuyLimitPayload && lastBuyLimitPayload.default_pct != null)
+      ? Number(lastBuyLimitPayload.default_pct)
+      : 10;
+  }
+
+  function buyLimitSavedPct() {
+    var saved = lastBuyLimitPayload || {};
+    var pct = saved.discount_pct;
+    if (pct == null || pct === '') {
+      return saved.enabled ? buyLimitDefaultPct() : null;
+    }
+    return Number(pct);
+  }
+
+  function readBuyLimitDraft() {
+    var toggle = document.getElementById('buy-limit-enabled');
+    var pctInput = document.getElementById('buy-limit-pct');
+    var on = !!(toggle && toggle.checked);
+    var raw = pctInput ? String(pctInput.value || '').trim() : '';
+    var pct = raw === '' ? null : Number(raw);
+    return { enabled: on, discount_pct: pct };
+  }
+
+  function isBuyLimitDirty() {
+    var draft = readBuyLimitDraft();
+    var saved = lastBuyLimitPayload || {};
+    var savedOn = !!saved.enabled;
+    if (draft.enabled !== savedOn) return true;
+    var savedPct = buyLimitSavedPct();
+    var draftPct = draft.discount_pct;
+    if (draft.enabled) {
+      if (draftPct == null || !Number.isFinite(draftPct)) return true;
+      return Number(draftPct) !== Number(savedPct);
+    }
+    // Off: pct change only counts as dirty if a value was entered and differs
+    if (draftPct == null || draftPct === '') {
+      return false;
+    }
+    if (savedPct == null) return true;
+    return Number(draftPct) !== Number(savedPct);
+  }
+
+  function applyBuyLimitUnsavedGlow(dirty) {
+    var switchWrap = document.getElementById('buy-limit-switch-wrap');
+    var pctWrap = document.getElementById('buy-limit-pct-wrap');
+    var saveBtn = document.getElementById('buy-limit-save-btn');
+    if (switchWrap) switchWrap.classList.toggle('buy-limit-unsaved', !!dirty);
+    if (pctWrap) pctWrap.classList.toggle('buy-limit-unsaved', !!dirty);
+    if (saveBtn) saveBtn.classList.toggle('buy-limit-unsaved', !!dirty);
+  }
+
+  function updateBuyLimitChrome() {
+    var toggle = document.getElementById('buy-limit-enabled');
+    var pctInput = document.getElementById('buy-limit-pct');
+    var editBtnPct = document.getElementById('buy-limit-edit-btn-pct');
+    var actions = document.getElementById('buy-limit-actions');
+    var enabledText = document.getElementById('buy-limit-enabled-text');
+    var enabledHint = document.getElementById('buy-limit-enabled-hint');
+    var saveBtn = document.getElementById('buy-limit-save-btn');
+    var on = !!(toggle && toggle.checked);
+    var dirty = isBuyLimitDirty();
+    var def = buyLimitDefaultPct();
+    var draft = readBuyLimitDraft();
+    var hintPct = draft.discount_pct != null && Number.isFinite(draft.discount_pct)
+      ? draft.discount_pct
+      : (buyLimitSavedPct() != null ? buyLimitSavedPct() : def);
+
+    if (toggle) toggle.disabled = isReadOnly();
+    var switchWrap = document.getElementById('buy-limit-switch-wrap');
+    if (switchWrap) switchWrap.classList.toggle('is-readonly-ui', isReadOnly());
+    if (enabledText) enabledText.textContent = on ? 'On' : 'Off';
+    if (enabledHint) {
+      enabledHint.textContent = on
+        ? ('Buy limit ' + hintPct + '% below market')
+        : 'Market buys';
+    }
+    if (pctInput) {
+      pctInput.disabled = !on || isReadOnly();
+      pctInput.readOnly = on && !buyLimitPctEditing;
+      if (on && (pctInput.value === '' || pctInput.value == null)) {
+        pctInput.value = String(
+          buyLimitSavedPct() != null ? buyLimitSavedPct() : def
+        );
+      }
+    }
+    if (editBtnPct) {
+      editBtnPct.hidden = isReadOnly() || buyLimitPctEditing || !on;
+    }
+    if (actions) actions.hidden = !(dirty || buyLimitPctEditing) || isReadOnly();
+    if (saveBtn) saveBtn.disabled = isReadOnly() || !dirty;
+    applyBuyLimitUnsavedGlow(dirty && !isReadOnly());
+    if (!dirty && !buyLimitPctEditing) buyLimitLocalDraft = false;
+
+    // Pill = what's actually saved / in effect (draft edits use glow, not the pill)
     var pill = document.getElementById('buy-limit-status-pill');
     if (pill) {
-      if (enabled) {
-        pill.textContent = 'On · ' + pct + '%';
+      var saved = lastBuyLimitPayload || {};
+      if (saved.enabled) {
+        var sp = buyLimitSavedPct();
+        pill.textContent = 'On · ' + (sp != null ? sp : def) + '%';
         pill.className = 'pill ok';
       } else {
         pill.textContent = 'Off';
         pill.className = 'pill';
       }
     }
-    var toggle = document.getElementById('buy-limit-enabled');
-    var pctInput = document.getElementById('buy-limit-pct');
-    var editBtn = document.getElementById('buy-limit-edit-btn');
-    var editBtnPct = document.getElementById('buy-limit-edit-btn-pct');
-    var actions = document.getElementById('buy-limit-actions');
-    var switchWrap = document.querySelector('.buy-limit-switch-wrap');
-    var enabledText = document.getElementById('buy-limit-enabled-text');
-    var enabledHint = document.getElementById('buy-limit-enabled-hint');
-    var pctHint = document.getElementById('buy-limit-pct-hint');
-    var locked = !buyLimitEditing;
-    var showEdit = locked && !isReadOnly();
-
-    if (toggle) {
-      toggle.disabled = locked || isReadOnly();
-      if (!buyLimitEditing) toggle.checked = enabled;
-    }
-    var onNow = buyLimitEditing ? !!(toggle && toggle.checked) : enabled;
-    if (enabledText) enabledText.textContent = onNow ? 'On' : 'Off';
-    if (enabledHint) {
-      enabledHint.textContent = onNow
-        ? ('GTC limit ' + (pct || defaultPct) + '% below market')
-        : 'Market buys';
-    }
-    if (pctHint) pctHint.textContent = onNow ? '1 – 99' : 'Off — field locked';
-    if (switchWrap) {
-      switchWrap.classList.toggle('is-locked', locked);
-      switchWrap.classList.toggle('is-disabled', false);
-    }
-    if (pctInput) {
-      // Off => disabled; on + locked => readonly (same feel as Account setup); editing => editable
-      pctInput.disabled = !onNow || isReadOnly();
-      pctInput.readOnly = onNow && locked;
-      if (!buyLimitEditing) {
-        pctInput.value = pct === '' || pct == null ? '' : String(pct);
-      } else if (onNow && (pctInput.value === '' || pctInput.value == null)) {
-        pctInput.value = String(defaultPct);
-      }
-    }
-    if (editBtn) editBtn.hidden = !showEdit;
-    if (editBtnPct) editBtnPct.hidden = !showEdit;
-    if (actions) actions.hidden = !buyLimitEditing;
   }
 
-  function syncBuyLimitPctEnabled() {
+  function renderBuyLimitCard(buyLimit) {
+    var card = document.getElementById('buy-limit-card');
+    if (!card) return;
+    if (buyLimit) lastBuyLimitPayload = buyLimit;
+    var saved = lastBuyLimitPayload || {};
+    var enabled = !!saved.enabled;
+    var def = buyLimitDefaultPct();
+    var pct = saved.discount_pct;
+    if (pct == null || pct === '') pct = enabled ? def : '';
+
     var toggle = document.getElementById('buy-limit-enabled');
     var pctInput = document.getElementById('buy-limit-pct');
-    var enabledText = document.getElementById('buy-limit-enabled-text');
-    var enabledHint = document.getElementById('buy-limit-enabled-hint');
-    var pctHint = document.getElementById('buy-limit-pct-hint');
-    if (!pctInput || !toggle) return;
-    var on = !!toggle.checked;
-    pctInput.disabled = !buyLimitEditing || !on || isReadOnly();
-    pctInput.readOnly = false;
-    if (enabledText) enabledText.textContent = on ? 'On' : 'Off';
-    var def = (lastBuyLimitPayload && lastBuyLimitPayload.default_pct != null)
-      ? lastBuyLimitPayload.default_pct
-      : 10;
-    if (on && (pctInput.value === '' || pctInput.value == null)) {
-      pctInput.value = String(def);
+
+    // Don't wipe in-progress edits when status refresh re-renders the card
+    if (!buyLimitLocalDraft) {
+      if (toggle) toggle.checked = enabled;
+      if (pctInput) {
+        pctInput.value = pct === '' || pct == null ? '' : String(pct);
+      }
+      buyLimitPctEditing = false;
     }
-    if (enabledHint) {
-      enabledHint.textContent = on
-        ? ('GTC limit ' + (pctInput.value || def) + '% below market')
-        : 'Market buys';
-    }
-    if (pctHint) pctHint.textContent = on ? '1 – 99' : 'Off — field locked';
+    updateBuyLimitChrome();
   }
 
   function setActionFeedback(id, msg, ok) {
@@ -1522,64 +1569,71 @@
     var filterSave = document.getElementById('filter-save-btn');
     var fieldSearch = document.getElementById('filter-field-search');
     var fieldPick = document.getElementById('filter-field-pick');
-    var buyLimitEdit = document.getElementById('buy-limit-edit-btn');
     var buyLimitEditPct = document.getElementById('buy-limit-edit-btn-pct');
     var buyLimitSave = document.getElementById('buy-limit-save-btn');
     var buyLimitCancel = document.getElementById('buy-limit-cancel-btn');
     var buyLimitToggle = document.getElementById('buy-limit-enabled');
     var buyLimitPct = document.getElementById('buy-limit-pct');
 
-    function beginBuyLimitEdit(focusId) {
-      buyLimitEditing = true;
-      setActionFeedback('buy-limit-feedback', '');
-      renderBuyLimitCard(lastBuyLimitPayload || {});
-      syncBuyLimitPctEnabled();
-      var el = document.getElementById(focusId || 'buy-limit-enabled');
-      if (el && !el.disabled) {
+    function focusBuyLimitPct() {
+      var el = document.getElementById('buy-limit-pct');
+      if (!el || el.disabled) return;
+      // Defer so we run after any competing label/setup handlers
+      setTimeout(function () {
         el.focus();
         if (el.select) el.select();
-      }
+      }, 0);
     }
 
-    if (buyLimitEdit) {
-      buyLimitEdit.addEventListener('click', function (ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        beginBuyLimitEdit('buy-limit-enabled');
-      });
-    }
     if (buyLimitEditPct) {
       buyLimitEditPct.addEventListener('click', function (ev) {
         ev.preventDefault();
         ev.stopPropagation();
-        beginBuyLimitEdit('buy-limit-pct');
+        if (isReadOnly()) return;
+        buyLimitLocalDraft = true;
+        buyLimitPctEditing = true;
+        setActionFeedback('buy-limit-feedback', '');
+        updateBuyLimitChrome();
+        focusBuyLimitPct();
       });
     }
     if (buyLimitCancel) {
       buyLimitCancel.addEventListener('click', function () {
-        buyLimitEditing = false;
+        buyLimitLocalDraft = false;
+        buyLimitPctEditing = false;
         setActionFeedback('buy-limit-feedback', '');
         renderBuyLimitCard(lastBuyLimitPayload || {});
       });
     }
     if (buyLimitToggle) {
       buyLimitToggle.addEventListener('change', function () {
-        if (!buyLimitEditing) return;
-        syncBuyLimitPctEnabled();
+        if (isReadOnly()) return;
+        buyLimitLocalDraft = true;
+        var on = !!buyLimitToggle.checked;
+        if (on && buyLimitPct && (buyLimitPct.value === '' || buyLimitPct.value == null)) {
+          buyLimitPct.value = String(
+            buyLimitSavedPct() != null ? buyLimitSavedPct() : buyLimitDefaultPct()
+          );
+        }
+        if (!on) buyLimitPctEditing = false;
+        setActionFeedback('buy-limit-feedback', '');
+        updateBuyLimitChrome();
       });
     }
     if (buyLimitPct) {
       buyLimitPct.addEventListener('input', function () {
         var v = String(buyLimitPct.value || '').replace(/[^\d]/g, '');
         if (v !== buyLimitPct.value) buyLimitPct.value = v;
+        buyLimitLocalDraft = true;
+        updateBuyLimitChrome();
       });
     }
     if (buyLimitSave) {
       buyLimitSave.addEventListener('click', async function () {
         if (isReadOnly()) return;
-        var on = !!(buyLimitToggle && buyLimitToggle.checked);
-        var raw = buyLimitPct ? String(buyLimitPct.value || '').trim() : '';
-        var pct = raw === '' ? null : Number(raw);
+        var draft = readBuyLimitDraft();
+        var on = draft.enabled;
+        var pct = draft.discount_pct;
         if (on) {
           if (pct == null || !Number.isFinite(pct) || pct !== Math.floor(pct) || pct <= 0 || pct >= 100) {
             setActionFeedback(
@@ -1603,12 +1657,13 @@
             enabled: on,
             discount_pct: pct,
           });
-          buyLimitEditing = false;
+          buyLimitLocalDraft = false;
+          buyLimitPctEditing = false;
           renderBuyLimitCard(res.buy_limit || res);
           setActionFeedback(
             'buy-limit-feedback',
             on
-              ? ('Buy limit orders on — GTC buys at ' + (res.buy_limit && res.buy_limit.discount_pct) + '% below market.')
+              ? ('Buy limit orders on — buys at ' + (res.buy_limit && res.buy_limit.discount_pct) + '% below market.')
               : 'Buy limit orders off — market buys.',
             true
           );
@@ -1634,9 +1689,12 @@
         ev.preventDefault();
         ev.stopPropagation();
         var which = btn.getAttribute('data-setup-field');
+        // Ignore non-setup pencils (e.g. buy-limit) that share similar styling
+        if (!which) return;
         var focusId = 'setup-min-cash';
         if (which === 'liq') focusId = 'setup-min-liq';
         if (which === 'ord') focusId = 'setup-order-amt';
+        if (which === 'cash') focusId = 'setup-min-cash';
         beginSetupEdit(focusId);
       });
     });
@@ -2843,7 +2901,8 @@
     var m = msg.match(/^(.*?)(\s*)(\([+\-] \$[0-9,]+\.\d{2}(?: \| [0-9.]+%)?\))$/);
     if (!m) return escapeHtml(msg) + movesHtml;
     var tone = m[3].indexOf('(-') === 0 ? 'neg' : 'pos';
-    return escapeHtml(m[1]) + '<span class="pl ' + tone + '">' + escapeHtml(m[3]) + '</span>' + movesHtml;
+    // Keep a space between price and the P/L parenthetical
+    return escapeHtml(m[1]) + ' <span class="pl ' + tone + '">' + escapeHtml(m[3]) + '</span>' + movesHtml;
   }
 
   function stopEventMeta(ev) {
