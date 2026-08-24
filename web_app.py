@@ -351,6 +351,24 @@ async def api_account_setup_post(request: Request):
     return JSONResponse(result, status_code=status)
 
 
+@app.get('/api/buy-limit')
+def api_buy_limit_get(request: Request):
+    with uc.use_user(int(request.state.user['id'])):
+        return st.get_buy_limit_settings()
+
+
+@app.post('/api/buy-limit')
+async def api_buy_limit_post(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    with uc.use_user(int(request.state.user['id'])):
+        result = st.save_buy_limit_settings(body if isinstance(body, dict) else {})
+    status = 200 if result.get('ok') else 400
+    return JSONResponse(result, status_code=status)
+
+
 @app.get('/api/algorithm')
 def api_algorithm_get(request: Request):
     with uc.use_user(int(request.state.user['id'])):

@@ -328,5 +328,12 @@
     "redirect_uri": "https://127.0.0.1",
     "authorize_url": "https://api.schwabapi.com/v1/oauth/authorize?client_id=mock&redirect_uri=https%3A%2F%2F127.0.0.1",
     "tokens_db": "~/.schwabdev/tokens.db"
+  },
+  "buy_limit": {
+    "enabled": false,
+    "discount_pct": null,
+    "default_pct": 10,
+    "min_pct_exclusive": 0,
+    "max_pct_exclusive": 100
   }
 }

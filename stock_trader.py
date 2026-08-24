@@ -5955,6 +5955,116 @@ def order_amount_dollars() -> float:
     return float(getattr(config, 'ORDER_AMOUNT_DOLLARS', 1000.0))
 
 
+def buy_limit_orders_enabled() -> bool:
+    """True when buys should be GTC LIMIT at a discount below market."""
+    try:
+        return bool(uc.get_user_settings(_uid()).get('buy_limit_enabled'))
+    except Exception:
+        return False
+
+
+def buy_limit_discount_pct() -> int:
+    """
+    Integer percent below market for buy limits (1–99).
+    Returns 0 when buy-limit mode is off.
+    """
+    if not buy_limit_orders_enabled():
+        return 0
+    try:
+        val = uc.get_user_settings(_uid()).get('buy_limit_pct')
+        if val is None:
+            return int(getattr(config, 'BUY_LIMIT_DEFAULT_PCT', 10))
+        pct = int(val)
+        if pct <= 0 or pct >= 100:
+            return int(getattr(config, 'BUY_LIMIT_DEFAULT_PCT', 10))
+        return pct
+    except Exception:
+        return int(getattr(config, 'BUY_LIMIT_DEFAULT_PCT', 10))
+
+
+def buy_limit_price_from_market(market_price: float, pct: Optional[int] = None) -> float:
+    """Limit buy price at pct% below market (rounded to cents, min $0.01)."""
+    if pct is None:
+        pct = buy_limit_discount_pct()
+    px = float(market_price) * (1.0 - float(pct) / 100.0)
+    return round(max(px, 0.01), 2)
+
+
+def get_buy_limit_settings() -> Dict[str, Any]:
+    """Actions card payload for buy-limit orders."""
+    try:
+        settings = uc.get_user_settings(_uid())
+    except Exception:
+        settings = {}
+    enabled = bool(settings.get('buy_limit_enabled'))
+    pct = settings.get('buy_limit_pct')
+    try:
+        pct_i = int(pct) if pct is not None else None
+    except (TypeError, ValueError):
+        pct_i = None
+    default_pct = int(getattr(config, 'BUY_LIMIT_DEFAULT_PCT', 10))
+    return {
+        'enabled': enabled,
+        'discount_pct': pct_i if pct_i is not None else (default_pct if enabled else None),
+        'default_pct': default_pct,
+        'min_pct_exclusive': 0,
+        'max_pct_exclusive': 100,
+    }
+
+
+def save_buy_limit_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and persist buy-limit Actions settings."""
+    enabled = bool(payload.get('enabled'))
+    default_pct = int(getattr(config, 'BUY_LIMIT_DEFAULT_PCT', 10))
+    raw_pct = payload.get('discount_pct', payload.get('buy_limit_pct'))
+    pct = None  # type: Optional[int]
+    if raw_pct is not None and raw_pct != '':
+        try:
+            pct = int(raw_pct)
+        except (TypeError, ValueError):
+            return {
+                'ok': False,
+                'error': 'Discount percent must be a whole number from 1 to 99.',
+                'buy_limit': get_buy_limit_settings(),
+            }
+    if enabled:
+        if pct is None:
+            pct = default_pct
+        if pct <= 0 or pct >= 100:
+            return {
+                'ok': False,
+                'error': 'Discount percent must be an integer from 1 to 99.',
+                'buy_limit': get_buy_limit_settings(),
+            }
+    else:
+        # Keep last saved percent when turning off (or leave unset).
+        if pct is not None and (pct <= 0 or pct >= 100):
+            return {
+                'ok': False,
+                'error': 'Discount percent must be an integer from 1 to 99.',
+                'buy_limit': get_buy_limit_settings(),
+            }
+        if pct is None:
+            try:
+                prev = uc.get_user_settings(_uid()).get('buy_limit_pct')
+                if prev is not None:
+                    pct = int(prev)
+            except Exception:
+                pct = None
+    kwargs = {'buy_limit_enabled': enabled}  # type: Dict[str, Any]
+    if pct is not None:
+        kwargs['buy_limit_pct'] = pct
+    try:
+        uc.update_user_settings(_uid(), **kwargs)
+    except Exception as e:
+        return {
+            'ok': False,
+            'error': str(e) or 'Could not save buy-limit settings.',
+            'buy_limit': get_buy_limit_settings(),
+        }
+    return {'ok': True, 'buy_limit': get_buy_limit_settings()}
+
+
 def schwab_order_submit_allowed() -> bool:
     """True only when TRADE_DRY_RUN is False — place/cancel/replace on Schwab."""
     return not trade_dry_run_enabled()
@@ -7073,27 +7183,56 @@ def execute_buy(ticker: str, quantity: int):
             if not account_hash:
                 print(f"Error: Could not get account hash. Cannot place order for {ticker}")
                 return
-            
-            # Build market order JSON for BUY
-            order = {
-                "orderType": "MARKET",
-                "session": "NORMAL",
-                "duration": "DAY",
-                "orderStrategyType": "SINGLE",
-                "orderLegCollection": [
-                    {
-                        "instruction": "BUY",
-                        "quantity": quantity,
-                        "instrument": {
-                            "symbol": ticker,
-                            "assetType": "EQUITY"
+
+            limit_pct = buy_limit_discount_pct()
+            use_limit = limit_pct > 0
+            limit_price = (
+                buy_limit_price_from_market(float(price), limit_pct)
+                if use_limit else None
+            )
+
+            if use_limit and limit_price is not None:
+                order = {
+                    "orderType": "LIMIT",
+                    "session": "NORMAL",
+                    "duration": "GOOD_TILL_CANCEL",
+                    "price": limit_price,
+                    "orderStrategyType": "SINGLE",
+                    "orderLegCollection": [
+                        {
+                            "instruction": "BUY",
+                            "quantity": quantity,
+                            "instrument": {
+                                "symbol": ticker,
+                                "assetType": "EQUITY"
+                            }
                         }
-                    }
-                ]
-            }
-            
+                    ]
+                }
+                print(
+                    f"Placing GTC LIMIT BUY for {quantity} shares of {ticker} "
+                    f"@ ${limit_price:.2f} ({limit_pct}% below market ${float(price):.2f})..."
+                )
+            else:
+                order = {
+                    "orderType": "MARKET",
+                    "session": "NORMAL",
+                    "duration": "DAY",
+                    "orderStrategyType": "SINGLE",
+                    "orderLegCollection": [
+                        {
+                            "instruction": "BUY",
+                            "quantity": quantity,
+                            "instrument": {
+                                "symbol": ticker,
+                                "assetType": "EQUITY"
+                            }
+                        }
+                    ]
+                }
+                print(f"Placing market BUY order for {quantity} shares of {ticker}{price_str}...")
+
             # Place the order
-            print(f"Placing market BUY order for {quantity} shares of {ticker}{price_str}...")
             response = SCHWAB_CLIENT.place_order(account_hash, order)
             
             # Check response
@@ -7115,7 +7254,12 @@ def execute_buy(ticker: str, quantity: int):
                     print(f"✓ Order placed successfully! (Response: {response.status_code})")
 
                 # Record as pending order (positions come from fetch_and_sync_schwab_positions when order fills)
-                order_amount_dollars = float(total) if total is not None else (float(price) * quantity) if price else 0.0
+                if use_limit and limit_price is not None:
+                    order_amount_dollars = float(limit_price) * quantity
+                    seed_price = float(limit_price)
+                else:
+                    order_amount_dollars = float(total) if total is not None else (float(price) * quantity) if price else 0.0
+                    seed_price = float(price) if price else None
                 date_ordered = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
                 conn = get_connection()
                 cur = conn.cursor()
@@ -7134,7 +7278,7 @@ def execute_buy(ticker: str, quantity: int):
                         date_purchased = COALESCE(positions.date_purchased, excluded.date_purchased),
                         average_price = COALESCE(positions.average_price, excluded.average_price)
                 """, (ticker, datetime.now().strftime('%Y-%m-%d'),
-                      float(price) if price else None, now_iso))
+                      seed_price, now_iso))
                 conn.commit()
                 conn.close()
                 # Tag before trade_history so scorecard sees origin=algo_buy
@@ -7147,12 +7291,18 @@ def execute_buy(ticker: str, quantity: int):
                     )
                 except Exception as book_err:
                     print(f"Warning: could not tag {ticker} as algorithm book: {book_err}")
+                buy_note = 'PLACING BUY — order submitted, awaiting fill'
+                if use_limit and limit_price is not None:
+                    buy_note = (
+                        'PLACING GTC LIMIT BUY @ $%.2f (%d%% below market) — awaiting fill'
+                        % (limit_price, limit_pct)
+                    )
                 record_trade(
                     'buy', ticker, quantity,
-                    price=float(price) if price is not None else None,
+                    price=seed_price,
                     order_id=order_id,
                     mode='real',
-                    note='PLACING BUY — order submitted, awaiting fill',
+                    note=buy_note,
                     scorecard='algorithm',
                 )
                 clear_rebuy_guard(ticker)
@@ -7171,21 +7321,42 @@ def execute_buy(ticker: str, quantity: int):
             traceback.print_exc()
             return
     else:
-        print(
-            f"[DRY-RUN] {format_bought_log_message(ticker, quantity, price, dry_run=True)}"
+        limit_pct = buy_limit_discount_pct()
+        limit_price = (
+            buy_limit_price_from_market(float(price), limit_pct)
+            if limit_pct > 0 else None
         )
+        log_px = float(limit_price) if limit_price is not None else float(price)
+        if limit_price is not None:
+            print(
+                f"[DRY-RUN] Would place GTC LIMIT BUY {quantity} {ticker} "
+                f"@ ${limit_price:.2f} ({limit_pct}% below market ${float(price):.2f})"
+            )
+        else:
+            print(
+                f"[DRY-RUN] {format_bought_log_message(ticker, quantity, price, dry_run=True)}"
+            )
         print(f"   (TRADE_DRY_RUN — no Schwab order; shares_owned not updated)")
-        log_event(
-            'buy',
-            format_bought_log_message(ticker, quantity, price, dry_run=True),
-            detail={
-                'ticker': ticker,
-                'quantity': quantity,
-                'price': float(price) if price is not None else None,
-                'phase': 'filled',
-                'dry_run': True,
-            },
-        )
+        detail = {
+            'ticker': ticker,
+            'quantity': quantity,
+            'price': log_px,
+            'market_price': float(price),
+            'phase': 'filled' if limit_price is None else 'limit_pending',
+            'dry_run': True,
+        }  # type: Dict[str, Any]
+        if limit_price is not None:
+            detail['limit_price'] = float(limit_price)
+            detail['limit_pct'] = limit_pct
+            detail['order_type'] = 'LIMIT'
+            detail['duration'] = 'GOOD_TILL_CANCEL'
+            msg = (
+                'DRY-RUN GTC LIMIT BUY %s %s @ %s (%d%% below market)'
+                % (quantity, ticker, _fmt_log_px(limit_price), limit_pct)
+            )
+        else:
+            msg = format_bought_log_message(ticker, quantity, price, dry_run=True)
+        log_event('buy', msg, detail=detail)
         try:
             set_position_book(
                 ticker,
@@ -7197,9 +7368,13 @@ def execute_buy(ticker: str, quantity: int):
             print(f"Warning: could not tag {ticker} as algorithm book: {book_err}")
         record_trade(
             'buy', ticker, quantity,
-            price=float(price) if price is not None else None,
+            price=log_px,
             mode='simulation',
-            note='DRY-RUN PLACING BUY — not submitted',
+            note=(
+                'DRY-RUN PLACING GTC LIMIT BUY — not submitted'
+                if limit_price is not None
+                else 'DRY-RUN PLACING BUY — not submitted'
+            ),
             scorecard='algorithm',
         )
         clear_rebuy_guard(ticker)
@@ -8092,12 +8267,102 @@ def reconcile_pending_orders(account_hash: Optional[str] = None) -> int:
         return 0
 
 
+def cancel_pending_buys_not_on_watchlist(account_hash: Optional[str] = None) -> int:
+    """
+    Cancel outstanding buy orders whose ticker is no longer on the watchlist.
+    Removes matching pending_orders rows. Returns number of cancels attempted.
+    """
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT ticker FROM watchlist')
+        on_watch = {row[0] for row in cursor.fetchall()}
+        cursor.execute(
+            '''
+            SELECT id, order_id, ticker, quantity_ordered, order_amount_dollars
+            FROM pending_orders
+            '''
+        )
+        rows = cursor.fetchall()
+        conn.close()
+    except sqlite3.OperationalError:
+        return 0
+    except Exception as e:
+        print(f"Warning: could not load pending buys for watchlist cleanup: {e}")
+        return 0
+
+    stale = [r for r in rows if r[2] not in on_watch]
+    if not stale:
+        return 0
+
+    account_hash = account_hash or _get_account_hash()
+    cancelled = 0
+    for pk, oid, ticker, qty, dollars in stale:
+        if trade_dry_run_enabled():
+            print(
+                f"[DRY-RUN] Would cancel pending buy {oid} for {ticker} (left watchlist)"
+            )
+            log_event(
+                'buy',
+                'DRY-RUN would cancel pending buy for %s (left watchlist)' % ticker,
+                detail={
+                    'ticker': ticker,
+                    'quantity': qty,
+                    'order_id': oid,
+                    'dollars': dollars,
+                    'source': 'off_watchlist_cancel',
+                    'phase': 'cancelled',
+                    'dry_run': True,
+                },
+            )
+            cancelled += 1
+            continue
+        ok = True
+        if oid and str(oid) not in ('PENDING',) and not str(oid).startswith('SIM'):
+            ok = cancel_stop_order(str(oid), account_hash=account_hash)
+        if not ok:
+            print(
+                f"Warning: could not cancel off-watchlist buy {oid} for {ticker}; "
+                f"leaving pending_orders row"
+            )
+            continue
+        try:
+            conn = get_connection()
+            conn.execute('DELETE FROM pending_orders WHERE id = ?', (pk,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Warning: failed to drop pending_orders id={pk}: {e}")
+            continue
+        cancelled += 1
+        msg = 'Cancelled pending buy for %s (left watchlist)' % ticker
+        print(f"  {msg}")
+        log_event(
+            'buy',
+            msg,
+            detail={
+                'ticker': ticker,
+                'quantity': qty,
+                'order_id': oid,
+                'dollars': dollars,
+                'source': 'off_watchlist_cancel',
+                'phase': 'cancelled',
+            },
+        )
+    return cancelled
+
+
 def sync_schwab_account(force_positions: bool = True) -> Dict[str, Any]:
     """
     Reconcile pending buys against Schwab open orders, then refresh positions
     (marks, shares, stop-limit exits). Used after orders and by schwab_sync job.
     """
     cleared = 0
+    off_wl = 0
+    try:
+        off_wl = cancel_pending_buys_not_on_watchlist()
+    except Exception as e:
+        print(f"Warning: off-watchlist pending buy cancel failed: {e}")
     try:
         cleared = reconcile_pending_orders()
     except Exception as e:
@@ -8105,6 +8370,7 @@ def sync_schwab_account(force_positions: bool = True) -> Dict[str, Any]:
     pos = refresh_schwab_positions_if_needed(force=bool(force_positions))
     return {
         'pending_cleared': cleared,
+        'pending_off_watchlist_cancelled': off_wl,
         'positions': pos,
     }
 
@@ -9864,21 +10130,50 @@ def run_buy_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
             qty = p.get('quantity')
             tkr = p.get('ticker')
             px = p.get('price')
-            msg = format_bought_log_message(tkr, qty, px, dry_run=True)
-            print(f"    ({msg})")
-            log_event(
-                'buy',
-                msg,
-                detail={
-                    'ticker': tkr,
-                    'quantity': qty,
-                    'price': px,
-                    'dollars': p.get('dollars'),
-                    'reason': p.get('reason'),
-                    'phase': 'filled',
-                    'dry_run': True,
-                },
-            )
+            limit_pct = buy_limit_discount_pct()
+            if limit_pct > 0 and px:
+                limit_px = buy_limit_price_from_market(float(px), limit_pct)
+                msg = (
+                    'DRY-RUN GTC LIMIT BUY %s %s @ %s (%d%% below market %s)'
+                    % (
+                        qty, tkr, _fmt_log_px(limit_px), limit_pct, _fmt_log_px(px),
+                    )
+                )
+                print(f"    ({msg})")
+                log_event(
+                    'buy',
+                    msg,
+                    detail={
+                        'ticker': tkr,
+                        'quantity': qty,
+                        'price': float(limit_px),
+                        'market_price': float(px),
+                        'limit_price': float(limit_px),
+                        'limit_pct': limit_pct,
+                        'order_type': 'LIMIT',
+                        'duration': 'GOOD_TILL_CANCEL',
+                        'dollars': p.get('dollars'),
+                        'reason': p.get('reason'),
+                        'phase': 'limit_pending',
+                        'dry_run': True,
+                    },
+                )
+            else:
+                msg = format_bought_log_message(tkr, qty, px, dry_run=True)
+                print(f"    ({msg})")
+                log_event(
+                    'buy',
+                    msg,
+                    detail={
+                        'ticker': tkr,
+                        'quantity': qty,
+                        'price': px,
+                        'dollars': p.get('dollars'),
+                        'reason': p.get('reason'),
+                        'phase': 'filled',
+                        'dry_run': True,
+                    },
+                )
             if tkr:
                 clear_rebuy_guard(str(tkr))
     return proposals
@@ -10315,6 +10610,14 @@ def run_watchlist_and_buys_job() -> bool:
         print(f"Updating watchlist (filter={filter_name})...")
         stats = update_watchlist(filter_name=filter_name)
         print(f"Watchlist: {stats}")
+        try:
+            n_cancel = cancel_pending_buys_not_on_watchlist()
+            if n_cancel:
+                print(f"Cancelled {n_cancel} pending buy(s) for tickers off watchlist")
+                stats = dict(stats)
+                stats['pending_buys_cancelled'] = n_cancel
+        except Exception as cancel_err:
+            print(f"Warning: off-watchlist buy cancel failed: {cancel_err}")
         log_event(
             'watchlist',
             f"Watchlist updated (filter={filter_name}): {stats}",
@@ -10705,6 +11008,19 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
             'why': 'Keeps position sizing consistent and cash-floor math simple',
         },
         {
+            'id': 'buy_limit',
+            'title': 'Buy limit orders',
+            'set_to': (
+                'ON — GTC limit %.0f%% below market' % buy_limit_discount_pct()
+                if buy_limit_orders_enabled()
+                else 'OFF — market buys'
+            ),
+            'why': (
+                'When on, new buys rest as GTC limits at a discount; '
+                'outstanding limits are cancelled if the name leaves the watchlist'
+            ),
+        },
+        {
             'id': 'rebuy_debounce',
             'title': 'Re-buy debounce after a sell',
             'set_to': (
@@ -10910,6 +11226,7 @@ def get_dashboard_status() -> Dict[str, Any]:
         'schwab': schwab,
         'account_setup': setup,
         'algorithm_control': algo_ctl,
+        'buy_limit': get_buy_limit_settings(),
         'onboarding_stage': stage,
         'actions_attention': needs_attention,
         'user': {

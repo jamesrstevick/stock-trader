@@ -82,6 +82,20 @@
         }
         return { ok: true, verified: true };
       }
+      if (path.indexOf('/api/buy-limit') === 0) {
+        var pct = body && body.discount_pct != null ? Number(body.discount_pct) : 10;
+        var en = !!(body && body.enabled);
+        return {
+          ok: true,
+          buy_limit: {
+            enabled: en,
+            discount_pct: en ? pct : pct,
+            default_pct: 10,
+            min_pct_exclusive: 0,
+            max_pct_exclusive: 100,
+          },
+        };
+      }
       return {
         ok: true,
         message: 'Mock: would submit Schwab callback (no live exchange)',
@@ -501,6 +515,8 @@
   var lastOnboardingStage = 'done';
   var setupEditing = false;
   var lastSetupPayload = null;
+  var buyLimitEditing = false;
+  var lastBuyLimitPayload = null;
   var filterBuilderState = { criteria: [], catalog: [], debounce: null };
   var ONBOARD_SNOOZE_KEY = 'onboardingGoLiveSnoozeUntil';
 
@@ -703,6 +719,7 @@
       if (active && active.id === 'page-actions') {
         renderSchwabActionCard(schwab, stage);
         renderAccountSetup(data.account_setup || { setup_complete: !!(currentUser && currentUser.is_admin) }, stage, schwab);
+        renderBuyLimitCard(data.buy_limit);
         renderAlgorithmControl(data.algorithm_control, stage);
       }
       return schwab;
@@ -904,6 +921,61 @@
     if (hCash) hCash.textContent = fieldHint('minimum_cash');
     if (hLiq) hLiq.textContent = fieldHint('minimum_liquidation_value');
     if (hOrd) hOrd.textContent = fieldHint('order_amount_dollars');
+  }
+
+  function renderBuyLimitCard(buyLimit) {
+    var card = document.getElementById('buy-limit-card');
+    if (!card) return;
+    buyLimit = buyLimit || {};
+    lastBuyLimitPayload = buyLimit;
+    var enabled = !!buyLimit.enabled;
+    var defaultPct = buyLimit.default_pct != null ? Number(buyLimit.default_pct) : 10;
+    var pct = buyLimit.discount_pct;
+    if (pct == null || pct === '') pct = enabled ? defaultPct : '';
+    var pill = document.getElementById('buy-limit-status-pill');
+    if (pill) {
+      if (enabled) {
+        pill.textContent = 'On · ' + pct + '%';
+        pill.className = 'pill ok';
+      } else {
+        pill.textContent = 'Off';
+        pill.className = 'pill';
+      }
+    }
+    var toggle = document.getElementById('buy-limit-enabled');
+    var pctInput = document.getElementById('buy-limit-pct');
+    var editBtn = document.getElementById('buy-limit-edit-btn');
+    var actions = document.getElementById('buy-limit-actions');
+    var locked = !buyLimitEditing;
+    if (toggle) {
+      toggle.disabled = locked || isReadOnly();
+      if (!buyLimitEditing) toggle.checked = enabled;
+    }
+    if (pctInput) {
+      var fieldOn = buyLimitEditing ? !!(toggle && toggle.checked) : enabled;
+      pctInput.disabled = locked || !fieldOn || isReadOnly();
+      if (!buyLimitEditing) {
+        pctInput.value = pct === '' || pct == null ? '' : String(pct);
+      } else if (toggle && toggle.checked && (pctInput.value === '' || pctInput.value == null)) {
+        pctInput.value = String(defaultPct);
+      }
+    }
+    if (editBtn) editBtn.hidden = buyLimitEditing || isReadOnly();
+    if (actions) actions.hidden = !buyLimitEditing;
+  }
+
+  function syncBuyLimitPctEnabled() {
+    var toggle = document.getElementById('buy-limit-enabled');
+    var pctInput = document.getElementById('buy-limit-pct');
+    if (!pctInput || !toggle) return;
+    var on = !!toggle.checked;
+    pctInput.disabled = !buyLimitEditing || !on || isReadOnly();
+    if (on && (pctInput.value === '' || pctInput.value == null)) {
+      var def = (lastBuyLimitPayload && lastBuyLimitPayload.default_pct != null)
+        ? lastBuyLimitPayload.default_pct
+        : 10;
+      pctInput.value = String(def);
+    }
   }
 
   function setActionFeedback(id, msg, ok) {
@@ -1418,6 +1490,85 @@
     var filterSave = document.getElementById('filter-save-btn');
     var fieldSearch = document.getElementById('filter-field-search');
     var fieldPick = document.getElementById('filter-field-pick');
+    var buyLimitEdit = document.getElementById('buy-limit-edit-btn');
+    var buyLimitSave = document.getElementById('buy-limit-save-btn');
+    var buyLimitCancel = document.getElementById('buy-limit-cancel-btn');
+    var buyLimitToggle = document.getElementById('buy-limit-enabled');
+    var buyLimitPct = document.getElementById('buy-limit-pct');
+
+    if (buyLimitEdit) {
+      buyLimitEdit.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        buyLimitEditing = true;
+        renderBuyLimitCard(lastBuyLimitPayload || {});
+        syncBuyLimitPctEnabled();
+        if (buyLimitToggle && !buyLimitToggle.disabled) buyLimitToggle.focus();
+      });
+    }
+    if (buyLimitCancel) {
+      buyLimitCancel.addEventListener('click', function () {
+        buyLimitEditing = false;
+        setActionFeedback('buy-limit-feedback', '');
+        renderBuyLimitCard(lastBuyLimitPayload || {});
+      });
+    }
+    if (buyLimitToggle) {
+      buyLimitToggle.addEventListener('change', function () {
+        if (!buyLimitEditing) return;
+        syncBuyLimitPctEnabled();
+      });
+    }
+    if (buyLimitPct) {
+      buyLimitPct.addEventListener('input', function () {
+        var v = String(buyLimitPct.value || '').replace(/[^\d]/g, '');
+        if (v !== buyLimitPct.value) buyLimitPct.value = v;
+      });
+    }
+    if (buyLimitSave) {
+      buyLimitSave.addEventListener('click', async function () {
+        if (isReadOnly()) return;
+        var on = !!(buyLimitToggle && buyLimitToggle.checked);
+        var raw = buyLimitPct ? String(buyLimitPct.value || '').trim() : '';
+        var pct = raw === '' ? null : Number(raw);
+        if (on) {
+          if (pct == null || !Number.isFinite(pct) || pct !== Math.floor(pct) || pct <= 0 || pct >= 100) {
+            setActionFeedback(
+              'buy-limit-feedback',
+              'Enter a whole number from 1 to 99 for the discount percent.',
+              false
+            );
+            return;
+          }
+        } else if (pct != null && (!Number.isFinite(pct) || pct !== Math.floor(pct) || pct <= 0 || pct >= 100)) {
+          setActionFeedback(
+            'buy-limit-feedback',
+            'Discount percent must be a whole number from 1 to 99.',
+            false
+          );
+          return;
+        }
+        setActionFeedback('buy-limit-feedback', 'Saving…', true);
+        try {
+          var res = await postJson('/api/buy-limit', {
+            enabled: on,
+            discount_pct: pct,
+          });
+          buyLimitEditing = false;
+          renderBuyLimitCard(res.buy_limit || res);
+          setActionFeedback(
+            'buy-limit-feedback',
+            on
+              ? ('Buy limit orders on — GTC buys at ' + (res.buy_limit && res.buy_limit.discount_pct) + '% below market.')
+              : 'Buy limit orders off — market buys.',
+            true
+          );
+          await refreshSchwabUi();
+        } catch (e) {
+          setActionFeedback('buy-limit-feedback', e.message || 'Save failed', false);
+        }
+      });
+    }
 
     function beginSetupEdit(focusId) {
       setupEditing = true;

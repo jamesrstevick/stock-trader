@@ -57,6 +57,10 @@ ORDER_AMOUNT_DOLLARS = 1000.0
 WATCHLIST_JOB_INTERVAL_MINUTES = 30
 WATCHLIST_JOB_INTERVAL_HOURS = 1
 
+# Buy limit orders (Actions toggle). When enabled, buys are GTC LIMIT at this
+# percent below the live market price instead of market orders. Integer 1–99.
+BUY_LIMIT_DEFAULT_PCT = 10
+
 # Sell / risk management
 # Legacy (unused). No sell/STOP_LIMIT until next ET calendar day after purchase.
 MINIMUM_HOLD_HOURS = 16

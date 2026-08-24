@@ -275,9 +275,23 @@ def init_auth_tables(conn: Optional[sqlite3.Connection] = None) -> None:
         )
         '''
     )
+    _ensure_user_settings_columns(conn)
     if own:
         conn.commit()
         conn.close()
+
+
+def _ensure_user_settings_columns(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the initial user_settings schema."""
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(user_settings)').fetchall()}
+    if 'buy_limit_enabled' not in cols:
+        conn.execute(
+            'ALTER TABLE user_settings ADD COLUMN buy_limit_enabled INTEGER NOT NULL DEFAULT 0'
+        )
+    if 'buy_limit_pct' not in cols:
+        conn.execute(
+            'ALTER TABLE user_settings ADD COLUMN buy_limit_pct INTEGER'
+        )
 
 
 def ensure_user_settings(user_id: int, conn: Optional[sqlite3.Connection] = None) -> None:
@@ -285,6 +299,7 @@ def ensure_user_settings(user_id: int, conn: Optional[sqlite3.Connection] = None
     if own:
         conn = get_connection()
     assert conn is not None
+    _ensure_user_settings_columns(conn)
     c = conn.cursor()
     c.execute('SELECT user_id FROM user_settings WHERE user_id = ?', (user_id,))
     if c.fetchone() is None:
@@ -732,25 +747,19 @@ def get_user_settings(user_id: int) -> Dict[str, Any]:
     try:
         cols = [r[1] for r in conn.execute('PRAGMA table_info(user_settings)').fetchall()]
         has_setup = 'setup_complete' in cols
+        has_buy_limit = 'buy_limit_enabled' in cols
+        select_cols = [
+            'active_filter', 'trade_dry_run', 'minimum_cash',
+            'minimum_liquidation_value', 'order_amount_dollars', 'schwab_tokens_db',
+        ]
         if has_setup:
-            row = conn.execute(
-                '''
-                SELECT active_filter, trade_dry_run, minimum_cash,
-                       minimum_liquidation_value, order_amount_dollars, schwab_tokens_db,
-                       setup_complete
-                FROM user_settings WHERE user_id = ?
-                ''',
-                (user_id,),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                '''
-                SELECT active_filter, trade_dry_run, minimum_cash,
-                       minimum_liquidation_value, order_amount_dollars, schwab_tokens_db
-                FROM user_settings WHERE user_id = ?
-                ''',
-                (user_id,),
-            ).fetchone()
+            select_cols.append('setup_complete')
+        if has_buy_limit:
+            select_cols.extend(['buy_limit_enabled', 'buy_limit_pct'])
+        row = conn.execute(
+            'SELECT %s FROM user_settings WHERE user_id = ?' % ', '.join(select_cols),
+            (user_id,),
+        ).fetchone()
         if not row:
             return {
                 'active_filter': 'safe',
@@ -764,7 +773,24 @@ def get_user_settings(user_id: int) -> Dict[str, Any]:
                 ),
                 'schwab_tokens_db': None,
                 'setup_complete': False,
+                'buy_limit_enabled': False,
+                'buy_limit_pct': None,
             }
+        idx = 6
+        setup_complete = False
+        if has_setup:
+            setup_complete = bool(row[idx])
+            idx += 1
+        buy_limit_enabled = False
+        buy_limit_pct = None
+        if has_buy_limit:
+            buy_limit_enabled = bool(row[idx])
+            buy_limit_pct = row[idx + 1]
+            if buy_limit_pct is not None:
+                try:
+                    buy_limit_pct = int(buy_limit_pct)
+                except (TypeError, ValueError):
+                    buy_limit_pct = None
         return {
             'active_filter': row[0] or 'safe',
             'trade_dry_run': bool(row[1]),
@@ -772,7 +798,9 @@ def get_user_settings(user_id: int) -> Dict[str, Any]:
             'minimum_liquidation_value': row[3],
             'order_amount_dollars': row[4],
             'schwab_tokens_db': row[5],
-            'setup_complete': bool(row[6]) if has_setup and len(row) > 6 else False,
+            'setup_complete': setup_complete,
+            'buy_limit_enabled': buy_limit_enabled,
+            'buy_limit_pct': buy_limit_pct,
         }
     finally:
         conn.close()
@@ -789,14 +817,17 @@ def update_user_settings(user_id: int, **kwargs) -> Dict[str, Any]:
     allowed = {
         'active_filter', 'trade_dry_run', 'minimum_cash',
         'minimum_liquidation_value', 'order_amount_dollars', 'setup_complete',
+        'buy_limit_enabled', 'buy_limit_pct',
     }
     sets = []
     vals = []  # type: List[Any]
     for k, v in kwargs.items():
         if k not in allowed:
             continue
-        if k == 'trade_dry_run' or k == 'setup_complete':
+        if k in ('trade_dry_run', 'setup_complete', 'buy_limit_enabled'):
             v = 1 if v else 0
+        if k == 'buy_limit_pct' and v is not None:
+            v = int(v)
         sets.append('%s = ?' % k)
         vals.append(v)
     if not sets:
