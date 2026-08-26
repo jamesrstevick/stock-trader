@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import pandas as pd
@@ -953,7 +954,9 @@ def _init_database_unlocked(
             order_id TEXT
         )
     ''')
-    
+    _ensure_column(cursor, 'pending_orders', 'order_type', 'TEXT')
+    _ensure_column(cursor, 'pending_orders', 'limit_price', 'REAL')
+
     # Create watchlist table - stores stocks selected by filters with all yfinance + Schwab data
     # Get all columns from fundamentals table to include in watchlist
     cursor.execute("PRAGMA table_info(fundamentals)")
@@ -1611,6 +1614,7 @@ def setup_file_logging(log_path: Optional[str] = None) -> str:
 
 
 # Viewer-facing log buckets (everything else collapses into task).
+# Protective STOP_LIMIT sells live under 'sell'; resting buy LIMITs under 'buy'.
 _LOG_CATEGORY_ALIASES = {
     'buy': 'buy',
     'sell': 'sell',
@@ -1624,15 +1628,15 @@ _LOG_CATEGORY_ALIASES = {
     'web': 'task',
     'order': 'sell',
     'trade': 'task',
-    'stop-limit': 'stop-limit',
-    'stop_limit': 'stop-limit',
-    'stoplimit': 'stop-limit',
-    'stop': 'stop-limit',
+    'stop-limit': 'sell',
+    'stop_limit': 'sell',
+    'stoplimit': 'sell',
+    'stop': 'sell',
 }
 
 # Bump when user-facing event_log copy changes. Next process start rewrites stored rows
 # (DELL Pull from GitHub restarts the loop/dashboard, so this is "first pull").
-_EVENT_LOG_CLEAN_VERSION = 5
+_EVENT_LOG_CLEAN_VERSION = 7
 _EVENT_LOG_CLEAN_FLAG = 'event_log_clean_version'
 _LOG_TICKER_RE = re.compile(r'\b([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b')
 _LOG_MONEY_RE = re.compile(r'\$([0-9]+(?:\.[0-9]+)?)')
@@ -1641,7 +1645,7 @@ _LOG_WAS_SH_RE = re.compile(r'\bwas\s+(\d+)\s+sh\b', re.I)
 
 
 def normalize_log_category(category: Optional[str]) -> str:
-    """Map any event category into buy | sell | stop-limit | watchlist | task."""
+    """Map any event category into buy | sell | watchlist | task."""
     key = (category or 'task').strip().lower()
     return _LOG_CATEGORY_ALIASES.get(key, 'task')
 
@@ -1794,6 +1798,16 @@ def format_bought_log_message(
         except (TypeError, ValueError):
             pass
     return '%sBOUGHT %s%s' % (prefix, qty_s, ticker)
+
+
+def format_buy_limit_log_message(
+    ticker: str,
+    limit_price: float,
+    dry_run: bool = False,
+) -> str:
+    """Resting buy limit (not yet filled) — mirrors STOP-LIMIT set copy."""
+    prefix = 'DRY-RUN ' if dry_run else ''
+    return '%sBUY-LIMIT set @ %s for %s' % (prefix, _fmt_log_px(limit_price), ticker)
 
 
 def format_sold_log_message(
@@ -2026,7 +2040,7 @@ def _legacy_event_plan(
             new_px = float(moved.group(2))
             return {
                 'action': 'update',
-                'category': 'stop-limit',
+                'category': 'sell',
                 'message': format_stop_limit_log_message(
                     tkr, new_px, previous_stop=prev_px,
                 ),
@@ -2048,7 +2062,7 @@ def _legacy_event_plan(
                 prev_px = first_px
                 return {
                     'action': 'update',
-                    'category': 'stop-limit',
+                    'category': 'sell',
                     'message': format_stop_limit_log_message(
                         tkr, new_px, previous_stop=prev_px,
                     ),
@@ -2057,8 +2071,8 @@ def _legacy_event_plan(
                     'stop_px': new_px,
                 }
             return {
-                'action': 'update' if cat != 'stop-limit' else 'keep',
-                'category': 'stop-limit',
+                'action': 'update' if cat != 'sell' else 'keep',
+                'category': 'sell',
                 'message': msg,
                 'kind': 'stop_moved',
                 'ticker': tkr,
@@ -2068,8 +2082,8 @@ def _legacy_event_plan(
         if '(deferred to avoid same-day trading)' in msg:
             kind = 'stop_deferred'
         return {
-            'action': 'update' if cat != 'stop-limit' else 'keep',
-            'category': 'stop-limit',
+            'action': 'update' if cat != 'sell' else 'keep',
+            'category': 'sell',
             'message': msg,
             'kind': kind,
             'ticker': tkr,
@@ -2094,6 +2108,39 @@ def _legacy_event_plan(
                 'ticker': tkr,
             }
 
+    # Resting buy limits (not fills) — normalize to STOP-LIMIT-style copy
+    if (
+        'BUY-LIMIT SET' in upper
+        or 'GTC LIMIT BUY' in upper
+        or str(detail.get('phase') or '') == 'limit_pending'
+    ):
+        tkr = ticker
+        if not tkr:
+            fm = re.search(r'\bfor\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b', msg, re.I)
+            if fm:
+                tkr = fm.group(1).upper()
+            else:
+                bm = re.search(
+                    r'\b([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\s+@',
+                    msg,
+                )
+                if bm:
+                    tkr = bm.group(1).upper()
+        limit_px = (
+            _detail_float(detail, 'limit_price', 'price')
+            or _first_money(msg)
+        )
+        dry = bool(detail.get('dry_run')) or upper.startswith('DRY-RUN')
+        if tkr and limit_px is not None:
+            new_msg = format_buy_limit_log_message(tkr, float(limit_px), dry_run=dry)
+            return {
+                'action': 'update' if new_msg != msg or cat != 'buy' else 'keep',
+                'category': 'buy',
+                'message': new_msg,
+                'kind': 'buy_limit_set',
+                'ticker': tkr,
+            }
+
     dry = bool(detail.get('dry_run')) or upper.startswith('DRY-RUN')
     arm = re.match(
         r'^(?:DRY-RUN would ARM STOP|STOP LIVE)\s+(\d+)\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\s+@\s+\$([0-9.]+)',
@@ -2108,7 +2155,7 @@ def _legacy_event_plan(
         if tkr and stop_px is not None:
             return {
                 'action': 'update',
-                'category': 'stop-limit',
+                'category': 'sell',
                 'message': format_stop_limit_log_message(tkr, stop_px),
                 'kind': 'stop_set',
                 'ticker': tkr,
@@ -2127,7 +2174,7 @@ def _legacy_event_plan(
         if tkr and stop_px is not None:
             return {
                 'action': 'update',
-                'category': 'stop-limit',
+                'category': 'sell',
                 'message': format_stop_limit_log_message(
                     tkr, stop_px, deferred=True,
                 ),
@@ -2138,7 +2185,7 @@ def _legacy_event_plan(
         if tkr:
             return {
                 'action': 'update',
-                'category': 'stop-limit',
+                'category': 'sell',
                 'message': 'STOP-LIMIT for %s (deferred to avoid same-day trading)' % tkr,
                 'kind': 'stop_deferred',
                 'ticker': tkr,
@@ -2153,7 +2200,7 @@ def _legacy_event_plan(
         tkr = failed.group(1).upper()
         return {
             'action': 'update',
-            'category': 'stop-limit',
+            'category': 'sell',
             'message': 'STOP-LIMIT failed for %s' % tkr,
             'kind': 'stop_failed',
             'ticker': tkr,
@@ -2258,7 +2305,7 @@ def _legacy_event_plan(
             deferred_bit = 'DEFER' in upper
             return {
                 'action': 'update',
-                'category': 'stop-limit',
+                'category': 'sell',
                 'message': format_stop_limit_log_message(
                     tkr, stop_px, deferred=deferred_bit,
                 ),
@@ -2481,6 +2528,16 @@ def _rewrite_legacy_event_log(conn: sqlite3.Connection) -> None:
 
         new_cat = plan.get('category')
         new_msg = plan.get('message')
+        # Fold legacy stop-limit bucket into sell (UI: STOP-LIMIT SELL vs SELL)
+        if action == 'keep' and normalize_log_category(category) == 'sell' and category != 'sell':
+            action = 'update'
+            new_cat = 'sell'
+            new_msg = message
+            plan['category'] = new_cat
+            plan['message'] = new_msg
+        if new_cat:
+            new_cat = normalize_log_category(new_cat)
+            plan['category'] = new_cat
         if action == 'update' and new_cat and new_msg:
             new_detail = plan.get('detail') if plan.get('update_detail') else None
             if new_cat != category or new_msg != message or new_detail is not None:
@@ -4029,6 +4086,12 @@ def run_trader(once: bool = True) -> None:
             print(f"run_trader (once={once}) — {wake_ts}")
             print("US RTH: %s" % ('OPEN' if market_open else 'CLOSED'))
             print("=" * 60)
+
+            try:
+                maybe_run_deploy_catch_up()
+            except Exception as e:
+                print_loop_status('Deploy catch-up skipped: %s' % e)
+                print('Warning: deploy catch-up failed: %s' % e)
 
             next_wake = None  # type: Optional[datetime]
 
@@ -6197,18 +6260,27 @@ def fetch_and_sync_schwab_positions(account_hash: Optional[str] = None) -> int:
         resp = SCHWAB_CLIENT.account_details(account_hash, fields="positions")
         if resp.status_code != 200:
             print(f"Error fetching positions: Status {resp.status_code}")
-            return 0
+            return -1
 
         account_data = resp.json()
         securities_account = account_data.get('securitiesAccount', {})
-        positions_data = securities_account.get('positions', [])
+        if not securities_account:
+            print("Error syncing positions: no securitiesAccount in Schwab response")
+            return -1
+        positions_data = securities_account.get('positions')
+        if positions_data is None:
+            positions_data = []
     except Exception as e:
         print(f"Error syncing positions from Schwab: {e}")
         return -1
 
     for attempt in range(5):
         try:
-            return _apply_schwab_positions_to_db(positions_data, account_hash)
+            return _apply_schwab_positions_to_db(
+                positions_data,
+                account_hash,
+                securities_account=securities_account,
+            )
         except sqlite3.OperationalError as e:
             if not _db_is_locked(e):
                 print(f"Error syncing positions from Schwab: {e}")
@@ -6231,27 +6303,15 @@ def fetch_and_sync_schwab_positions(account_hash: Optional[str] = None) -> int:
 def _apply_schwab_positions_to_db(
     positions_data: List[Dict[str, Any]],
     account_hash: Optional[str],
+    securities_account: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Write a Schwab positions payload into the local positions table."""
-    if not positions_data:
-        conn = get_connection(timeout=10.0, busy_timeout_ms=8000)
-        try:
-            cursor = conn.cursor()
-            try:
-                cursor.execute(
-                    "SELECT ticker, stop_order_id FROM positions WHERE stop_order_id IS NOT NULL"
-                )
-                for tkr, oid in cursor.fetchall():
-                    if oid:
-                        cancel_stop_order(str(oid), account_hash=account_hash)
-            except sqlite3.OperationalError as e:
-                if _db_is_locked(e):
-                    raise
-            cursor.execute("DELETE FROM positions")
-            conn.commit()
-        finally:
-            conn.close()
-        return 0
+    if not positions_data and _account_equity_implies_stock_positions(securities_account):
+        print(
+            'Warning: Schwab returned 0 positions but account equity still '
+            'looks like stock is held — refusing to wipe local positions'
+        )
+        return -1
 
     conn = get_connection(timeout=10.0, busy_timeout_ms=8000)
     try:
@@ -6273,14 +6333,32 @@ def _apply_schwab_positions_to_db(
                     pass
         synced = 0
         seen_tickers = set()  # type: set
-        # Positions that left the account — log hard vs trail stop-limit fills after commit
-        closed_exits = []  # type: List[Dict[str, Any]]
+        still_held_tickers = []  # type: List[str]
+        buy_stamps = {}  # type: Dict[str, Tuple[str, str]]
+        try:
+            cursor.execute(
+                '''
+                SELECT ticker, ts FROM trade_history
+                WHERE side = 'buy' AND IFNULL(mode, '') != 'simulation'
+                ORDER BY id DESC
+                '''
+            )
+            for tkr, ts in cursor.fetchall():
+                if not tkr or tkr in buy_stamps or not ts:
+                    continue
+                ts_s = str(ts)
+                buy_stamps[str(tkr)] = (
+                    ts_s[:10],
+                    ts_s[:19] if len(ts_s) >= 19 else ts_s,
+                )
+        except sqlite3.OperationalError:
+            buy_stamps = {}
         if config.DEBUG and positions_data:
             print("DEBUG: First position keys:", list(positions_data[0].keys()))
             if positions_data[0].get('instrument'):
                 print("DEBUG: First position instrument keys:", list(positions_data[0]['instrument'].keys()))
-        for p in positions_data:
-            instrument = p.get('instrument', {})
+        for p in positions_data or []:
+            instrument = p.get('instrument', {}) or {}
             ticker = instrument.get('symbol')
             if not ticker:
                 continue
@@ -6288,53 +6366,24 @@ def _apply_schwab_positions_to_db(
             short_qty = p.get('shortQuantity', 0) or 0
             qty = long_qty - short_qty
             if qty <= 0:
-                try:
-                    cursor.execute(
-                        """
-                        SELECT stop_order_id, trail_active, stop_order_price,
-                               shares_owned, average_price
-                        FROM positions WHERE ticker = ?
-                        """,
-                        (ticker,),
-                    )
-                    row = cursor.fetchone()
-                    if row:
-                        oid, trail_a, stop_px, sh, avg = row
-                        if oid or trail_a or stop_px is not None:
-                            closed_exits.append({
-                                'ticker': ticker,
-                                'stop_order_id': oid,
-                                'trail_active': bool(trail_a),
-                                'stop_order_price': stop_px,
-                                'shares_owned': sh,
-                                'average_price': avg,
-                            })
-                        if oid and not str(oid).startswith('SIM'):
-                            cancel_stop_order(str(oid), account_hash=account_hash)
-                except sqlite3.OperationalError as e:
-                    if _db_is_locked(e):
-                        raise
-                cursor.execute("DELETE FROM positions WHERE ticker = ?", (ticker,))
                 continue
             seen_tickers.add(ticker)
+            still_held_tickers.append(str(ticker))
             avg_price = p.get('averagePrice')
             market_val = p.get('marketValue')
             current_day_pl = p.get('currentDayProfitLoss')
             long_open_pl = p.get('longOpenProfitLoss')
-            # Day % = day P/L as % of start-of-day value (market_value - current_day_profit_loss)
             day_pct = None
             if current_day_pl is not None and market_val is not None:
                 sod_val = float(market_val) - float(current_day_pl)
                 if sod_val and abs(sod_val) > 1e-9:
                     day_pct = (float(current_day_pl) / sod_val) * 100
-            # Open % = total P/L as % of cost basis (shares * average_price)
             open_pct = None
             if long_open_pl is not None and avg_price is not None and qty and float(avg_price) > 0:
                 cost_basis = qty * float(avg_price)
                 if cost_basis > 0:
                     open_pct = (float(long_open_pl) / cost_basis) * 100
-            
-            # Prefer Schwab-provided acquired/purchase date if present; else use local date
+
             date_purchased = None
             for key in ('acquiredDate', 'dateAcquired', 'averagePriceDate', 'purchaseDate'):
                 raw = p.get(key) or instrument.get(key)
@@ -6342,7 +6391,9 @@ def _apply_schwab_positions_to_db(
                     if isinstance(raw, (int, float)):
                         try:
                             from datetime import timezone
-                            dt = datetime.fromtimestamp(raw / 1000.0 if raw > 1e12 else raw, tz=timezone.utc)
+                            dt = datetime.fromtimestamp(
+                                raw / 1000.0 if raw > 1e12 else raw, tz=timezone.utc
+                            )
                             date_purchased = dt.strftime('%Y-%m-%d')
                         except (OSError, ValueError):
                             pass
@@ -6350,10 +6401,15 @@ def _apply_schwab_positions_to_db(
                         date_purchased = raw[:10]
                     if date_purchased:
                         break
+            ledger_pair = buy_stamps.get(str(ticker))
+            ledger_date = ledger_pair[0] if ledger_pair else None
+            ledger_at = ledger_pair[1] if ledger_pair else None
             if not date_purchased:
-                date_purchased = datetime.now().strftime('%Y-%m-%d')
-            purchased_at_default = f"{date_purchased}T00:00:00"
-            # Preserve existing purchase timestamps and trail state on sync
+                date_purchased = ledger_date or datetime.now().strftime('%Y-%m-%d')
+            if ledger_at:
+                purchased_at_default = ledger_at
+            else:
+                purchased_at_default = '%sT00:00:00' % date_purchased
             cursor.execute("""
                 INSERT INTO positions (
                     ticker, date_purchased, shares_owned, average_price, market_value,
@@ -6382,8 +6438,33 @@ def _apply_schwab_positions_to_db(
                 purchased_at_default,
             ))
             synced += 1
-        
-        # Flat locally but gone from Schwab: cancel orphan stops and remove rows
+            if ledger_date:
+                today_s = datetime.now().strftime('%Y-%m-%d')
+                cursor.execute(
+                    'SELECT date_purchased FROM positions WHERE ticker = ?',
+                    (ticker,),
+                )
+                cur_row = cursor.fetchone()
+                cur_d = str((cur_row[0] if cur_row else '') or '')[:10]
+                if cur_d == today_s and str(ledger_date)[:10] < today_s:
+                    cursor.execute(
+                        '''
+                        UPDATE positions
+                        SET date_purchased = ?, purchased_at = ?
+                        WHERE ticker = ?
+                        ''',
+                        (
+                            ledger_date,
+                            ledger_at or ('%sT00:00:00' % ledger_date),
+                            ticker,
+                        ),
+                    )
+                    print(
+                        '  Restored %s purchase date %s from buy ledger (was stamped today)'
+                        % (ticker, ledger_date)
+                    )
+
+        missing_rows = []  # type: List[Dict[str, Any]]
         try:
             cursor.execute(
                 """
@@ -6394,7 +6475,7 @@ def _apply_schwab_positions_to_db(
             )
             for tkr, oid, trail_a, stop_px, limit_px, sh, avg, mv in cursor.fetchall():
                 if tkr not in seen_tickers:
-                    closed_exits.append({
+                    missing_rows.append({
                         'ticker': tkr,
                         'stop_order_id': oid,
                         'trail_active': bool(trail_a),
@@ -6404,22 +6485,95 @@ def _apply_schwab_positions_to_db(
                         'average_price': avg,
                         'market_value': mv,
                     })
-                    if oid and not str(oid).startswith('SIM'):
-                        cancel_stop_order(str(oid), account_hash=account_hash)
-                    cursor.execute("DELETE FROM positions WHERE ticker = ?", (tkr,))
         except sqlite3.OperationalError as e:
             if _db_is_locked(e):
                 raise
-            pass
 
         conn.commit()
         synced_count = synced
-        closed = list(closed_exits)
     finally:
         try:
             conn.close()
         except Exception:
             pass
+
+    for tkr in still_held_tickers:
+        try:
+            _void_false_sync_sell_if_still_held(str(tkr))
+        except Exception as e:
+            print('Warning: false-sell repair for %s failed: %s' % (tkr, e))
+
+    closed = []  # type: List[Dict[str, Any]]
+    if missing_rows:
+        open_orders = get_open_orders(account_hash)
+        refetch_seen = set()  # type: set
+        try:
+            raw = get_schwab_positions_raw(account_hash) or []
+            for p in raw:
+                instrument = (p or {}).get('instrument', {}) or {}
+                tkr = instrument.get('symbol')
+                if not tkr:
+                    continue
+                long_qty = p.get('longQuantity', 0) or 0
+                short_qty = p.get('shortQuantity', 0) or 0
+                if (long_qty - short_qty) > 0:
+                    refetch_seen.add(tkr)
+        except Exception as e:
+            print('Warning: confirmatory positions refetch failed: %s' % e)
+        for ex in missing_rows:
+            tkr = ex.get('ticker')
+            if not tkr:
+                continue
+            if tkr in refetch_seen:
+                print(
+                    '  Keeping %s — missing from first snapshot, present on refetch'
+                    % tkr
+                )
+                continue
+            confirmed, reason = _confirm_schwab_close(
+                str(tkr),
+                ex.get('stop_order_id'),
+                account_hash,
+                open_orders,
+            )
+            if not confirmed:
+                print(
+                    '  Not treating %s as sold (%s) — Schwab snapshot omitted it'
+                    % (tkr, reason)
+                )
+                live = find_working_stop_limit_sell(
+                    str(tkr), account_hash=account_hash, open_orders=open_orders
+                )
+                if live:
+                    sync_position_stop_order(
+                        str(tkr),
+                        live.get('order_id'),
+                        live.get('stop_price'),
+                        live.get('limit_price'),
+                        live.get('quantity'),
+                    )
+                continue
+            closed.append(ex)
+
+        if closed:
+            conn = get_connection(timeout=10.0, busy_timeout_ms=8000)
+            try:
+                cursor = conn.cursor()
+                for ex in closed:
+                    cursor.execute(
+                        'DELETE FROM positions WHERE ticker = ?',
+                        (ex.get('ticker'),),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    try:
+        reconcile_local_stops_from_schwab(
+            account_hash=account_hash,
+        )
+    except Exception as e:
+        print('Warning: broker stop reconcile failed: %s' % e)
 
     set_runtime_flag(
         'positions_synced_at',
@@ -6449,14 +6603,8 @@ def _positive_float(value: Any) -> Optional[float]:
     return n
 
 
-def _sync_close_fill_price(ex: Dict[str, Any]) -> Optional[float]:
-    """Best fill estimate: stop limit, stop trigger, then last mark."""
-    px = _positive_float(ex.get('stop_limit_price'))
-    if px is not None:
-        return px
-    px = _positive_float(ex.get('stop_order_price'))
-    if px is not None:
-        return px
+def _last_mark_price(ex: Dict[str, Any]) -> Optional[float]:
+    """Last local mark (market value / shares). Not a stop or limit."""
     mv = _positive_float(ex.get('market_value'))
     shares = ex.get('shares_owned')
     try:
@@ -6465,7 +6613,182 @@ def _sync_close_fill_price(ex: Dict[str, Any]) -> Optional[float]:
         qty = 0.0
     if mv is not None and qty > 0:
         return mv / qty
+    return _positive_float(ex.get('price'))
+
+
+def _schwab_order_fill_price(details: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Average execution price from a Schwab order payload, or None."""
+    if not details or not isinstance(details, dict):
+        return None
+    weighted = 0.0
+    qty_sum = 0.0
+    activities = details.get('orderActivityCollection') or []
+    if not isinstance(activities, list):
+        activities = []
+    for act in activities:
+        if not isinstance(act, dict):
+            continue
+        legs = act.get('executionLegs') or []
+        if not isinstance(legs, list):
+            continue
+        for leg in legs:
+            if not isinstance(leg, dict):
+                continue
+            px = _positive_float(leg.get('price'))
+            qty = _positive_float(leg.get('quantity'))
+            if px is None or qty is None or qty <= 0:
+                continue
+            weighted += px * qty
+            qty_sum += qty
+    if qty_sum > 0:
+        return weighted / qty_sum
+    for key in ('averagePrice', 'averageFillPrice', 'filledPrice'):
+        px = _positive_float(details.get(key))
+        if px is not None:
+            return px
     return None
+
+
+def _submitted_sell_order_id(ticker: str) -> Optional[str]:
+    """Most recent Events SELL-submitted order id for ticker (awaiting fill)."""
+    t = str(ticker or '').strip().upper()
+    if not t:
+        return None
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            '''
+            SELECT ts, detail_json FROM event_log
+            WHERE category = 'sell'
+            ORDER BY id DESC LIMIT 80
+            '''
+        )
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    cutoff = datetime.now() - timedelta(hours=6)
+    for row in rows:
+        ts_raw = row[0] if row else None
+        raw = row[1] if row and len(row) > 1 else None
+        if ts_raw:
+            try:
+                ts = datetime.fromisoformat(str(ts_raw).replace('Z', '+00:00')[:19])
+                if ts < cutoff:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        if not raw:
+            continue
+        try:
+            detail = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(detail, dict):
+            continue
+        if str(detail.get('ticker') or '').strip().upper() != t:
+            continue
+        if str(detail.get('phase') or '').strip().lower() != 'submitted':
+            continue
+        oid = detail.get('order_id')
+        if oid:
+            return str(oid)
+    return None
+
+
+def _recent_filled_sell_price(
+    ticker: str,
+    account_hash: Optional[str] = None,
+) -> Optional[float]:
+    """Fill average of the newest FILLED Schwab SELL for ticker (today's window)."""
+    t = str(ticker or '').strip().upper()
+    if not t or not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
+        return None
+    account_hash = account_hash or _get_account_hash()
+    if not account_hash:
+        return None
+    try:
+        to_date = datetime.now(timezone.utc) + timedelta(days=1)
+        from_date = datetime.now(timezone.utc) - timedelta(days=5)
+        response = SCHWAB_CLIENT.account_orders(account_hash, from_date, to_date)
+        if response is None or getattr(response, 'status_code', 500) != 200:
+            return None
+        orders = _parse_schwab_orders_payload(response.json())
+    except Exception as e:
+        print('Warning: could not list recent filled sells for %s: %s' % (t, e))
+        return None
+    best_px = None  # type: Optional[float]
+    best_entered = ''
+    for order in orders or []:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get('status') or '').upper() != 'FILLED':
+            continue
+        for leg in order.get('orderLegCollection') or []:
+            if not isinstance(leg, dict):
+                continue
+            inst = str(leg.get('instruction') or '').upper()
+            if inst not in ('SELL', 'SELL_SHORT'):
+                continue
+            instrument = leg.get('instrument') or {}
+            sym = str((instrument or {}).get('symbol') or '').strip().upper()
+            if sym != t:
+                continue
+            px = _schwab_order_fill_price(order)
+            if px is None:
+                continue
+            entered = str(
+                order.get('enteredTime') or order.get('closeTime') or ''
+            )
+            if best_px is None or entered >= best_entered:
+                best_px = px
+                best_entered = entered
+            break
+    return best_px
+
+
+def _resolve_close_fill_price(
+    ex: Dict[str, Any],
+    account_hash: Optional[str] = None,
+) -> Optional[float]:
+    """
+    Scorecard fill: Schwab execution average, then last mark.
+
+    Never use the intended STOP_LIMIT prices — those are the trail, not the fill
+    (a market sell after a missed trail must ledger ~last, not the Events stop).
+    """
+    ticker = str(ex.get('ticker') or '').strip().upper()
+    ids = []  # type: List[str]
+    oid = ex.get('stop_order_id') or ex.get('order_id')
+    if oid:
+        ids.append(str(oid))
+    submitted = _submitted_sell_order_id(ticker) if ticker else None
+    if submitted and submitted not in ids:
+        ids.append(submitted)
+    for order_id in ids:
+        details = get_schwab_order_details(order_id, account_hash=account_hash)
+        px = _schwab_order_fill_price(details)
+        if px is not None:
+            return px
+        if details and str(details.get('status') or '').upper() not in (
+            'FILLED', 'EXPIRED', 'CANCELED', 'CANCELLED', 'REJECTED', 'REPLACED',
+        ):
+            time.sleep(0.8)
+            details = get_schwab_order_details(order_id, account_hash=account_hash)
+            px = _schwab_order_fill_price(details)
+            if px is not None:
+                return px
+    filled = _recent_filled_sell_price(ticker, account_hash=account_hash)
+    if filled is not None:
+        return filled
+    return _last_mark_price(ex)
+
+
+def _sync_close_fill_price(ex: Dict[str, Any]) -> Optional[float]:
+    """Close fill for the scorecard (Schwab execution, not the intended stop)."""
+    return _resolve_close_fill_price(ex)
 
 
 def _trade_mode_is_simulation(mode: Any) -> bool:
@@ -6533,7 +6856,18 @@ def _log_position_closed_on_sync(ex: Dict[str, Any]) -> None:
         qty = None
     px = _sync_close_fill_price(ex)
     basis = _positive_float(ex.get('average_price'))
-    if had_stop:
+    submitted_oid = _submitted_sell_order_id(str(ticker)) if ticker else None
+    if submitted_oid:
+        exit_info = {
+            'exit_kind': 'market_sell',
+            'short_label': 'SOLD',
+        }
+        label = exit_info['short_label']
+        source = 'market_sell_fill'
+        trade_note = 'Market sell fill detected on Schwab sync'
+        if not oid:
+            oid = submitted_oid
+    elif had_stop:
         exit_info = describe_sell_exit('trail' if trail else 'hard', trail)
         label = exit_info['short_label']
         source = 'stop_limit_fill'
@@ -6559,6 +6893,10 @@ def _log_position_closed_on_sync(ex: Dict[str, Any]) -> None:
             note=trade_note,
         )
         recorded = True
+        try:
+            record_rebuy_guard(str(ticker), sell_price=px, cost_basis=basis)
+        except Exception:
+            pass
     if not had_stop and not recorded:
         return
     msg = format_sold_log_message(ticker, qty, px, cost_basis=basis)
@@ -6574,6 +6912,7 @@ def _log_position_closed_on_sync(ex: Dict[str, Any]) -> None:
             'exit_kind': exit_info['exit_kind'],
             'source': source,
             'phase': 'filled',
+            'fill_is_execution': True,
             'stop_order_id': oid,
             'stop_order_price': stop_px,
             'stop_limit_price': ex.get('stop_limit_price'),
@@ -6693,17 +7032,444 @@ def _extract_order_id(response) -> Optional[str]:
         return None
     location = ''
     try:
-        location = response.headers.get('Location', '') or ''
+        headers = getattr(response, 'headers', None)
+        if headers is not None:
+            location = headers.get('Location') or headers.get('location') or ''
     except Exception:
         return None
     if not location:
         return None
-    parts = location.split('/')
+    trimmed = str(location).split('?')[0].rstrip('/')
+    parts = trimmed.split('/')
     if 'orders' in parts:
         order_idx = parts.index('orders')
-        if order_idx + 1 < len(parts):
-            return parts[order_idx + 1]
+        if order_idx + 1 < len(parts) and parts[order_idx + 1]:
+            return str(parts[order_idx + 1])
+    last = parts[-1] if parts else ''
+    if last and last.isdigit():
+        return last
     return None
+
+
+def _order_stop_price(order: Dict[str, Any]) -> Optional[float]:
+    return _positive_float(
+        order.get('stopPrice') if isinstance(order, dict) else None
+    ) or _positive_float(
+        order.get('stop_price') if isinstance(order, dict) else None
+    )
+
+
+def _order_limit_price(order: Dict[str, Any]) -> Optional[float]:
+    return _positive_float(
+        order.get('price') if isinstance(order, dict) else None
+    ) or _positive_float(
+        order.get('limit_price') if isinstance(order, dict) else None
+    )
+
+
+def _working_stop_limits_by_ticker(
+    open_orders: Optional[List[Dict[str, Any]]],
+) -> Dict[str, Dict[str, Any]]:
+    """Best working STOP_LIMIT SELL per ticker from get_open_orders() rows."""
+    best = {}  # type: Dict[str, Dict[str, Any]]
+    for order in open_orders or []:
+        if not isinstance(order, dict):
+            continue
+        instruction = str(order.get('instruction') or '').upper()
+        if instruction and instruction not in ('SELL', 'SELL_SHORT'):
+            continue
+        otype = str(order.get('order_type') or order.get('orderType') or '').upper()
+        if otype != 'STOP_LIMIT':
+            continue
+        ticker = str(order.get('ticker') or '').strip().upper()
+        oid = order.get('order_id')
+        if not ticker or not oid:
+            continue
+        stop_px = _positive_float(order.get('stop_price')) or _order_stop_price(order)
+        limit_px = _positive_float(order.get('price')) or _order_limit_price(order)
+        qty = order.get('quantity')
+        try:
+            qty_i = int(qty) if qty is not None else None
+        except (TypeError, ValueError):
+            qty_i = None
+        row = {
+            'ticker': ticker,
+            'order_id': str(oid),
+            'stop_price': stop_px,
+            'limit_price': limit_px,
+            'quantity': qty_i,
+            'entered_time': order.get('entered_time'),
+            'status': order.get('status'),
+            'order_type': otype or 'STOP_LIMIT',
+            'instruction': instruction or 'SELL',
+        }
+        prev = best.get(ticker)
+        if prev is None:
+            best[ticker] = row
+            continue
+        prev_px = _positive_float(prev.get('stop_price')) or 0.0
+        new_px = stop_px or 0.0
+        if new_px >= prev_px:
+            best[ticker] = row
+    return best
+
+
+def find_working_stop_limit_sell(
+    ticker: str,
+    account_hash: Optional[str] = None,
+    open_orders: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Live Schwab STOP_LIMIT SELL for ticker, or None."""
+    t = str(ticker or '').strip().upper()
+    if not t:
+        return None
+    orders = open_orders
+    if orders is None:
+        orders = get_open_orders(account_hash)
+    return _working_stop_limits_by_ticker(orders).get(t)
+
+
+def _is_working_buy_instruction(instruction: Any) -> bool:
+    inst = str(instruction or '').upper()
+    return inst in ('BUY', 'BUY_TO_COVER')
+
+
+def _working_buys_grouped(
+    open_orders: Optional[List[Dict[str, Any]]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Working Schwab BUY orders grouped by ticker."""
+    grouped = {}  # type: Dict[str, List[Dict[str, Any]]]
+    for order in open_orders or []:
+        if not isinstance(order, dict):
+            continue
+        if not _is_working_buy_instruction(order.get('instruction')):
+            continue
+        ticker = str(order.get('ticker') or '').strip().upper()
+        oid = order.get('order_id')
+        if not ticker or not oid:
+            continue
+        qty = order.get('quantity')
+        try:
+            qty_i = int(qty) if qty is not None else None
+        except (TypeError, ValueError):
+            qty_i = None
+        grouped.setdefault(ticker, []).append({
+            'ticker': ticker,
+            'order_id': str(oid),
+            'quantity': qty_i,
+            'limit_price': _order_limit_price(order) or _positive_float(order.get('price')),
+            'order_type': str(order.get('order_type') or order.get('orderType') or 'LIMIT').upper(),
+            'entered_time': order.get('entered_time'),
+            'status': order.get('status'),
+            'instruction': str(order.get('instruction') or 'BUY').upper(),
+        })
+    return grouped
+
+
+def _oldest_working_buy(orders: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not orders:
+        return None
+
+    def _key(row):
+        entered = str(row.get('entered_time') or '')
+        if not entered:
+            entered = '9999'
+        return (entered, str(row.get('order_id') or ''))
+
+    ordered = sorted(orders, key=_key)
+    return ordered[0]
+
+
+def preview_extra_working_buys(
+    open_orders: Optional[List[Dict[str, Any]]] = None,
+    account_hash: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """One GTC buy per ticker: extras we would cancel (does not cancel)."""
+    orders = open_orders if open_orders is not None else get_open_orders(account_hash)
+    grouped = _working_buys_grouped(orders)
+    extras = []  # type: List[Dict[str, Any]]
+    for ticker, rows in grouped.items():
+        if len(rows) < 2:
+            continue
+        keep = _oldest_working_buy(rows)
+        if not keep:
+            continue
+        keep_id = str(keep.get('order_id') or '')
+        for extra in rows:
+            oid = str(extra.get('order_id') or '')
+            if not oid or oid == keep_id:
+                continue
+            extras.append({
+                'ticker': ticker,
+                'keep_order_id': keep_id,
+                'keep_limit_price': keep.get('limit_price'),
+                'keep_entered_time': keep.get('entered_time'),
+                'cancel_order_id': oid,
+                'cancel_limit_price': extra.get('limit_price'),
+                'cancel_entered_time': extra.get('entered_time'),
+                'quantity': extra.get('quantity'),
+            })
+    return extras
+
+
+def find_working_buy(
+    ticker: str,
+    account_hash: Optional[str] = None,
+    open_orders: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Oldest working Schwab BUY for ticker, or None."""
+    t = str(ticker or '').strip().upper()
+    if not t:
+        return None
+    orders = open_orders
+    if orders is None:
+        orders = get_open_orders(account_hash)
+    return _oldest_working_buy(_working_buys_grouped(orders).get(t) or [])
+
+
+def working_buy_tickers(
+    open_orders: Optional[List[Dict[str, Any]]] = None,
+    account_hash: Optional[str] = None,
+) -> set:
+    """Tickers with a working Schwab buy (already spoken for)."""
+    orders = open_orders if open_orders is not None else get_open_orders(account_hash)
+    return set(_working_buys_grouped(orders).keys())
+
+
+def _order_entered_market_date(order: Optional[Dict[str, Any]]) -> Optional[date]:
+    if not order:
+        return None
+    raw = order.get('entered_time') if isinstance(order, dict) else None
+    if not raw:
+        return None
+    parsed = _parse_purchased_at(str(raw))
+    if parsed is None:
+        return None
+    return _as_market_datetime(parsed).date()
+
+
+def reconcile_local_stops_from_schwab(
+    account_hash: Optional[str] = None,
+    open_orders: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    """
+    Overwrite local stop_order_* from working Schwab STOP_LIMIT sells.
+
+    Local prices/ids are a cache. Schwab is the truth. Returns rows updated.
+    """
+    orders = open_orders if open_orders is not None else get_open_orders(account_hash)
+    live_map = _working_stop_limits_by_ticker(orders)
+    init_database()
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            '''
+            SELECT ticker, stop_order_id, stop_order_price, stop_limit_price, stop_order_qty
+            FROM positions WHERE shares_owned > 0
+            '''
+        )
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        return 0
+    updated = 0
+    try:
+        for ticker, oid, stop_px, limit_px, qty in rows:
+            live = live_map.get(str(ticker or '').upper())
+            if not live:
+                continue
+            new_id = live.get('order_id')
+            new_stop = live.get('stop_price')
+            new_limit = live.get('limit_price')
+            new_qty = live.get('quantity')
+            same_id = str(oid or '') == str(new_id or '')
+            same_stop = (
+                stop_px is not None
+                and new_stop is not None
+                and abs(float(stop_px) - float(new_stop)) < 0.009
+            )
+            same_limit = (
+                (limit_px is None and new_limit is None)
+                or (
+                    limit_px is not None
+                    and new_limit is not None
+                    and abs(float(limit_px) - float(new_limit)) < 0.009
+                )
+            )
+            same_qty = (qty is None and new_qty is None) or (
+                qty is not None and new_qty is not None and int(qty) == int(new_qty)
+            )
+            if same_id and same_stop and same_limit and same_qty:
+                continue
+            if oid and str(oid) != str(new_id):
+                print(
+                    '  Rebinding %s stop id %s → %s (Schwab working order @ %s)'
+                    % (
+                        ticker,
+                        oid,
+                        new_id,
+                        ('$%.2f' % new_stop) if new_stop is not None else 'n/a',
+                    )
+                )
+            elif stop_px is not None and new_stop is not None and not same_stop:
+                print(
+                    '  Correcting %s local stop $%.2f → Schwab $%.2f'
+                    % (ticker, float(stop_px), float(new_stop))
+                )
+            cursor.execute(
+                '''
+                UPDATE positions
+                SET stop_order_id = ?, stop_order_price = ?,
+                    stop_limit_price = ?, stop_order_qty = ?
+                WHERE ticker = ?
+                ''',
+                (
+                    new_id,
+                    float(new_stop) if new_stop is not None else None,
+                    float(new_limit) if new_limit is not None else None,
+                    int(new_qty) if new_qty is not None else None,
+                    ticker,
+                ),
+            )
+            updated += 1
+        if updated:
+            conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return updated
+
+
+def _account_equity_implies_stock_positions(
+    securities_account: Optional[Dict[str, Any]],
+) -> bool:
+    """True when balances say the account still holds stock (payload likely incomplete)."""
+    if not securities_account or not isinstance(securities_account, dict):
+        return False
+    balances = securities_account.get('currentBalances') or {}
+    if not isinstance(balances, dict):
+        balances = {}
+    lmv = _positive_float(balances.get('longMarketValue')) or 0.0
+    if lmv > 1.0:
+        return True
+    liq = _positive_float(balances.get('liquidationValue')) or 0.0
+    cash = (
+        _positive_float(balances.get('cashBalance'))
+        or _positive_float(balances.get('availableFunds'))
+        or _positive_float(balances.get('cashAvailableForTrading'))
+        or 0.0
+    )
+    return (liq - cash) > 25.0
+
+
+def _purchase_stamp_from_ledger(ticker: str) -> Tuple[Optional[str], Optional[str]]:
+    """Latest real buy date / timestamp for ticker, if any."""
+    for t in get_trade_history(ticker=ticker, limit=50):
+        if _trade_mode_is_simulation(t.get('mode')):
+            continue
+        if str(t.get('side') or '').strip().lower() != 'buy':
+            continue
+        ts = str(t.get('ts') or '').strip()
+        if len(ts) >= 10:
+            purchased_at = ts[:19] if len(ts) >= 19 else ts
+            return ts[:10], purchased_at
+        return None, None
+    return None, None
+
+
+def _void_false_sync_sell_if_still_held(ticker: str) -> bool:
+    """
+    If we ledgered a Schwab-sync SOLD but the shares are still at the broker,
+    delete that sell so the scorecard matches reality.
+    """
+    last = _latest_real_trade(ticker)
+    if last is None:
+        return False
+    if str(last.get('side') or '').strip().lower() != 'sell':
+        return False
+    note = str(last.get('note') or '')
+    if 'Schwab sync' not in note:
+        return False
+    ts = _parse_purchased_at(str(last.get('ts') or ''))
+    if ts is not None:
+        ts_naive = ts.replace(tzinfo=None) if ts.tzinfo is not None else ts
+        age_hours = (datetime.now() - ts_naive).total_seconds() / 3600.0
+        if age_hours > 24 * 14:
+            return False
+    trade_id = last.get('id')
+    if not trade_id:
+        return False
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('DELETE FROM trade_history WHERE id = ?', (int(trade_id),))
+        conn.commit()
+    except Exception as e:
+        print('Warning: could not void false sync sell for %s: %s' % (ticker, e))
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return False
+    conn.close()
+    print(
+        '  Voided false Schwab-sync SELL for %s (trade id=%s; shares still held)'
+        % (ticker, trade_id)
+    )
+    try:
+        n = _retract_false_sold_events_for_ticker(str(ticker))
+        if n:
+            print('  Retracted %s false SOLD Event(s) for %s' % (n, ticker))
+    except Exception as e:
+        print('  Warning: could not retract Events SOLD for %s: %s' % (ticker, e))
+    try:
+        log_event(
+            'task',
+            'Corrected false SOLD for %s — shares still at Schwab' % ticker,
+            level='warning',
+            detail={
+                'ticker': ticker,
+                'voided_trade_id': trade_id,
+                'source': 'false_sync_close',
+            },
+        )
+    except Exception:
+        pass
+    return True
+
+
+def _confirm_schwab_close(
+    ticker: str,
+    stored_stop_id: Optional[str],
+    account_hash: Optional[str],
+    open_orders: Optional[List[Dict[str, Any]]],
+) -> Tuple[bool, str]:
+    """
+    Whether a locally held ticker that is missing from a Schwab positions
+    payload is a real close. Schwab working orders win over a glitchy snapshot.
+    """
+    live = find_working_stop_limit_sell(
+        ticker, account_hash=account_hash, open_orders=open_orders
+    )
+    if live:
+        return False, 'working_stop'
+    oid = str(stored_stop_id or '')
+    if oid and oid not in ('PENDING', 'SIM-STOP') and not oid.startswith('SIM'):
+        details = get_schwab_order_details(oid, account_hash=account_hash)
+        status = str((details or {}).get('status') or '').upper()
+        if status == 'FILLED':
+            return True, 'stop_filled'
+        if status in {
+            'OPEN', 'WORKING', 'QUEUED', 'ACCEPTED', 'AWAITING_PARENT_ORDER',
+            'AWAITING_CONDITION', 'AWAITING_STOP_CONDITION',
+            'AWAITING_MANUAL_REVIEW', 'AWAITING_UR_OUT', 'PENDING_ACTIVATION',
+            'PENDING_CANCEL', 'PENDING_REPLACE', 'NEW',
+        }:
+            return False, 'stop_still_open'
+    return False, 'unconfirmed'
 
 
 def build_stop_limit_sell_order(
@@ -6881,6 +7647,35 @@ def place_stop_limit_sell(
             f"(limit ${limit:.2f})..."
         )
         response = SCHWAB_CLIENT.place_order(account_hash, order)
+        min_move = float(getattr(config, 'STOP_REPLACE_MIN_DOLLARS', 0.05))
+        time.sleep(0.5)
+        live = find_working_stop_limit_sell(ticker, account_hash=account_hash)
+        if live and live.get('stop_price') is not None:
+            live_stop = float(live['stop_price'])
+            if abs(live_stop - stop) < max(min_move, 0.009):
+                order_id = live.get('order_id') or _extract_order_id(response)
+                sync_position_stop_order(
+                    ticker,
+                    order_id,
+                    live_stop,
+                    live.get('limit_price') or limit,
+                    live.get('quantity') or qty,
+                )
+                print(f"✓ STOP_LIMIT placed for {ticker} order_id={order_id}")
+                return order_id
+            if response.status_code in (200, 201):
+                print(
+                    '  Place accepted for %s but Schwab working stop is still $%.2f (wanted $%.2f)'
+                    % (ticker, live_stop, stop)
+                )
+            sync_position_stop_order(
+                ticker,
+                live.get('order_id'),
+                live.get('stop_price'),
+                live.get('limit_price'),
+                live.get('quantity'),
+            )
+            return None
         if response.status_code not in (200, 201):
             print(
                 f"✗ STOP_LIMIT place failed for {ticker}: "
@@ -6952,22 +7747,69 @@ def replace_stop_limit_sell(
             f"(replace, limit ${limit:.2f})..."
         )
         response = SCHWAB_CLIENT.replace_order(account_hash, order_id, order)
-        if response.status_code not in (200, 201):
+        min_move = float(getattr(config, 'STOP_REPLACE_MIN_DOLLARS', 0.05))
+
+        def _live_matches():
+            live = find_working_stop_limit_sell(
+                ticker, account_hash=account_hash
+            )
+            if not live or live.get('stop_price') is None:
+                return None
+            if abs(float(live['stop_price']) - stop) < max(min_move, 0.009):
+                return live
+            return None
+
+        # schwabdev retries PUT; a lost 201 + retry on the old id can look like failure
+        time.sleep(0.6)
+        live_ok = _live_matches()
+        if live_ok:
+            new_id = live_ok.get('order_id') or _extract_order_id(response) or order_id
+            sync_position_stop_order(
+                ticker,
+                new_id,
+                live_ok.get('stop_price') or stop,
+                live_ok.get('limit_price') or limit,
+                live_ok.get('quantity') or qty,
+            )
+            print(f"✓ STOP_LIMIT replaced for {ticker} order_id={new_id}")
+            return new_id
+
+        print(
+            f"✗ STOP_LIMIT replace not confirmed for {ticker}: "
+            f"{getattr(response, 'status_code', '?')} {getattr(response, 'text', '')}"
+        )
+        print(f"  Falling back to cancel+place for {ticker}...")
+        live = find_working_stop_limit_sell(ticker, account_hash=account_hash)
+        cancel_id = (live or {}).get('order_id') or order_id
+        cancelled = cancel_stop_order(str(cancel_id), account_hash=account_hash)
+        time.sleep(0.5)
+        still = find_working_stop_limit_sell(ticker, account_hash=account_hash)
+        if still:
             print(
-                f"✗ STOP_LIMIT replace failed for {ticker}: "
-                f"{response.status_code} {response.text}"
+                '  Cancel+place aborted for %s — Schwab still has working stop %s @ %s'
+                % (
+                    ticker,
+                    still.get('order_id'),
+                    ('$%.2f' % still['stop_price']) if still.get('stop_price') else 'n/a',
+                )
             )
-            # Fall back: cancel + place
-            print(f"  Falling back to cancel+place for {ticker}...")
-            cancel_stop_order(order_id, account_hash=account_hash)
-            clear_position_stop_order(ticker)
-            return place_stop_limit_sell(
-                ticker, qty, stop, limit, account_hash=account_hash
+            sync_position_stop_order(
+                ticker,
+                still.get('order_id'),
+                still.get('stop_price'),
+                still.get('limit_price'),
+                still.get('quantity'),
             )
-        new_id = _extract_order_id(response) or order_id
-        sync_position_stop_order(ticker, new_id, stop, limit, qty)
-        print(f"✓ STOP_LIMIT replaced for {ticker} order_id={new_id}")
-        return new_id
+            return None
+        if not cancelled:
+            print(
+                '  Warning: cancel of %s returned failure, but no working stop remains'
+                % cancel_id
+            )
+        clear_position_stop_order(ticker)
+        return place_stop_limit_sell(
+            ticker, qty, stop, limit, account_hash=account_hash
+        )
     except Exception as e:
         print(f"Error replacing STOP_LIMIT for {ticker}: {e}")
         import traceback
@@ -6980,6 +7822,7 @@ def ensure_broker_stop_limit(
     quantity: int,
     stop_price: float,
     spot_price: Optional[float] = None,
+    open_orders: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Place or replace resting STOP_LIMIT as needed.
@@ -6990,10 +7833,40 @@ def ensure_broker_stop_limit(
     qty = int(quantity)
     stop = round(float(stop_price), 2)
     limit = stop_limit_price_from_stop(stop)
+    live = find_working_stop_limit_sell(
+        ticker, open_orders=open_orders
+    )
+    if live:
+        sync_position_stop_order(
+            ticker,
+            live.get('order_id'),
+            live.get('stop_price'),
+            live.get('limit_price'),
+            live.get('quantity'),
+        )
 
     hold_ok, hold_reason = is_min_hold_met(ticker)
     if not hold_ok:
-        # Cancel any same-day resting stop so it cannot fill into a day trade.
+        # Only cancel a stop entered today (true PDT risk). A GTC from an
+        # earlier day must stay — a false "new buy" date used to wipe it.
+        entered = _order_entered_market_date(live)
+        today = _now_market().date()
+        if live and entered is not None and entered < today:
+            print(
+                '  Leaving existing %s STOP_LIMIT @ %s (entered %s; defer is same-day PDT only)'
+                % (
+                    ticker,
+                    ('$%.2f' % live['stop_price']) if live.get('stop_price') else 'n/a',
+                    entered.isoformat(),
+                )
+            )
+            return {
+                'action': 'skipped',
+                'reason': 'stop deferred — %s (left prior-day broker stop)' % hold_reason,
+                'stop_price': live.get('stop_price') or stop,
+                'limit_price': live.get('limit_price') or limit,
+                'order_id': live.get('order_id'),
+            }
         try:
             cancel_position_broker_stop(ticker)
         except Exception as e:
@@ -7063,8 +7936,7 @@ def ensure_broker_stop_limit(
         # Qty mismatch with live order, or promote PENDING → real place
         if existing_id and not is_sim_or_pending:
             if existing_qty is not None and int(existing_qty) != qty:
-                cancel_stop_order(str(existing_id))
-                clear_position_stop_order(ticker)
+                cancel_position_broker_stop(ticker)
         elif existing_id and is_sim_or_pending:
             clear_position_stop_order(ticker)
         order_id = place_stop_limit_sell(ticker, qty, stop, limit)
@@ -7118,15 +7990,52 @@ def ensure_broker_stop_limit(
     }
 
 
-def cancel_position_broker_stop(ticker: str) -> None:
-    """Cancel resting stop for ticker (if any) and clear DB fields."""
+def cancel_position_broker_stop(ticker: str) -> bool:
+    """Cancel resting stop for ticker (local id and any live Schwab order)."""
     stored = get_position_stop_order(ticker)
     oid = stored.get('stop_order_id')
-    if oid and not str(oid).startswith('SIM'):
-        cancel_stop_order(str(oid))
-    elif oid:
+    live = None  # type: Optional[Dict[str, Any]]
+    try:
+        live = find_working_stop_limit_sell(ticker)
+    except Exception as e:
+        print('Warning: could not list working stops before cancel %s: %s' % (ticker, e))
+    ids = []  # type: List[str]
+    if live and live.get('order_id'):
+        ids.append(str(live['order_id']))
+    if oid and str(oid) not in ids and not str(oid).startswith('SIM'):
+        ids.append(str(oid))
+    if oid and str(oid).startswith('SIM'):
         print(f"[DRY-RUN] Clearing sim stop for {ticker}")
+        clear_position_stop_order(ticker)
+        return True
+    if trade_dry_run_enabled():
+        print(f"[DRY-RUN] Would cancel stop(s) for {ticker}: {ids or oid}")
+        clear_position_stop_order(ticker)
+        return True
+    if not ids:
+        clear_position_stop_order(ticker)
+        return True
+    ok = True
+    for cancel_id in ids:
+        if not cancel_stop_order(cancel_id):
+            ok = False
+    time.sleep(0.4)
+    still = find_working_stop_limit_sell(ticker)
+    if still:
+        print(
+            '✗ %s still has working STOP_LIMIT %s after cancel'
+            % (ticker, still.get('order_id'))
+        )
+        sync_position_stop_order(
+            ticker,
+            still.get('order_id'),
+            still.get('stop_price'),
+            still.get('limit_price'),
+            still.get('quantity'),
+        )
+        return False
     clear_position_stop_order(ticker)
+    return ok
 
 
 def execute_buy(ticker: str, quantity: int):
@@ -7142,6 +8051,25 @@ def execute_buy(ticker: str, quantity: int):
         print(f"   Add {ticker} to watchlist using update_watchlist() before trading.")
         return
     conn.close()
+
+    live_buy = find_working_buy(ticker)
+    if live_buy:
+        print(
+            '⚠️  Trading blocked: %s already has a working Schwab buy '
+            '(order %s @ %s). Leaving it until fill or off-watchlist.'
+            % (
+                ticker,
+                live_buy.get('order_id'),
+                ('$%.2f' % live_buy['limit_price'])
+                if live_buy.get('limit_price') is not None
+                else 'n/a',
+            )
+        )
+        try:
+            _upsert_pending_buy_from_live(live_buy)
+        except Exception as e:
+            print('Warning: could not sync pending buy for %s: %s' % (ticker, e))
+        return
     
     # Live Schwab price required for sizing / cash-floor check (no Yahoo fallback)
     price = get_trade_price(ticker)
@@ -7257,16 +8185,35 @@ def execute_buy(ticker: str, quantity: int):
                 if use_limit and limit_price is not None:
                     order_amount_dollars = float(limit_price) * quantity
                     seed_price = float(limit_price)
+                    pending_order_type = 'LIMIT'
+                    pending_limit_price = float(limit_price)
                 else:
                     order_amount_dollars = float(total) if total is not None else (float(price) * quantity) if price else 0.0
                     seed_price = float(price) if price else None
+                    pending_order_type = 'MARKET'
+                    pending_limit_price = None
                 date_ordered = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
                 conn = get_connection()
                 cur = conn.cursor()
-                cur.execute(
-                    "INSERT INTO pending_orders (ticker, date_ordered, quantity_ordered, order_amount_dollars, order_id) VALUES (?, ?, ?, ?, ?)",
-                    (ticker, date_ordered, quantity, order_amount_dollars, order_id)
-                )
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO pending_orders (
+                            ticker, date_ordered, quantity_ordered, order_amount_dollars,
+                            order_id, order_type, limit_price
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            ticker, date_ordered, quantity, order_amount_dollars,
+                            order_id, pending_order_type, pending_limit_price,
+                        ),
+                    )
+                except sqlite3.OperationalError:
+                    # Older DB without order_type / limit_price columns
+                    cur.execute(
+                        "INSERT INTO pending_orders (ticker, date_ordered, quantity_ordered, order_amount_dollars, order_id) VALUES (?, ?, ?, ?, ?)",
+                        (ticker, date_ordered, quantity, order_amount_dollars, order_id),
+                    )
                 # Seed purchase timestamp / trail fields for min-hold (sync will fill shares when filled)
                 now_iso = datetime.now().isoformat()
                 cur.execute("""
@@ -7297,6 +8244,22 @@ def execute_buy(ticker: str, quantity: int):
                         'PLACING GTC LIMIT BUY @ $%.2f (%d%% below market) — awaiting fill'
                         % (limit_price, limit_pct)
                     )
+                    log_event(
+                        'buy',
+                        format_buy_limit_log_message(ticker, float(limit_price)),
+                        detail={
+                            'ticker': ticker,
+                            'quantity': quantity,
+                            'price': float(limit_price),
+                            'limit_price': float(limit_price),
+                            'limit_pct': limit_pct,
+                            'market_price': float(price),
+                            'order_id': order_id,
+                            'order_type': 'LIMIT',
+                            'duration': 'GOOD_TILL_CANCEL',
+                            'phase': 'limit_pending',
+                        },
+                    )
                 record_trade(
                     'buy', ticker, quantity,
                     price=seed_price,
@@ -7307,7 +8270,11 @@ def execute_buy(ticker: str, quantity: int):
                 )
                 clear_rebuy_guard(ticker)
                 try:
-                    sync_schwab_account_after_order('buy')
+                    # Limit buys rest open — short wait is for market fills; still sync
+                    # but reconcile must not treat working limits as filled.
+                    sync_schwab_account_after_order(
+                        'buy_limit' if use_limit else 'buy'
+                    )
                 except Exception as sync_err:
                     print(f"Warning: post-buy Schwab sync failed: {sync_err}")
             else:
@@ -7326,37 +8293,45 @@ def execute_buy(ticker: str, quantity: int):
             buy_limit_price_from_market(float(price), limit_pct)
             if limit_pct > 0 else None
         )
-        log_px = float(limit_price) if limit_price is not None else float(price)
         if limit_price is not None:
             print(
                 f"[DRY-RUN] Would place GTC LIMIT BUY {quantity} {ticker} "
                 f"@ ${limit_price:.2f} ({limit_pct}% below market ${float(price):.2f})"
             )
+            print(f"   (TRADE_DRY_RUN — no Schwab order; shares_owned not updated)")
+            msg = format_buy_limit_log_message(ticker, float(limit_price), dry_run=True)
+            log_event(
+                'buy',
+                msg,
+                detail={
+                    'ticker': ticker,
+                    'quantity': quantity,
+                    'price': float(limit_price),
+                    'limit_price': float(limit_price),
+                    'limit_pct': limit_pct,
+                    'market_price': float(price),
+                    'order_type': 'LIMIT',
+                    'duration': 'GOOD_TILL_CANCEL',
+                    'phase': 'limit_pending',
+                    'dry_run': True,
+                },
+            )
         else:
             print(
                 f"[DRY-RUN] {format_bought_log_message(ticker, quantity, price, dry_run=True)}"
             )
-        print(f"   (TRADE_DRY_RUN — no Schwab order; shares_owned not updated)")
-        detail = {
-            'ticker': ticker,
-            'quantity': quantity,
-            'price': log_px,
-            'market_price': float(price),
-            'phase': 'filled' if limit_price is None else 'limit_pending',
-            'dry_run': True,
-        }  # type: Dict[str, Any]
-        if limit_price is not None:
-            detail['limit_price'] = float(limit_price)
-            detail['limit_pct'] = limit_pct
-            detail['order_type'] = 'LIMIT'
-            detail['duration'] = 'GOOD_TILL_CANCEL'
-            msg = (
-                'DRY-RUN GTC LIMIT BUY %s %s @ %s (%d%% below market)'
-                % (quantity, ticker, _fmt_log_px(limit_price), limit_pct)
+            print(f"   (TRADE_DRY_RUN — no Schwab order; shares_owned not updated)")
+            log_event(
+                'buy',
+                format_bought_log_message(ticker, quantity, price, dry_run=True),
+                detail={
+                    'ticker': ticker,
+                    'quantity': quantity,
+                    'price': float(price) if price is not None else None,
+                    'phase': 'filled',
+                    'dry_run': True,
+                },
             )
-        else:
-            msg = format_bought_log_message(ticker, quantity, price, dry_run=True)
-        log_event('buy', msg, detail=detail)
         try:
             set_position_book(
                 ticker,
@@ -7368,7 +8343,9 @@ def execute_buy(ticker: str, quantity: int):
             print(f"Warning: could not tag {ticker} as algorithm book: {book_err}")
         record_trade(
             'buy', ticker, quantity,
-            price=log_px,
+            price=float(limit_price) if limit_price is not None else (
+                float(price) if price is not None else None
+            ),
             mode='simulation',
             note=(
                 'DRY-RUN PLACING GTC LIMIT BUY — not submitted'
@@ -7579,6 +8556,27 @@ def _has_real_sell_near(ticker: str, event_ts: str, before_hours: float = 1.0, a
         if _trade_mode_is_simulation(t.get('mode')):
             continue
         if str(t.get('side') or '').strip().lower() != 'sell':
+            continue
+        ts = (t.get('ts') or '')[:19]
+        if ev is None:
+            if ts == ev_key:
+                return True
+            continue
+        tt = _parse_trade_ts(ts)
+        if tt is None:
+            continue
+        if (ev - timedelta(hours=before_hours)) <= tt <= (ev + timedelta(hours=after_hours)):
+            return True
+    return False
+
+
+def _has_real_buy_near(ticker: str, event_ts: str, before_hours: float = 24.0, after_hours: float = 24.0) -> bool:
+    ev = _parse_trade_ts(event_ts)
+    ev_key = (event_ts or '')[:19]
+    for t in get_trade_history(ticker=ticker, limit=50):
+        if _trade_mode_is_simulation(t.get('mode')):
+            continue
+        if str(t.get('side') or '').strip().lower() != 'buy':
             continue
         ts = (t.get('ts') or '')[:19]
         if ev is None:
@@ -7978,53 +8976,32 @@ def execute_sell(
                 else:
                     print(f"✓ Order placed successfully! (Response: {response.status_code})")
 
-                # Update watchlist shares owned (negative for sell, only after successful order)
-                update_shares_owned(ticker, -quantity)
-                record_rebuy_guard(ticker, sell_price=sell_price, cost_basis=cost_basis)
-                trade_note = (
-                    f"PLACING MARKET SELL — order submitted "
-                    f"({exit_info['short_label']})"
-                )
-                record_trade(
-                    'sell', ticker, quantity,
-                    price=float(sell_price) if sell_price is not None else None,
-                    order_id=order_id,
-                    cost_basis_per_share=cost_basis,
-                    mode='real',
-                    note=trade_note,
-                )
-                clear_position_stop_order(ticker)
-                try:
-                    sync_schwab_account_after_order('sell')
-                except Exception as sync_err:
-                    print(f"Warning: post-sell Schwab sync failed: {sync_err}")
-                sold_msg = format_sold_log_message(
-                    ticker, quantity,
-                    float(sell_price) if sell_price is not None else None,
-                    cost_basis=cost_basis,
-                )
-                print(f"  {sold_msg}")
-                pl, pct = _sold_pl_pair(
-                    float(sell_price) if sell_price is not None else None,
+                # Do not delete the local row or log SOLD until Schwab shows
+                # the shares gone. ACK is not a fill — that was logging fake gains.
+                submitted = 'SELL submitted %s %s @ %s (awaiting Schwab fill)' % (
                     quantity,
-                    cost_basis,
+                    ticker,
+                    _fmt_log_px(sell_price),
                 )
+                print(f"  {submitted}")
                 log_event(
                     'sell',
-                    sold_msg,
+                    submitted,
                     detail={
                         'ticker': ticker,
                         'quantity': quantity,
                         'price': sell_price,
                         'order_id': order_id,
                         'exit_kind': exit_kind or exit_info['exit_kind'],
-                        'phase': 'filled',
+                        'phase': 'submitted',
                         'order_type': 'MARKET',
                         'average_price': cost_basis,
-                        'realized_pl': pl,
-                        'realized_pct': pct,
                     },
                 )
+                try:
+                    sync_schwab_account_after_order('sell')
+                except Exception as sync_err:
+                    print(f"Warning: post-sell Schwab sync failed: {sync_err}")
             else:
                 print(f"✗ Order failed with status {response.status_code}")
                 print(f"  Response: {response.text}")
@@ -8105,7 +9082,7 @@ def _open_orders_from_schwab_orders(orders: List[Dict[str, Any]]) -> List[Dict[s
         'OPEN', 'WORKING', 'QUEUED', 'ACCEPTED', 'AWAITING_PARENT_ORDER',
         'AWAITING_CONDITION', 'AWAITING_STOP_CONDITION',
         'AWAITING_MANUAL_REVIEW', 'AWAITING_UR_OUT', 'PENDING_ACTIVATION',
-        'PENDING_CANCEL', 'PENDING_REPLACE',
+        'PENDING_CANCEL', 'PENDING_REPLACE', 'NEW',
     }
     open_orders = []
     for order in orders:
@@ -8114,15 +9091,26 @@ def _open_orders_from_schwab_orders(orders: List[Dict[str, Any]]) -> List[Dict[s
         order_id = order.get('orderId') or order.get('order_id')
         if order_id is not None:
             order_id = str(order_id)
+        order_type = order.get('orderType') or order.get('order_type')
+        price = order.get('price')
         for leg in order.get('orderLegCollection', []) or []:
             instrument = leg.get('instrument', {}) or {}
             ticker = instrument.get('symbol', '')
             quantity = int(leg.get('quantity', 0) or 0)
+            instruction = leg.get('instruction') or ''
             if ticker and quantity > 0:
                 open_orders.append({
                     'ticker': ticker,
                     'quantity': quantity,
                     'order_id': order_id,
+                    'order_type': order_type,
+                    'price': price,
+                    'stop_price': _order_stop_price(order),
+                    'instruction': instruction,
+                    'status': order.get('status'),
+                    'entered_time': (
+                        order.get('enteredTime') or order.get('entered_time')
+                    ),
                 })
     return open_orders
 
@@ -8189,37 +9177,293 @@ def get_open_orders(account_hash: Optional[str] = None) -> List[Dict[str, Any]]:
         return []
 
 
+def get_schwab_order_details(
+    order_id: str,
+    account_hash: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Fetch one Schwab order by id, or None on failure."""
+    if not order_id or not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
+        return None
+    account_hash = account_hash or _get_account_hash()
+    if not account_hash:
+        return None
+    try:
+        fn = getattr(SCHWAB_CLIENT, 'order_details', None)
+        if fn is None:
+            return None
+        response = fn(account_hash, order_id)
+        if response is None or getattr(response, 'status_code', 500) not in (200, 201):
+            return None
+        data = response.json()
+        return data if isinstance(data, dict) else None
+    except Exception as e:
+        print(f"Warning: order_details({order_id}) failed: {e}")
+        return None
+
+
+def _classify_pending_buy_outcome(
+    order_id: str,
+    order_type: Optional[str] = None,
+    account_hash: Optional[str] = None,
+    open_order_ids: Optional[set] = None,
+) -> str:
+    """
+    Return 'open' | 'filled' | 'cancelled' | 'unknown' for a pending buy order_id.
+    LIMIT orders default to 'open' when status is unclear (avoid false BOUGHT).
+    MARKET orders default to 'filled' when gone from the open list (fills quickly).
+    """
+    oid = str(order_id)
+    if open_order_ids is not None and oid in open_order_ids:
+        return 'open'
+    details = get_schwab_order_details(oid, account_hash=account_hash)
+    status = ''
+    if details:
+        status = str(details.get('status') or '').upper()
+    filled = {'FILLED'}
+    cancelled = {'CANCELED', 'CANCELLED', 'REJECTED', 'EXPIRED', 'REPLACED'}
+    still_open = {
+        'OPEN', 'WORKING', 'QUEUED', 'ACCEPTED', 'AWAITING_PARENT_ORDER',
+        'AWAITING_CONDITION', 'AWAITING_STOP_CONDITION',
+        'AWAITING_MANUAL_REVIEW', 'AWAITING_UR_OUT', 'PENDING_ACTIVATION',
+        'PENDING_CANCEL', 'PENDING_REPLACE', 'NEW',
+    }
+    if status in filled:
+        return 'filled'
+    if status in cancelled:
+        return 'cancelled'
+    if status in still_open:
+        return 'open'
+    is_limit = str(order_type or '').upper() in ('LIMIT', 'STOP', 'STOP_LIMIT')
+    if is_limit:
+        # Missing from open list + unknown status: keep resting GTC limits
+        return 'open'
+    # Market (or unspecified): gone from open list ⇒ treat as filled
+    return 'filled'
+
+
+def _upsert_pending_buy_from_live(live: Dict[str, Any]) -> None:
+    """Ensure pending_orders has the working Schwab buy (Schwab is the truth)."""
+    ticker = str(live.get('ticker') or '').strip().upper()
+    oid = str(live.get('order_id') or '')
+    if not ticker or not oid:
+        return
+    qty = live.get('quantity')
+    try:
+        qty_i = int(qty) if qty is not None else 0
+    except (TypeError, ValueError):
+        qty_i = 0
+    limit_px = _positive_float(live.get('limit_price'))
+    dollars = (float(limit_px) * qty_i) if limit_px is not None and qty_i else 0.0
+    order_type = str(live.get('order_type') or 'LIMIT')
+    entered = str(live.get('entered_time') or datetime.now().strftime('%Y-%m-%dT%H:%M:%S'))
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            'SELECT id FROM pending_orders WHERE order_id = ?',
+            (oid,),
+        )
+        if cursor.fetchone():
+            conn.close()
+            return
+        try:
+            cursor.execute(
+                'DELETE FROM pending_orders WHERE ticker = ? AND (order_id IS NULL OR order_id != ?)',
+                (ticker, oid),
+            )
+            cursor.execute(
+                """
+                INSERT INTO pending_orders (
+                    ticker, date_ordered, quantity_ordered, order_amount_dollars,
+                    order_id, order_type, limit_price
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (ticker, entered[:19], qty_i, dollars, oid, order_type, limit_px),
+            )
+        except sqlite3.OperationalError:
+            cursor.execute(
+                'DELETE FROM pending_orders WHERE ticker = ? AND (order_id IS NULL OR order_id != ?)',
+                (ticker, oid),
+            )
+            cursor.execute(
+                """
+                INSERT INTO pending_orders (
+                    ticker, date_ordered, quantity_ordered, order_amount_dollars, order_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (ticker, entered[:19], qty_i, dollars, oid),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _cancel_extra_working_buys(
+    grouped: Dict[str, List[Dict[str, Any]]],
+    account_hash: Optional[str],
+) -> int:
+    """
+    One GTC buy per ticker until fill or off-watchlist. Keep the oldest; cancel extras.
+    """
+    cancelled = 0
+    for ticker, orders in grouped.items():
+        if len(orders) < 2:
+            continue
+        keep = _oldest_working_buy(orders)
+        if not keep:
+            continue
+        keep_id = str(keep.get('order_id') or '')
+        for extra in orders:
+            oid = str(extra.get('order_id') or '')
+            if not oid or oid == keep_id:
+                continue
+            px = extra.get('limit_price')
+            keep_px = keep.get('limit_price')
+            print(
+                '  Extra BUY for %s: cancelling %s @ %s (keeping %s @ %s)'
+                % (
+                    ticker,
+                    oid,
+                    ('$%.2f' % px) if px is not None else 'n/a',
+                    keep_id,
+                    ('$%.2f' % keep_px) if keep_px is not None else 'n/a',
+                )
+            )
+            if trade_dry_run_enabled():
+                cancelled += 1
+                continue
+            if cancel_stop_order(oid, account_hash=account_hash):
+                cancelled += 1
+                try:
+                    conn = get_connection()
+                    conn.execute('DELETE FROM pending_orders WHERE order_id = ?', (oid,))
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+                try:
+                    log_event(
+                        'buy',
+                        'Cancelled extra buy for %s (keeping one GTC)' % ticker,
+                        detail={
+                            'ticker': ticker,
+                            'order_id': oid,
+                            'kept_order_id': keep_id,
+                            'limit_price': px,
+                            'kept_limit_price': keep_px,
+                            'source': 'duplicate_buy_cancel',
+                            'phase': 'cancelled',
+                        },
+                    )
+                except Exception:
+                    pass
+            else:
+                print('  Warning: could not cancel extra buy %s for %s' % (oid, ticker))
+    return cancelled
+
+
 def reconcile_pending_orders(account_hash: Optional[str] = None) -> int:
     """
-    Remove from pending_orders any row whose order_id is no longer in Schwab open orders
-    (filled or cancelled). Logs each cleared buy so the UI/log stay in sync.
-    
+    Remove from pending_orders any row whose Schwab order filled or cancelled.
+    Resting LIMIT buys stay pending and do not emit BOUGHT until actually filled.
+
     Returns:
         Number of rows removed from pending_orders.
     """
     try:
+        account_hash = account_hash or _get_account_hash()
         open_orders = get_open_orders(account_hash)
+        grouped = _working_buys_grouped(open_orders)
+        extras = _cancel_extra_working_buys(grouped, account_hash)
+        if extras:
+            time.sleep(0.5)
+            open_orders = get_open_orders(account_hash)
+            grouped = _working_buys_grouped(open_orders)
+        for ticker, orders in grouped.items():
+            keep = _oldest_working_buy(orders)
+            if keep:
+                _upsert_pending_buy_from_live(keep)
         open_order_ids = {str(o['order_id']) for o in open_orders if o.get('order_id')}
+        live_buy_ids = set()  # type: set
+        live_buy_tickers = set()  # type: set
+        for tkr, orders in grouped.items():
+            live_buy_tickers.add(tkr)
+            for o in orders:
+                if o.get('order_id'):
+                    live_buy_ids.add(str(o['order_id']))
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT id, order_id, ticker, quantity_ordered, order_amount_dollars
-            FROM pending_orders WHERE order_id IS NOT NULL
-            """
-        )
+        try:
+            cursor.execute(
+                """
+                SELECT id, order_id, ticker, quantity_ordered, order_amount_dollars,
+                       order_type, limit_price
+                FROM pending_orders WHERE order_id IS NOT NULL
+                """
+            )
+            has_type = True
+        except sqlite3.OperationalError:
+            cursor.execute(
+                """
+                SELECT id, order_id, ticker, quantity_ordered, order_amount_dollars
+                FROM pending_orders WHERE order_id IS NOT NULL
+                """
+            )
+            has_type = False
         rows = cursor.fetchall()
-        cleared = []  # type: List[Dict[str, Any]]
-        for pk, oid, ticker, qty, dollars in rows:
-            if oid and str(oid) not in open_order_ids:
-                cleared.append({
-                    'id': pk,
-                    'order_id': oid,
-                    'ticker': ticker,
-                    'quantity': qty,
-                    'dollars': dollars,
-                })
+        filled_rows = []  # type: List[Dict[str, Any]]
+        cancelled_rows = []  # type: List[Dict[str, Any]]
+        for row in rows:
+            if has_type:
+                pk, oid, ticker, qty, dollars, order_type, limit_price = row
+            else:
+                pk, oid, ticker, qty, dollars = row
+                order_type, limit_price = None, None
+            if not oid:
+                continue
+            tkr_u = str(ticker or '').strip().upper()
+            oid_s = str(oid)
+            if oid_s in live_buy_ids or oid_s in open_order_ids:
+                continue
+            if tkr_u in live_buy_tickers:
+                keep = _oldest_working_buy(grouped.get(tkr_u) or [])
+                keep_id = str((keep or {}).get('order_id') or '')
+                if keep_id and keep_id != oid_s:
+                    cursor.execute(
+                        'UPDATE pending_orders SET order_id = ? WHERE id = ?',
+                        (keep_id, pk),
+                    )
+                    print(
+                        '  Rebinding pending buy %s order id %s → %s (Schwab working order)'
+                        % (tkr_u, oid_s, keep_id)
+                    )
+                continue
+            is_limit = (
+                str(order_type or '').upper() in ('LIMIT', 'STOP', 'STOP_LIMIT')
+                or limit_price is not None
+            )
+            outcome = _classify_pending_buy_outcome(
+                oid_s,
+                order_type=order_type or ('LIMIT' if is_limit else None),
+                account_hash=account_hash,
+                open_order_ids=open_order_ids,
+            )
+            payload = {
+                'id': pk,
+                'order_id': oid,
+                'ticker': ticker,
+                'quantity': qty,
+                'dollars': dollars,
+                'order_type': order_type,
+                'limit_price': limit_price,
+            }
+            if outcome == 'filled':
+                filled_rows.append(payload)
                 cursor.execute("DELETE FROM pending_orders WHERE id = ?", (pk,))
+            elif outcome == 'cancelled':
+                cancelled_rows.append(payload)
+                cursor.execute("DELETE FROM pending_orders WHERE id = ?", (pk,))
+            # open / unknown → leave pending
         # Also drop pending rows with no order_id that are older than today (orphan)
         cursor.execute(
             """
@@ -8230,12 +9474,14 @@ def reconcile_pending_orders(account_hash: Optional[str] = None) -> int:
         )
         conn.commit()
         conn.close()
-        for row in cleared:
+        for row in filled_rows:
             qty = row.get('quantity')
             dollars = row.get('dollars')
             px = None  # type: Optional[float]
             try:
-                if qty and dollars and float(qty) > 0:
+                if row.get('limit_price') is not None:
+                    px = float(row['limit_price'])
+                elif qty and dollars and float(qty) > 0:
                     px = float(dollars) / float(qty)
             except (TypeError, ValueError):
                 px = None
@@ -8259,9 +9505,27 @@ def reconcile_pending_orders(account_hash: Optional[str] = None) -> int:
                     'dollars': dollars,
                     'source': 'pending_reconcile',
                     'phase': 'filled',
+                    'order_type': row.get('order_type'),
                 },
             )
-        return len(cleared)
+        for row in cancelled_rows:
+            ticker = row.get('ticker')
+            msg = 'Cancelled pending buy for %s' % ticker
+            print(f"  {msg}")
+            log_event(
+                'buy',
+                msg,
+                detail={
+                    'ticker': ticker,
+                    'quantity': row.get('quantity'),
+                    'order_id': row.get('order_id'),
+                    'dollars': row.get('dollars'),
+                    'source': 'pending_reconcile',
+                    'phase': 'cancelled',
+                    'order_type': row.get('order_type'),
+                },
+            )
+        return len(filled_rows) + len(cancelled_rows)
     except sqlite3.OperationalError:
         # pending_orders table may not exist yet
         return 0
@@ -8276,7 +9540,7 @@ def cancel_pending_buys_not_on_watchlist(account_hash: Optional[str] = None) -> 
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT ticker FROM watchlist')
-        on_watch = {row[0] for row in cursor.fetchall()}
+        on_watch = {str(row[0]).strip().upper() for row in cursor.fetchall() if row[0]}
         cursor.execute(
             '''
             SELECT id, order_id, ticker, quantity_ordered, order_amount_dollars
@@ -8291,12 +9555,13 @@ def cancel_pending_buys_not_on_watchlist(account_hash: Optional[str] = None) -> 
         print(f"Warning: could not load pending buys for watchlist cleanup: {e}")
         return 0
 
-    stale = [r for r in rows if r[2] not in on_watch]
-    if not stale:
-        return 0
-
+    stale = [
+        r for r in rows
+        if str(r[2] or '').strip().upper() not in on_watch
+    ]
     account_hash = account_hash or _get_account_hash()
     cancelled = 0
+    handled_ids = set()  # type: set
     for pk, oid, ticker, qty, dollars in stale:
         if trade_dry_run_enabled():
             print(
@@ -8316,6 +9581,8 @@ def cancel_pending_buys_not_on_watchlist(account_hash: Optional[str] = None) -> 
                 },
             )
             cancelled += 1
+            if oid:
+                handled_ids.add(str(oid))
             continue
         ok = True
         if oid and str(oid) not in ('PENDING',) and not str(oid).startswith('SIM'):
@@ -8349,6 +9616,57 @@ def cancel_pending_buys_not_on_watchlist(account_hash: Optional[str] = None) -> 
                 'phase': 'cancelled',
             },
         )
+        if oid:
+            handled_ids.add(str(oid))
+
+    try:
+        live_grouped = _working_buys_grouped(get_open_orders(account_hash))
+    except Exception as e:
+        print('Warning: could not list Schwab buys for off-watchlist cleanup: %s' % e)
+        live_grouped = {}
+    for ticker, orders in live_grouped.items():
+        if ticker in on_watch:
+            continue
+        for extra in orders:
+            oid = str(extra.get('order_id') or '')
+            if not oid or oid in handled_ids:
+                continue
+            if trade_dry_run_enabled():
+                print(
+                    '[DRY-RUN] Would cancel Schwab buy %s for %s (left watchlist)'
+                    % (oid, ticker)
+                )
+                cancelled += 1
+                continue
+            if not cancel_stop_order(oid, account_hash=account_hash):
+                print(
+                    'Warning: could not cancel off-watchlist Schwab buy %s for %s'
+                    % (oid, ticker)
+                )
+                continue
+            try:
+                conn = get_connection()
+                conn.execute('DELETE FROM pending_orders WHERE order_id = ?', (oid,))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+            cancelled += 1
+            handled_ids.add(oid)
+            msg = 'Cancelled pending buy for %s (left watchlist)' % ticker
+            print('  %s' % msg)
+            log_event(
+                'buy',
+                msg,
+                detail={
+                    'ticker': ticker,
+                    'quantity': extra.get('quantity'),
+                    'order_id': oid,
+                    'limit_price': extra.get('limit_price'),
+                    'source': 'off_watchlist_cancel',
+                    'phase': 'cancelled',
+                },
+            )
     return cancelled
 
 
@@ -8587,17 +9905,25 @@ def get_owned_tickers() -> set:
     return owned
 
 
-def get_pending_buy_tickers() -> set:
-    """Tickers with unfilled buy orders (treat as already spoken for)."""
+def get_pending_buy_tickers(
+    open_orders: Optional[List[Dict[str, Any]]] = None,
+) -> set:
+    """Tickers with unfilled buy orders (local pending or working at Schwab)."""
+    pending = set()  # type: set
     try:
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT DISTINCT ticker FROM pending_orders")
-        pending = {row[0] for row in cursor.fetchall()}
+        pending = {str(row[0]).strip().upper() for row in cursor.fetchall() if row[0]}
         conn.close()
-        return pending
     except sqlite3.OperationalError:
-        return set()
+        pending = set()
+    try:
+        live = working_buy_tickers(open_orders=open_orders)
+        pending |= {str(t).strip().upper() for t in live}
+    except Exception as e:
+        print('Warning: could not list Schwab working buys: %s' % e)
+    return pending
 
 
 def get_watchlist_ranked() -> List[str]:
@@ -8978,6 +10304,1053 @@ def bring_positions_up_to_speed(
             + (' [ALREADY THROUGH STOP]' if state['breached'] else '')
         )
     return results
+
+
+def _event_stop_price_from_row(
+    message: str,
+    detail: Optional[Dict[str, Any]],
+) -> Optional[float]:
+    """STOP-LIMIT dollar from Events (prefer detail; avoid the 'raised $delta' amount)."""
+    detail = detail if isinstance(detail, dict) else {}
+    px = _detail_float(detail, 'stop_price')
+    if px is not None:
+        return px
+    text = message or ''
+    moved = re.search(r'to\s+\$([0-9]+(?:\.[0-9]+)?)', text, re.I)
+    if moved:
+        try:
+            return float(moved.group(1))
+        except (TypeError, ValueError):
+            pass
+    at_px = re.search(r'@\s+\$([0-9]+(?:\.[0-9]+)?)', text)
+    if at_px:
+        try:
+            return float(at_px.group(1))
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _latest_events_stop_for_ticker(ticker: str) -> Optional[Dict[str, Any]]:
+    """
+    Latest non-dry-run STOP-LIMIT Events row for ticker.
+
+    Category is stored as 'sell' (stop-limit alias). Algorithm truth for the trail.
+    """
+    t = str(ticker or '').strip().upper()
+    if not t:
+        return None
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            '''
+            SELECT id, ts, message, detail_json FROM event_log
+            WHERE category = 'sell'
+            ORDER BY id DESC LIMIT 2500
+            '''
+        )
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    for eid, ts, message, detail_json in rows:
+        detail = {}  # type: Dict[str, Any]
+        if detail_json:
+            try:
+                parsed = json.loads(detail_json)
+                if isinstance(parsed, dict):
+                    detail = parsed
+            except (TypeError, ValueError):
+                detail = {}
+        if detail.get('dry_run'):
+            continue
+        msg = str(message or '')
+        if msg.upper().startswith('DRY-RUN'):
+            continue
+        phase = str(detail.get('phase') or '').strip().lower()
+        if phase in ('deferred', 'submitted', 'filled'):
+            continue
+        otype = str(detail.get('order_type') or '').upper()
+        is_stop = (
+            otype == 'STOP_LIMIT'
+            or msg.upper().startswith('STOP-LIMIT')
+            or msg.upper().startswith('STOP_LIMIT')
+        )
+        if not is_stop:
+            continue
+        ev_ticker = str(detail.get('ticker') or '').strip().upper()
+        if not ev_ticker:
+            skip_tok = ('STOP', 'LIMIT', 'SOLD', 'BUY', 'DRY', 'RUN')
+            found = [x for x in _LOG_TICKER_RE.findall(msg) if x not in skip_tok]
+            ev_ticker = found[-1] if found else ''
+        if ev_ticker != t:
+            continue
+        stop_px = _event_stop_price_from_row(msg, detail)
+        if stop_px is None:
+            continue
+        return {
+            'id': eid,
+            'ts': ts,
+            'stop_price': float(stop_px),
+            'message': msg,
+        }
+    return None
+
+
+def _trail_buffer_for_ticker(ticker: str) -> float:
+    on_wl = ticker_on_watchlist(ticker)
+    if not on_wl:
+        return float(getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.07))
+    return float(getattr(config, 'TRAIL_BUFFER_PCT', 0.10))
+
+
+def _peak_gain_from_stop_price(
+    purchase: float,
+    stop_price: float,
+    buffer: float,
+) -> Optional[float]:
+    """Invert stop_price = purchase * (1 + peak - buffer)."""
+    if purchase is None or float(purchase) <= 0:
+        return None
+    if stop_price is None or float(stop_price) <= 0:
+        return None
+    return (float(stop_price) / float(purchase)) - 1.0 + float(buffer)
+
+
+def repair_held_purchase_dates() -> List[str]:
+    """If a holding is stamped later than its last real buy, restore the ledger date."""
+    notes = []  # type: List[str]
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            '''
+            SELECT ticker, date_purchased, purchased_at
+            FROM positions WHERE shares_owned > 0
+            '''
+        )
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    for ticker, date_purchased, purchased_at in rows:
+        ledger_date, ledger_at = _purchase_stamp_from_ledger(str(ticker))
+        if not ledger_date:
+            continue
+        cur_d = str(date_purchased or '')[:10]
+        if cur_d and cur_d <= str(ledger_date)[:10]:
+            continue
+        new_at = ledger_at or ('%sT00:00:00' % ledger_date)
+        conn = get_connection()
+        try:
+            conn.execute(
+                '''
+                UPDATE positions
+                SET date_purchased = ?, purchased_at = ?
+                WHERE ticker = ?
+                ''',
+                (ledger_date, new_at, ticker),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        msg = 'Restored %s purchase date %s (was %s)' % (
+            ticker, ledger_date, cur_d or purchased_at or 'blank',
+        )
+        notes.append(msg)
+        print('  ' + msg)
+    return notes
+
+
+def restore_algorithm_trails_from_events(
+    persist: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Seed peak/stop from leftover DB peak and latest Events STOP-LIMIT.
+
+    Does not use today's print as the peak (that would rebuild a looser trail
+    after a missed ratchet). Current last may still raise the peak if it is a
+    new high. Does not place orders.
+    """
+    init_database()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        SELECT ticker, shares_owned, average_price, peak_gain_pct, stop_gain_pct,
+               trail_active
+        FROM positions WHERE shares_owned > 0
+        '''
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    activate = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10))
+    results = []  # type: List[Dict[str, Any]]
+    for ticker, shares, avg_price, peak_gain, stop_gain, trail_active in rows:
+        if int(shares or 0) <= 0:
+            continue
+        book = get_position_book(ticker)
+        if get_algorithm_start() and book != 'algorithm':
+            continue
+        if avg_price is None or float(avg_price) <= 0:
+            continue
+        purchase = float(avg_price)
+        buffer = _trail_buffer_for_ticker(ticker)
+        peak = float(peak_gain) if peak_gain is not None else None
+        source = 'db' if peak is not None else 'none'
+        events = _latest_events_stop_for_ticker(str(ticker))
+        if events:
+            ev_peak = _peak_gain_from_stop_price(
+                purchase, float(events['stop_price']), buffer,
+            )
+            if ev_peak is not None and ev_peak >= activate:
+                if peak is None or ev_peak > float(peak) + 1e-9:
+                    peak = ev_peak
+                    source = 'events'
+                elif source == 'db':
+                    source = 'db+events'
+        last = get_trade_price(ticker)
+        if not last or float(last) <= 0:
+            results.append({
+                'ticker': ticker,
+                'ok': False,
+                'reason': 'no live Schwab price',
+                'peak_source': source,
+                'events_stop': (events or {}).get('stop_price'),
+            })
+            continue
+        state = compute_trail_state_for_position(
+            str(ticker),
+            purchase,
+            float(last),
+            peak_gain=peak,
+            stop_gain=stop_gain if source.startswith('db') else None,
+            trail_active=bool(trail_active) or (
+                peak is not None and float(peak) >= activate
+            ),
+        )
+        if persist:
+            _update_position_trail_state(
+                str(ticker),
+                state['peak_gain_pct'],
+                state['stop_gain_pct'],
+                state['trail_active'],
+            )
+        row = dict(state)
+        row['ok'] = True
+        row['peak_source'] = source
+        row['events_stop'] = (events or {}).get('stop_price')
+        row['events_ts'] = (events or {}).get('ts')
+        row['shares'] = int(shares or 0)
+        results.append(row)
+        ev_s = (
+            (' Events stop $%.2f' % events['stop_price'])
+            if events else ''
+        )
+        print(
+            '  trail %s: peak %s (%.1f%%) intended stop $%.2f last $%.2f%s%s'
+            % (
+                ticker,
+                source,
+                state['peak_gain_pct'] * 100.0,
+                state['stop_price'],
+                float(last),
+                ev_s,
+                ' [THROUGH STOP]' if state['breached'] else '',
+            )
+        )
+    return results
+
+
+def _fmt_px_opt(px: Any) -> str:
+    if px is None:
+        return 'n/a'
+    try:
+        return '$%.2f' % float(px)
+    except (TypeError, ValueError):
+        return 'n/a'
+
+
+def _event_row_ticker(message: str, detail: Optional[Dict[str, Any]]) -> str:
+    detail = detail if isinstance(detail, dict) else {}
+    t = str(detail.get('ticker') or '').strip().upper()
+    if t:
+        return t
+    msg = message or ''
+    for pat in (
+        r'\bfor\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b',
+        r'\bSOLD\s+(?:\d+\s+)?([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b',
+        r'\bBOUGHT\s+(?:\d+\s+)?([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b',
+        r'\bSELL submitted\s+\d+\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b',
+    ):
+        m = re.search(pat, msg, re.I)
+        if m:
+            tok = m.group(1).upper()
+            if tok not in ('STOP', 'LIMIT', 'SOLD', 'BUY', 'DRY', 'RUN'):
+                return tok
+    return ''
+
+
+def _load_trade_events(limit: int = 2500) -> List[Dict[str, Any]]:
+    """Current-user buy/sell Events rows (newest first)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            '''
+            SELECT id, ts, level, category, message, detail_json
+            FROM event_log
+            WHERE category IN ('buy', 'sell')
+            ORDER BY id DESC LIMIT ?
+            ''',
+            (int(limit),),
+        )
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    out = []  # type: List[Dict[str, Any]]
+    for eid, ts, level, category, message, detail_json in rows:
+        detail = {}  # type: Dict[str, Any]
+        if detail_json:
+            try:
+                parsed = json.loads(detail_json)
+                if isinstance(parsed, dict):
+                    detail = parsed
+            except (TypeError, ValueError):
+                detail = {}
+        out.append({
+            'id': eid,
+            'ts': ts,
+            'level': level,
+            'category': category,
+            'message': message or '',
+            'detail': detail,
+        })
+    return out
+
+
+def _retract_event_row(
+    ev_id: int,
+    new_message: str,
+    reason: str,
+) -> bool:
+    """Rewrite a fake Event so Sell/Buy filters no longer show it as real."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            'SELECT category, message, detail_json FROM event_log WHERE id = ?',
+            (int(ev_id),),
+        )
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return False
+        old_cat, old_msg, detail_json = row
+        detail = {}  # type: Dict[str, Any]
+        if detail_json:
+            try:
+                parsed = json.loads(detail_json)
+                if isinstance(parsed, dict):
+                    detail = parsed
+            except (TypeError, ValueError):
+                detail = {}
+        if detail.get('retracted'):
+            conn.close()
+            return False
+        detail['retracted'] = True
+        detail['retracted_reason'] = reason
+        detail['retracted_message'] = old_msg
+        detail['original_category'] = old_cat
+        cursor.execute(
+            '''
+            UPDATE event_log
+            SET category = ?, level = ?, message = ?, detail_json = ?
+            WHERE id = ?
+            ''',
+            (
+                'task',
+                'warn',
+                new_message,
+                json.dumps(detail),
+                int(ev_id),
+            ),
+        )
+        conn.commit()
+    except Exception as e:
+        print('Warning: could not retract event id=%s: %s' % (ev_id, e))
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return False
+    conn.close()
+    try:
+        bump_dashboard_rev()
+    except Exception:
+        pass
+    return True
+
+
+def plan_event_reality_repairs(
+    held_tickers: Optional[set] = None,
+    schwab_stops: Optional[Dict[str, Any]] = None,
+    extra_buy_order_ids: Optional[set] = None,
+    pending_buy_tickers: Optional[set] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Events rows that do not match the broker: false SOLD, phantom STOP-LIMIT
+    ratchets that never reached Schwab, false BOUGHT, extra GTC buys.
+    """
+    held = {str(t).strip().upper() for t in (held_tickers or get_owned_tickers())}
+    stops = schwab_stops if schwab_stops is not None else {}
+    extra_ids = {str(x) for x in (extra_buy_order_ids or set()) if x}
+    pending_buys = {
+        str(t).strip().upper() for t in (pending_buy_tickers or set()) if t
+    }
+    min_move = float(getattr(config, 'STOP_REPLACE_MIN_DOLLARS', 0.05))
+    plans = []  # type: List[Dict[str, Any]]
+    for ev in _load_trade_events():
+        detail = ev.get('detail') or {}
+        msg = str(ev.get('message') or '')
+        upper = msg.upper()
+        if detail.get('retracted') or upper.startswith('RETRACTED'):
+            continue
+        if detail.get('dry_run') or upper.startswith('DRY-RUN'):
+            continue
+        ticker = _event_row_ticker(msg, detail)
+        phase = str(detail.get('phase') or '').strip().lower()
+        source = str(detail.get('source') or '').strip().lower()
+        otype = str(detail.get('order_type') or '').upper()
+        oid = detail.get('order_id')
+        is_stop = (
+            otype == 'STOP_LIMIT'
+            or upper.startswith('STOP-LIMIT')
+            or upper.startswith('STOP_LIMIT')
+        )
+        is_sold = (
+            ((upper.startswith('SOLD') or ' SOLD ' in (' ' + upper)) and not is_stop)
+            or (
+                phase == 'filled'
+                and str(ev.get('category')) == 'sell'
+                and not is_stop
+            )
+            or (
+                source in ('stop_limit_fill', 'sync_close', 'market_sell_fill')
+                and not is_stop
+            )
+        )
+        is_submitted = (
+            phase == 'submitted'
+            or 'SELL SUBMITTED' in upper
+            or 'AWAITING SCHWAB FILL' in upper
+        )
+        is_bought = upper.startswith('BOUGHT') or (
+            str(ev.get('category')) == 'buy' and phase == 'filled'
+        )
+        is_buy_limit = (
+            'BUY-LIMIT' in upper
+            or phase == 'limit_pending'
+            or (str(ev.get('category')) == 'buy' and otype == 'LIMIT')
+        )
+
+        if oid and str(oid) in extra_ids:
+            plans.append({
+                'id': ev['id'],
+                'ticker': ticker,
+                'ts': ev.get('ts'),
+                'old_message': msg,
+                'reason': 'extra_buy',
+                'new_message': 'RETRACTED extra buy for %s (duplicate GTC, never filled)' % (
+                    ticker or 'ticker',
+                ),
+            })
+            continue
+
+        if ticker and ticker in held:
+            if is_sold:
+                plans.append({
+                    'id': ev['id'],
+                    'ticker': ticker,
+                    'ts': ev.get('ts'),
+                    'old_message': msg,
+                    'reason': 'false_sold',
+                    'new_message': (
+                        'RETRACTED false SOLD for %s — never filled (shares stayed at Schwab)'
+                        % ticker
+                    ),
+                })
+                continue
+            if is_submitted:
+                plans.append({
+                    'id': ev['id'],
+                    'ticker': ticker,
+                    'ts': ev.get('ts'),
+                    'old_message': msg,
+                    'reason': 'false_submitted',
+                    'new_message': (
+                        'RETRACTED SELL submitted for %s — never filled (shares stayed at Schwab)'
+                        % ticker
+                    ),
+                })
+                continue
+            if is_stop and phase != 'deferred':
+                live = stops.get(ticker) if isinstance(stops.get(ticker), dict) else None
+                schwab_px = None
+                if live:
+                    schwab_px = _positive_float(live.get('stop_price'))
+                elif ticker in stops and not isinstance(stops.get(ticker), dict):
+                    schwab_px = _positive_float(stops.get(ticker))
+                ev_px = _event_stop_price_from_row(msg, detail)
+                if (
+                    schwab_px is not None
+                    and ev_px is not None
+                    and float(ev_px) > float(schwab_px) + min_move
+                ):
+                    plans.append({
+                        'id': ev['id'],
+                        'ticker': ticker,
+                        'ts': ev.get('ts'),
+                        'old_message': msg,
+                        'reason': 'phantom_stop',
+                        'new_message': (
+                            'RETRACTED STOP-LIMIT %s for %s — never reached Schwab '
+                            '(working stop was %s)'
+                            % (_fmt_px_opt(ev_px), ticker, _fmt_px_opt(schwab_px))
+                        ),
+                    })
+                    continue
+            if is_bought and not is_buy_limit:
+                if not _has_real_buy_near(ticker, str(ev.get('ts') or '')):
+                    plans.append({
+                        'id': ev['id'],
+                        'ticker': ticker,
+                        'ts': ev.get('ts'),
+                        'old_message': msg,
+                        'reason': 'false_bought',
+                        'new_message': (
+                            'RETRACTED false BOUGHT for %s — position was already held'
+                            % ticker
+                        ),
+                    })
+                    continue
+        if (
+            ticker
+            and ticker not in held
+            and ticker in pending_buys
+            and is_bought
+            and not is_buy_limit
+        ):
+            plans.append({
+                'id': ev['id'],
+                'ticker': ticker,
+                'ts': ev.get('ts'),
+                'old_message': msg,
+                'reason': 'false_bought',
+                'new_message': (
+                    'RETRACTED false BOUGHT for %s — buy is still a resting GTC'
+                    % ticker
+                ),
+            })
+    return plans
+
+
+def apply_event_reality_repairs(plans: List[Dict[str, Any]]) -> int:
+    n = 0
+    for row in plans:
+        ev_id = row.get('id')
+        if not ev_id:
+            continue
+        ok = _retract_event_row(
+            int(ev_id),
+            str(row.get('new_message') or 'RETRACTED event'),
+            str(row.get('reason') or 'catch_up'),
+        )
+        if ok:
+            n += 1
+            print('  Events: %s' % row.get('new_message'))
+    return n
+
+
+def _retract_false_sold_events_for_ticker(ticker: str) -> int:
+    """Retract SOLD / SELL-submitted Events for a name that is still held."""
+    t = str(ticker or '').strip().upper()
+    if not t:
+        return 0
+    plans = plan_event_reality_repairs(
+        held_tickers={t},
+        schwab_stops={},
+        extra_buy_order_ids=set(),
+    )
+    sold = [p for p in plans if p.get('reason') in ('false_sold', 'false_submitted')]
+    return apply_event_reality_repairs(sold)
+
+
+def run_catch_up_for_current_user(live: bool = False) -> Dict[str, Any]:
+    """
+    Bring this user up to speed with what the algorithm was doing.
+
+    1. Sync Schwab, restore buy dates, void fake SOLDs, rebind stop ids
+    2. Restore trail peaks from Events (not from today's print)
+    3. Dry-run (default): print sell / replace / leave, extra GTC buys,
+       and Events that will be retracted so the log matches the broker
+    4. live=True: retract fake Events, then during RTH cancel extra buys
+       and one sell pass (scorecard / SOLD line uses the Schwab fill)
+    """
+    init_database()
+    uname = None  # type: Optional[str]
+    try:
+        user = uc.get_user_by_id(_uid()) or {}
+        uname = user.get('username')
+    except Exception:
+        uname = None
+    label = uname or ('user %s' % _uid())
+    mode = 'LIVE' if live else 'dry-run'
+    report = {
+        'username': label,
+        'live': bool(live),
+        'ok': False,
+        'skipped': False,
+        'repairs': [],
+        'positions': [],
+        'extra_buys': [],
+        'sells': [],
+    }  # type: Dict[str, Any]
+
+    print('')
+    print('=' * 60)
+    print('Catch-up %s — %s' % (mode, label))
+    print('=' * 60)
+
+    if not get_algorithm_start():
+        msg = 'Skipping %s — algorithm_start not set (onboard in Actions → Run)' % label
+        print('  ' + msg)
+        report['skipped'] = True
+        report['reason'] = 'no_algorithm_start'
+        report['ok'] = True
+        return report
+
+    maybe_reinit_schwab_client()
+    if not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
+        msg = 'Skipping %s — Schwab not connected' % label
+        print('  ' + msg)
+        report['skipped'] = True
+        report['reason'] = 'schwab_unavailable'
+        report['ok'] = False
+        return report
+
+    sync = refresh_schwab_positions_if_needed(force=True)
+    if not sync.get('ok'):
+        msg = 'Position sync failed (%s) — refusing catch-up' % sync.get('reason')
+        print('  ' + msg)
+        report['reason'] = 'sync_failed'
+        report['ok'] = False
+        return report
+
+    print('\n--- Repairs %s ---' % ('(applying)' if live else '(preview; writes on --live)'))
+    repairs = []  # type: List[str]
+    if live:
+        repairs = repair_held_purchase_dates()
+        held = sorted(get_owned_tickers())
+        for tkr in held:
+            try:
+                if _void_false_sync_sell_if_still_held(str(tkr)):
+                    repairs.append('Voided false Schwab-sync SELL for %s' % tkr)
+            except Exception as e:
+                print('  Warning: false-sell repair for %s failed: %s' % (tkr, e))
+        try:
+            n = reconcile_local_stops_from_schwab()
+            if n:
+                repairs.append('Rebound %s local stop(s) from Schwab' % n)
+        except Exception as e:
+            print('  Warning: stop rebind failed: %s' % e)
+    else:
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                '''
+                SELECT ticker, date_purchased FROM positions WHERE shares_owned > 0
+                '''
+            )
+            date_rows = cursor.fetchall()
+        except sqlite3.OperationalError:
+            date_rows = []
+        finally:
+            conn.close()
+        for tkr, date_purchased in date_rows:
+            ledger_date, _ledger_at = _purchase_stamp_from_ledger(str(tkr))
+            cur_d = str(date_purchased or '')[:10]
+            if ledger_date and (not cur_d or cur_d > str(ledger_date)[:10]):
+                msg = 'Would restore %s purchase date %s (now %s)' % (
+                    tkr, ledger_date, cur_d or 'blank',
+                )
+                repairs.append(msg)
+                print('  ' + msg)
+            try:
+                last = _latest_real_trade(str(tkr))
+            except Exception:
+                last = None
+            if (
+                last
+                and str(last.get('side') or '').strip().lower() == 'sell'
+                and 'Schwab sync' in str(last.get('note') or '')
+            ):
+                msg = 'Would void false Schwab-sync SELL for %s (trade id=%s)' % (
+                    tkr, last.get('id'),
+                )
+                repairs.append(msg)
+                print('  ' + msg)
+        if not repairs:
+            print('  (no purchase-date / false-SOLD repairs needed)')
+    print('\n--- Algorithm trail (Events + DB peak) ---')
+    trails = restore_algorithm_trails_from_events(persist=bool(live))
+    report['repairs'] = repairs
+    report['trails'] = trails
+
+    open_orders = []  # type: List[Dict[str, Any]]
+    try:
+        open_orders = get_open_orders() or []
+    except Exception as e:
+        print('  Warning: could not list open orders: %s' % e)
+        open_orders = []
+    extras = preview_extra_working_buys(open_orders=open_orders)
+    report['extra_buys'] = extras
+
+    print('\n--- Positions (algorithm vs Schwab vs last) ---')
+    live_stops = _working_stop_limits_by_ticker(open_orders)
+    user_dry = trade_dry_run_enabled()
+    min_move = float(getattr(config, 'STOP_REPLACE_MIN_DOLLARS', 0.05))
+    position_rows = []  # type: List[Dict[str, Any]]
+    for state in trails:
+        ticker = state.get('ticker')
+        if not ticker or not state.get('ok'):
+            if ticker:
+                print('  [%s] skip: %s' % (ticker, state.get('reason')))
+            continue
+        schwab = live_stops.get(str(ticker).upper()) or {}
+        schwab_stop = schwab.get('stop_price')
+        intended = state.get('stop_price')
+        last = state.get('price')
+        hold_ok, hold_reason = is_min_hold_met(str(ticker))
+        if not hold_ok:
+            ledger_date, _ledger_at = _purchase_stamp_from_ledger(str(ticker))
+            if ledger_date:
+                try:
+                    buy_d = datetime.strptime(str(ledger_date)[:10], '%Y-%m-%d').date()
+                    if buy_d < _now_market().date():
+                        hold_ok = True
+                        hold_reason = 'buy date will restore to %s' % ledger_date
+                except ValueError:
+                    pass
+        if state.get('breached'):
+            action = 'sell_now' if hold_ok else 'skip_sell'
+        else:
+            if not hold_ok:
+                action = 'defer_stop_limit'
+            elif (
+                schwab_stop is not None
+                and intended is not None
+                and abs(float(intended) - float(schwab_stop)) < min_move
+            ):
+                action = 'leave'
+            elif (
+                schwab_stop is not None
+                and intended is not None
+                and float(intended) > float(schwab_stop) + min_move
+            ):
+                action = 'replace'
+            elif schwab_stop is None:
+                action = 'place_stop_limit'
+            else:
+                action = 'leave'
+        row = {
+            'ticker': ticker,
+            'shares': state.get('shares'),
+            'purchase': state.get('purchase'),
+            'last': last,
+            'events_stop': state.get('events_stop'),
+            'schwab_stop': schwab_stop,
+            'intended_stop': intended,
+            'peak_source': state.get('peak_source'),
+            'action': action,
+            'hold_ok': hold_ok,
+            'hold_reason': hold_reason,
+            'breached': bool(state.get('breached')),
+        }
+        position_rows.append(row)
+        note = ''
+        if action == 'sell_now':
+            note = (
+                ' — market sell at live print (scorecard uses Schwab fill, '
+                'not Events stop %s)' % _fmt_px_opt(state.get('events_stop'))
+            )
+        elif action == 'skip_sell':
+            note = ' — stop breached but %s' % hold_reason
+        elif action == 'replace':
+            note = ' — raise Schwab %s → %s' % (
+                _fmt_px_opt(schwab_stop), _fmt_px_opt(intended),
+            )
+        print(
+            '  [%s] %s  last %s  events %s  schwab %s  intended %s%s'
+            % (
+                action,
+                ticker,
+                _fmt_px_opt(last),
+                _fmt_px_opt(state.get('events_stop')),
+                _fmt_px_opt(schwab_stop),
+                _fmt_px_opt(intended),
+                note,
+            )
+        )
+    report['positions'] = position_rows
+
+    print('\n--- Extra GTC buys (keep oldest) ---')
+    if not extras:
+        print('  (none)')
+    for extra in extras:
+        print(
+            '  %s: keep %s @ %s; cancel %s @ %s'
+            % (
+                extra.get('ticker'),
+                extra.get('keep_order_id'),
+                _fmt_px_opt(extra.get('keep_limit_price')),
+                extra.get('cancel_order_id'),
+                _fmt_px_opt(extra.get('cancel_limit_price')),
+            )
+        )
+
+    extra_ids = {
+        str(x.get('cancel_order_id'))
+        for x in extras
+        if x.get('cancel_order_id')
+    }
+    event_plans = plan_event_reality_repairs(
+        held_tickers=set(get_owned_tickers()),
+        schwab_stops=live_stops,
+        extra_buy_order_ids=extra_ids,
+        pending_buy_tickers=working_buy_tickers(open_orders=open_orders),
+    )
+    report['event_repairs'] = event_plans
+    print('\n--- Events (match what actually happened) ---')
+    if not event_plans:
+        print('  (no false SOLD / phantom stop / extra-buy Events to retract)')
+    else:
+        for row in event_plans:
+            print(
+                '  [%s] %s  was: %s'
+                % (row.get('reason'), row.get('ticker'), row.get('old_message'))
+            )
+        if live:
+            n = apply_event_reality_repairs(event_plans)
+            repairs.append('Retracted %s Event(s) that did not happen at Schwab' % n)
+            report['repairs'] = repairs
+        else:
+            print('  (will retract on --live, then new SOLD/STOP lines use the real fill)')
+
+    market_open = is_us_equity_market_open()
+    if not live:
+        print('\nDry-run only — no Schwab orders, no trail writes, no Event retractions.')
+        print(
+            '  Review the list, then: python main.py --catch-up --live'
+            '  (optionally --user NAME). Events / scorecard will use the Schwab fill, '
+            'not the missed stop.'
+        )
+        report['ok'] = True
+        report['executed'] = False
+        return report
+
+    if user_dry:
+        print(
+            '\n%s is Dry Run — books repaired, not placing Schwab orders. '
+            'Go live in Actions first if this account should trade.'
+            % label
+        )
+        report['ok'] = True
+        report['executed'] = False
+        report['reason'] = 'user_dry_run'
+        return report
+
+    if not market_open:
+        print(
+            '\nMarket closed — books repaired. Re-run --catch-up --live during RTH '
+            'to sell / replace / cancel extras.'
+        )
+        report['ok'] = True
+        report['executed'] = False
+        report['reason'] = 'market_closed'
+        return report
+
+    print('\n--- LIVE: cancel extra buys, then one sell pass ---')
+    try:
+        reconcile_pending_orders()
+    except Exception as e:
+        print('Warning: pending-buy reconcile failed: %s' % e)
+    sells = run_sell_pass(dry_run=False)
+    report['sells'] = sells
+    report['ok'] = True
+    report['executed'] = True
+    print(
+        '\nScorecard: realized P/L is logged when Schwab shows the fill '
+        '(execution average), not the Events stop.'
+    )
+    return report
+
+
+def run_catch_up(
+    live: bool = False,
+    usernames: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Run catch-up for each active user (or named users). Per-user Events/Schwab."""
+    init_database()
+    want = None  # type: Optional[set]
+    if usernames:
+        want = {str(n).strip().lower() for n in usernames if str(n).strip()}
+    users = uc.list_active_users()
+    if want:
+        users = [
+            u for u in users
+            if str(u.get('username') or '').strip().lower() in want
+        ]
+        missing = want - {
+            str(u.get('username') or '').strip().lower() for u in users
+        }
+        for name in sorted(missing):
+            print('No active user named %s' % name)
+    reports = []  # type: List[Dict[str, Any]]
+    for user in users:
+        uid = int(user['id'])
+        with uc.use_user(uid):
+            _sync_schwab_globals(uid)
+            reports.append(run_catch_up_for_current_user(live=live))
+    return {
+        'live': bool(live),
+        'users': reports,
+    }
+
+
+def _repo_root() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _catch_up_request_path() -> str:
+    return os.path.join(_repo_root(), 'data', 'catch_up_requested.json')
+
+
+def _git_head_sha() -> str:
+    try:
+        proc = subprocess.Popen(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            cwd=_repo_root(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        out, _err = proc.communicate()
+        if proc.returncode == 0:
+            return (out or '').strip()
+    except Exception:
+        pass
+    return ''
+
+
+def _catch_up_request_present() -> bool:
+    return os.path.isfile(_catch_up_request_path())
+
+
+def _consume_catch_up_request() -> None:
+    path = _catch_up_request_path()
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _on_always_on_host() -> bool:
+    """True on the Dell (supervisor writes data/host_status.json)."""
+    return os.path.isfile(os.path.join(_repo_root(), 'data', 'host_status.json'))
+
+
+def _should_auto_catch_up() -> bool:
+    """
+    After Actions → Pull from GitHub, or to finish orders at the next RTH open.
+
+    Does not run on a normal Surface `python main.py --loop` (no host status /
+    request file). Crash restarts with the same git SHA skip unless orders
+    are still pending from an after-hours pull.
+    """
+    if _catch_up_request_present():
+        return True
+    pending = get_runtime_flag('catch_up_orders_pending') == '1'
+    if pending:
+        return bool(is_us_equity_market_open())
+    if not _on_always_on_host():
+        return False
+    sha = _git_head_sha()
+    done = get_runtime_flag('catch_up_done_sha') or ''
+    return bool(sha and sha != done)
+
+
+def maybe_run_deploy_catch_up() -> None:
+    """Live catch-up once after a Dell pull, then the loop continues as usual."""
+    if not _should_auto_catch_up():
+        return
+    print_loop_status('Deploy catch-up (live) before normal jobs…')
+    print('')
+    print('=' * 60)
+    print('DEPLOY CATCH-UP (automatic after git pull / new SHA)')
+    print('=' * 60)
+    try:
+        log_event('task', 'Deploy catch-up started (live)')
+    except Exception:
+        pass
+    result = None  # type: Optional[Dict[str, Any]]
+    try:
+        result = run_catch_up(live=True)
+    except Exception as e:
+        print_loop_status('Deploy catch-up failed: %s' % e)
+        print('Deploy catch-up failed: %s' % e)
+        try:
+            log_event(
+                'task',
+                'Deploy catch-up failed: %s' % e,
+                level='error',
+            )
+        except Exception:
+            pass
+        return
+    _consume_catch_up_request()
+    sha = _git_head_sha()
+    if sha:
+        set_runtime_flag('catch_up_done_sha', sha)
+    market_open = is_us_equity_market_open()
+    if not market_open:
+        set_runtime_flag('catch_up_orders_pending', '1')
+        print_loop_status('Catch-up books done; live orders wait for market open')
+        try:
+            log_event(
+                'task',
+                'Deploy catch-up repaired books; orders deferred until RTH',
+            )
+        except Exception:
+            pass
+        return
+    set_runtime_flag('catch_up_orders_pending', '0')
+    executed = any(bool(u.get('executed')) for u in (result or {}).get('users') or [])
+    print_loop_status(
+        'Catch-up complete%s — resuming normal jobs'
+        % (' (orders placed)' if executed else '')
+    )
+    try:
+        log_event('task', 'Deploy catch-up finished — resuming normal jobs')
+    except Exception:
+        pass
 
 
 def mark_algorithm_start(force: bool = False) -> Dict[str, Any]:
@@ -9713,7 +12086,7 @@ def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
                 'rank': rank,
             })
             continue
-        if ticker in pending:
+        if str(ticker).upper() in pending:
             proposals.append({
                 'action': 'skip_buy',
                 'ticker': ticker,
@@ -10117,6 +12490,10 @@ def run_buy_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
             'ticker': None,
             'reason': msg,
         }]
+    try:
+        reconcile_pending_orders()
+    except Exception as rec_err:
+        print('Warning: pending-buy reconcile before buy pass failed: %s' % rec_err)
     proposals = propose_buys()
     emit_trade_pass_warnings(proposals, category='task')
     for p in proposals:
@@ -10133,12 +12510,7 @@ def run_buy_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
             limit_pct = buy_limit_discount_pct()
             if limit_pct > 0 and px:
                 limit_px = buy_limit_price_from_market(float(px), limit_pct)
-                msg = (
-                    'DRY-RUN GTC LIMIT BUY %s %s @ %s (%d%% below market %s)'
-                    % (
-                        qty, tkr, _fmt_log_px(limit_px), limit_pct, _fmt_log_px(px),
-                    )
-                )
+                msg = format_buy_limit_log_message(tkr, float(limit_px), dry_run=True)
                 print(f"    ({msg})")
                 log_event(
                     'buy',
@@ -10198,6 +12570,13 @@ def run_sell_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
         }]
     proposals = propose_sells()
     emit_trade_pass_warnings(proposals, category='task')
+    live_orders = None  # type: Optional[List[Dict[str, Any]]]
+    if not dry_run:
+        try:
+            live_orders = get_open_orders() or []
+        except Exception as e:
+            print('  Warning: could not list Schwab open orders for sell pass: %s' % e)
+            live_orders = None
     for p in proposals:
         if p.get('action') == 'warning':
             print(f"  ⚠️  {p.get('reason')}")
@@ -10208,7 +12587,6 @@ def run_sell_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
             exit_info = describe_sell_exit(p.get('stop_kind'), bool(p.get('trail_active')))
             exit_kind = p.get('exit_kind') or exit_info['exit_kind']
             qty = int(p.get('quantity') or 0)
-            # execute_sell logs SOLD (or dry-run SOLD)
             if dry_run:
                 execute_sell(
                     ticker,
@@ -10218,9 +12596,16 @@ def run_sell_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
                 )
                 continue
             try:
-                cancel_position_broker_stop(ticker)
+                cancelled = cancel_position_broker_stop(ticker)
             except Exception as e:
+                cancelled = False
                 print(f"  Warning: cancel stop before sell_now failed for {ticker}: {e}")
+            if not cancelled:
+                print(
+                    '  Aborting market sell for %s — working STOP_LIMIT still at Schwab'
+                    % ticker
+                )
+                continue
             execute_sell(
                 ticker,
                 qty,
@@ -10232,10 +12617,22 @@ def run_sell_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
             stop_px = p.get('stop_price')
             already = _stop_defer_already_logged(ticker)
             if not dry_run:
-                try:
-                    cancel_position_broker_stop(ticker)
-                except Exception as e:
-                    print(f"  Warning: cancel deferred stop for {ticker}: {e}")
+                live = find_working_stop_limit_sell(ticker)
+                entered = _order_entered_market_date(live)
+                today = _now_market().date()
+                if live and entered is not None and entered < today:
+                    print(
+                        '  Leaving %s prior-day STOP_LIMIT @ %s during same-day defer'
+                        % (
+                            ticker,
+                            ('$%.2f' % live['stop_price']) if live.get('stop_price') else 'n/a',
+                        )
+                    )
+                else:
+                    try:
+                        cancel_position_broker_stop(ticker)
+                    except Exception as e:
+                        print(f"  Warning: cancel deferred stop for {ticker}: {e}")
             if already:
                 continue
             if stop_px is None:
@@ -10273,6 +12670,7 @@ def run_sell_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
                 int(p['quantity']),
                 float(p['stop_price']),
                 spot_price=p.get('price'),
+                open_orders=live_orders,
             )
             action = result.get('action')
             if action == 'unchanged':
@@ -11708,21 +14106,43 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
 
     pending = []  # type: List[Dict[str, Any]]
     try:
-        cursor.execute(
-            '''
-            SELECT id, ticker, date_ordered, quantity_ordered, order_amount_dollars, order_id
-            FROM pending_orders ORDER BY date_ordered DESC
-            '''
-        )
-        for r in cursor.fetchall():
-            pending.append({
-                'id': r[0],
-                'ticker': r[1],
-                'date_ordered': r[2],
-                'quantity_ordered': r[3],
-                'order_amount_dollars': r[4],
-                'order_id': r[5],
-            })
+        try:
+            cursor.execute(
+                '''
+                SELECT id, ticker, date_ordered, quantity_ordered, order_amount_dollars,
+                       order_id, order_type, limit_price
+                FROM pending_orders ORDER BY date_ordered DESC
+                '''
+            )
+            for r in cursor.fetchall():
+                pending.append({
+                    'id': r[0],
+                    'ticker': r[1],
+                    'date_ordered': r[2],
+                    'quantity_ordered': r[3],
+                    'order_amount_dollars': r[4],
+                    'order_id': r[5],
+                    'order_type': r[6],
+                    'limit_price': r[7],
+                })
+        except sqlite3.OperationalError:
+            cursor.execute(
+                '''
+                SELECT id, ticker, date_ordered, quantity_ordered, order_amount_dollars, order_id
+                FROM pending_orders ORDER BY date_ordered DESC
+                '''
+            )
+            for r in cursor.fetchall():
+                pending.append({
+                    'id': r[0],
+                    'ticker': r[1],
+                    'date_ordered': r[2],
+                    'quantity_ordered': r[3],
+                    'order_amount_dollars': r[4],
+                    'order_id': r[5],
+                    'order_type': None,
+                    'limit_price': None,
+                })
     except sqlite3.OperationalError:
         pass
 
@@ -11734,11 +14154,54 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
             open_orders = get_open_orders() or []
         except Exception:
             open_orders = []
+    live_map = _working_stop_limits_by_ticker(open_orders)
+    if live_map:
+        held = {
+            str(p.get('ticker') or '').upper() for p in positions if p.get('ticker')
+        }
+        for p in positions:
+            live = live_map.get(str(p.get('ticker') or '').upper())
+            if not live:
+                continue
+            p['stop_order_id'] = live.get('order_id')
+            p['stop_order_price'] = live.get('stop_price')
+            p['stop_limit_price'] = live.get('limit_price')
+            p['stop_order_qty'] = live.get('quantity')
+            p['stop_display_price'] = _dashboard_stop_display_price(
+                live.get('stop_price'), p.get('stop_gain_pct'), p.get('average_price')
+            )
+            status_info = _dashboard_position_status(
+                p.get('ticker'),
+                p.get('book'),
+                p.get('stop_display_price'),
+                trail_active=bool(p.get('trail_active')),
+            )
+            p['status'] = status_info['status']
+            p['status_label'] = status_info['status_label']
+            p['min_hold_met'] = status_info['min_hold_met']
+            p['hold_hours_left'] = status_info['hold_hours_left']
+        rebuilt = []  # type: List[Dict[str, Any]]
+        for tkr, live in live_map.items():
+            if tkr not in held:
+                continue
+            rebuilt.append({
+                'ticker': tkr,
+                'quantity': live.get('quantity'),
+                'order_id': live.get('order_id'),
+                'order_type': 'STOP_LIMIT',
+                'stop_price': live.get('stop_price'),
+                'limit_price': live.get('limit_price'),
+                'source': 'limit_sell',
+            })
+        if rebuilt:
+            limit_sells = rebuilt
     limit_ids = {str(o.get('order_id')) for o in limit_sells if o.get('order_id')}
-    if limit_ids and open_orders:
+    pending_ids = {str(o.get('order_id')) for o in pending if o.get('order_id')}
+    skip_ids = limit_ids | pending_ids
+    if skip_ids and open_orders:
         open_orders = [
             o for o in open_orders
-            if str(o.get('order_id') or '') not in limit_ids
+            if str(o.get('order_id') or '') not in skip_ids
         ]
 
     sod = total_mv - total_day
@@ -11854,13 +14317,18 @@ def get_dashboard_events(
     uid = _uid()
     user = uc.get_user_by_id(uid) or {}
 
-    allowed = {'buy', 'sell', 'stop-limit', 'watchlist', 'task'}
+    allowed = {'buy', 'sell', 'watchlist', 'task'}
     cats = []  # type: List[str]
     if categories:
         for raw in categories:
             key = normalize_log_category(raw)
             if key in allowed and key not in cats:
                 cats.append(key)
+
+    # Until cleanup rewrites old rows, Sell filter also matches legacy stop-limit category
+    sql_cats = list(cats)
+    if 'sell' in sql_cats and 'stop-limit' not in sql_cats:
+        sql_cats.append('stop-limit')
 
     before = None  # type: Optional[int]
     if before_id is not None:
@@ -11874,10 +14342,10 @@ def get_dashboard_events(
     fetch_n = limit + 1
     where_parts = []  # type: List[str]
     params = []  # type: List[Any]
-    if cats:
-        placeholders = ','.join(['?'] * len(cats))
+    if sql_cats:
+        placeholders = ','.join(['?'] * len(sql_cats))
         where_parts.append('category IN (%s)' % placeholders)
-        params.extend(cats)
+        params.extend(sql_cats)
     if before is not None:
         where_parts.append('id < ?')
         params.append(before)
@@ -11910,7 +14378,7 @@ def get_dashboard_events(
             'id': r[0],
             'ts': r[1],
             'level': r[2],
-            'category': r[3],
+            'category': normalize_log_category(r[3]),
             'message': r[4],
             'detail': detail,
             'user_id': uid,

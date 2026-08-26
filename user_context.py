@@ -37,6 +37,8 @@ GLOBAL_FLAG_KEYS = frozenset([
     'last_loop_wake',
     'rth_session_started',
     'yahoo_universe_size',
+    'catch_up_done_sha',
+    'catch_up_orders_pending',
 ])
 
 # job_runs names that stay global (shared Yahoo refresh)

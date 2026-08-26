@@ -1286,7 +1286,7 @@
     }
     if (detail) {
       detail.textContent = alive
-        ? 'Pull from GitHub on this machine, then restart the three processes. Crashes restart on their own.'
+        ? 'Pull from GitHub, restart, then catch-up (live) before normal jobs. Crashes restart on their own.'
         : ((data && data.hint) || 'Supervisor is not running on this machine.');
     }
     var children = (data && data.children) || {};
@@ -2703,11 +2703,21 @@
       obody.innerHTML = '';
       (data.pending_orders || []).forEach(function (o) {
         var tr = document.createElement('tr');
+        var isLimit = String(o.order_type || '').toUpperCase() === 'LIMIT' ||
+          (o.limit_price != null && o.limit_price !== '');
+        var kind = isLimit ? 'buy limit' : 'pending buy';
+        var detailParts = [];
+        if (isLimit && o.limit_price != null && o.limit_price !== '') {
+          detailParts.push('limit ' + money(o.limit_price));
+        } else if (o.order_amount_dollars != null && o.order_amount_dollars !== '') {
+          detailParts.push(money(o.order_amount_dollars));
+        }
+        if (o.order_id) detailParts.push('id ' + String(o.order_id));
         tr.innerHTML =
-          '<td>pending buy</td>' +
+          '<td>' + kind + '</td>' +
           '<td>' + escapeHtml(o.ticker || '') + '</td>' +
           '<td class="num">' + (o.quantity_ordered != null ? o.quantity_ordered : '—') + '</td>' +
-          '<td>' + money(o.order_amount_dollars) + (o.order_id ? ' · id ' + escapeHtml(String(o.order_id)) : '') + '</td>';
+          '<td>' + escapeHtml(detailParts.join(' · ') || '—') + '</td>';
         obody.appendChild(tr);
       });
       (data.limit_sells || []).forEach(function (o) {
@@ -2764,18 +2774,18 @@
     }
   }
 
-  // Viewer tags. Activity (Buy/Sell/Stop/Watchlist) is the default view; Tasks is ops noise.
+  // Viewer tags. Activity (Buy/Sell/Watchlist) is the default view; Tasks is ops noise.
+  // Resting STOP_LIMIT sells show under Sell as "STOP-LIMIT SELL"; LIMIT buys under Buy as "LIMIT BUY".
   var LOG_CATEGORIES = [
-    { id: 'buy', label: 'Buy', meaning: 'Actual buys after the order fills.' },
-    { id: 'sell', label: 'Sell', meaning: 'Actual sales after the order fills.' },
-    { id: 'stop-limit', label: 'Stop', meaning: 'Protective stop set, moved, or deferred.' },
+    { id: 'buy', label: 'Buy', meaning: 'Market fills (BUY) and resting buy limits (LIMIT BUY).' },
+    { id: 'sell', label: 'Sell', meaning: 'Market fills (SELL) and protective stop-limits (STOP-LIMIT SELL).' },
     { id: 'watchlist', label: 'Watchlist', meaning: 'Watchlist refresh from the filter (adds/removes).' },
     { id: 'task', label: 'Tasks', meaning: 'Scheduler noise: task start/finish, Yahoo batches, Schwab sync, account snapshots.' }
   ];
 
   var LOG_PAGE_SIZE = 50;
   // Default: activity only (not Tasks)
-  var logFilterSelected = { buy: true, sell: true, 'stop-limit': true, watchlist: true };
+  var logFilterSelected = { buy: true, sell: true, watchlist: true };
   var logEventsCache = [];
   var logHasMore = false;
   var logLoadingMore = false;
@@ -2784,34 +2794,64 @@
   function normalizeLogCategory(ev) {
     var c = String((ev && ev.category) || '').toLowerCase();
     var m = String((ev && ev.message) || '').toUpperCase();
+    // Legacy stop-limit bucket → Sell
     if (c === 'stop-limit' || c === 'stop_limit' || c === 'stoplimit' || c === 'stop') {
-      return 'stop-limit';
-    }
-    if (c === 'buy') return 'buy';
-    if (c === 'sell' || c === 'order') {
-      if (m.indexOf('SOLD') < 0 && (m.indexOf('STOP-LIMIT') >= 0 || m.indexOf('STOP LIVE') >= 0 ||
-          m.indexOf('STOP DEFERRED') >= 0 || m.indexOf('ARM STOP') >= 0)) {
-        return 'stop-limit';
-      }
       return 'sell';
     }
+    if (c === 'buy') return 'buy';
+    if (c === 'sell' || c === 'order') return 'sell';
     if (c === 'watchlist') return 'watchlist';
     if (c === 'task' || c === 'job' || c === 'yahoo' || c === 'account' ||
         c === 'book' || c === 'algorithm' || c === 'web') {
       return 'task';
     }
     if (c === 'trade') {
-      if (m.indexOf('STOP') >= 0 && m.indexOf('SOLD') < 0) return 'stop-limit';
-      if (m.indexOf('SOLD') >= 0 || m.indexOf('SELL') >= 0) return 'sell';
-      if (m.indexOf('BOUGHT') >= 0 || m.indexOf('BUY') >= 0) return 'buy';
+      if (m.indexOf('SOLD') >= 0 || m.indexOf('SELL') >= 0 || m.indexOf('STOP') >= 0) {
+        return 'sell';
+      }
+      if (m.indexOf('BUY-LIMIT') >= 0 || m.indexOf('BOUGHT') >= 0 || m.indexOf('BUY') >= 0) {
+        return 'buy';
+      }
       return 'task';
     }
+    // Message fallback for oddly categorized rows
+    if (m.indexOf('SOLD') >= 0) return 'sell';
+    if (m.indexOf('STOP-LIMIT') >= 0 || m.indexOf('STOP LIVE') >= 0 ||
+        m.indexOf('STOP DEFERRED') >= 0 || m.indexOf('ARM STOP') >= 0) {
+      return 'sell';
+    }
+    if (m.indexOf('BUY-LIMIT') >= 0 || m.indexOf('BOUGHT') >= 0) return 'buy';
     return 'task';
   }
 
   function logCategoryLabel(id) {
     var found = LOG_CATEGORIES.find(function (c) { return c.id === id; });
     return found ? found.label : id;
+  }
+
+  /** Row tag: BUY / LIMIT BUY / SELL / STOP-LIMIT SELL / … */
+  function logEventTag(ev) {
+    var cat = ev && ev._cat ? ev._cat : normalizeLogCategory(ev);
+    var m = String((ev && ev.message) || '').toUpperCase();
+    var d = (ev && ev.detail) || {};
+    var phase = String(d.phase || '').toLowerCase();
+    if (cat === 'sell') {
+      if (m.indexOf('SOLD') >= 0) return 'SELL';
+      if (m.indexOf('STOP') >= 0 || phase === 'deferred' || phase === 'moved' ||
+          phase === 'set' || d.order_type === 'STOP_LIMIT') {
+        return 'STOP-LIMIT SELL';
+      }
+      return 'SELL';
+    }
+    if (cat === 'buy') {
+      if (m.indexOf('BUY-LIMIT') >= 0 || phase === 'limit_pending' ||
+          String(d.order_type || '').toUpperCase() === 'LIMIT') {
+        return 'LIMIT BUY';
+      }
+      if (m.indexOf('BOUGHT') >= 0 || m.indexOf('BUY') >= 0) return 'BUY';
+      return 'BUY';
+    }
+    return logCategoryLabel(cat);
   }
 
   function logEventsQuery(extra) {
@@ -2907,9 +2947,17 @@
 
   function stopEventMeta(ev) {
     var cat = ev && ev._cat ? ev._cat : normalizeLogCategory(ev);
-    if (cat !== 'stop-limit') return null;
     var d = (ev && ev.detail) || {};
     var msg = String((ev && ev.message) || '');
+    var upper = msg.toUpperCase();
+    // Collapsible ratchet rows live under Sell now (not a separate Stop bucket)
+    if (cat !== 'sell') return null;
+    if (upper.indexOf('SOLD') >= 0) return null;
+    if (!(upper.indexOf('STOP-LIMIT') >= 0 || upper.indexOf('STOP LIVE') >= 0 ||
+          upper.indexOf('STOP DEFERRED') >= 0 || upper.indexOf('ARM STOP') >= 0 ||
+          String(d.order_type || '').toUpperCase() === 'STOP_LIMIT')) {
+      return null;
+    }
     var ticker = String(d.ticker || '').trim().toUpperCase();
     var forM = msg.match(/\bfor\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b/i);
     if (!ticker && forM) ticker = forM[1].toUpperCase();
@@ -2938,7 +2986,6 @@
         verb = stopPx + 0.005 < prevPx ? 'decreased' : 'increased';
       }
     }
-    var upper = msg.toUpperCase();
     var phase = String(d.phase || '').toLowerCase();
     var deferred = phase === 'deferred' || upper.indexOf('DEFERRED') >= 0;
     var increased = !deferred && (
@@ -3113,7 +3160,7 @@
         '<div class="' + rowClass + '">' +
           '<div class="ts">' + escapeHtml(tsText) + '</div>' +
           '<div class="lvl' + lvlClass + '">' + lvlLabel + '</div>' +
-          '<div class="cat">' + escapeHtml(logCategoryLabel(ev._cat)) + '</div>' +
+          '<div class="cat">' + escapeHtml(logEventTag(ev)) + '</div>' +
           '<div class="msg">' + formatEventMessage(ev) + '</div>' +
         '</div>'
       );

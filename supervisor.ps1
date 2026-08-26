@@ -284,6 +284,16 @@ function Stop-AllChildren {
     }
 }
 
+function Request-CatchUp {
+    $path = Join-Path $DataDir 'catch_up_requested.json'
+    $payload = @{
+        requested_at = (Get-Date).ToString('s')
+        reason = 'git_pull'
+    } | ConvertTo-Json
+    Set-Content -Path $path -Value $payload -Encoding UTF8
+    Write-HostLog 'Requested deploy catch-up (loop will run it before normal jobs)'
+}
+
 function Invoke-GitPull {
     $branch = (git -C $Root rev-parse --abbrev-ref HEAD).Trim()
     if (-not $branch) { throw 'Not a git checkout (no branch)' }
@@ -357,6 +367,7 @@ function Invoke-HostCommand {
             } else {
                 $message = 'Updated {0} -> {1}  - restarting processes' -f $shaBefore, $shaAfter
             }
+            Request-CatchUp
             $supHashAfter = $null
             try { $supHashAfter = (Get-FileHash -Path $PSCommandPath -Algorithm SHA256).Hash } catch {}
             if ($supHashBefore -and $supHashAfter -and ($supHashBefore -ne $supHashAfter)) {

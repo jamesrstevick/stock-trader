@@ -471,10 +471,10 @@ table.data .pos-status-muted { color: var(--muted); }
   text-transform: lowercase;
 }
 .event .cat {
-  font-size: 0.72rem;
+  font-size: 0.68rem;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.03em;
   color: var(--accent);
   white-space: nowrap;
 }

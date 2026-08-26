@@ -3,6 +3,8 @@ Main entry point script for stock trading system.
 
 Usage:
   python main.py                     # run due jobs once (TRADE_DRY_RUN=True => log only, no Schwab orders)
+  python main.py --catch-up [--live] [--user NAME]
+                                    # repair books + Events trail; dry-run print, or live orders
   python main.py --dry-run           # one-shot full-system preview (never places orders)
   python main.py --loop              # always-on mode (periodic jobs; respects TRADE_DRY_RUN)
   python main.py --yahoo-full        # one-shot Yahoo catch-up (all tickers, oldest-first)
@@ -59,6 +61,23 @@ def main(argv=None):
         result = uc.set_password(rest[0], rest[1])
         print(result)
         sys.exit(0 if result.get('ok') else 1)
+    if '--catch-up' in argv:
+        live = '--live' in argv
+        usernames = []
+        i = 0
+        while i < len(argv):
+            if argv[i] == '--user' and i + 1 < len(argv):
+                usernames.append(argv[i + 1])
+                i += 2
+                continue
+            i += 1
+        result = st.run_catch_up(
+            live=live,
+            usernames=usernames or None,
+        )
+        users = result.get('users') or []
+        failed = [u for u in users if not u.get('ok')]
+        sys.exit(1 if failed else 0)
     if '--dry-run' in argv or '-n' in argv:
         st.dry_run_system()
         return

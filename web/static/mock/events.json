@@ -11,7 +11,7 @@
       "id": 5,
       "ts": "2026-08-03T17:52:00",
       "level": "info",
-      "category": "stop-limit",
+      "category": "sell",
       "message": "STOP-LIMIT increased $2.20 to $70.20 for MET"
     },
     {
@@ -25,7 +25,7 @@
       "id": 3,
       "ts": "2026-08-03T10:15:00",
       "level": "info",
-      "category": "stop-limit",
+      "category": "sell",
       "message": "STOP-LIMIT set @ $36.10 for RELX (deferred to avoid same-day trading)"
     },
     {

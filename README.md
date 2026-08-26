@@ -120,7 +120,7 @@ On the Dell you do **not** need Cursor. Double-click **`setup_host.bat`** in the
 
 First time only: copy `config.py` from your Surface into that same folder (or let the script create one from `config.example.py` and paste your Schwab keys). Windows: **Sleep → Never**. Leave the setup/supervisor window open.
 
-Later deploys: push from the Surface, then **Actions → Dell host → Pull from GitHub**.
+Later deploys: push from the Surface, then **Actions → Dell host → Pull from GitHub**. The loop runs a live catch-up first (repair books / Events, place any missed stops or sells), then resumes the normal schedule.
 
 To start at logon: `.\install_host_startup.ps1` then `Start-ScheduledTask -TaskName JameTraderHost`.
 
