@@ -382,9 +382,15 @@ function Invoke-HostCommand {
                 }
                 $script:busy = $false
                 Write-StatusFile
-                Start-Process -FilePath 'powershell.exe' -ArgumentList @(
-                    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath
-                ) + $(if ($NoTunnel) { @('-NoTunnel') } else { @() })
+                $reexecArgs = @(
+                    '-NoProfile',
+                    '-ExecutionPolicy', 'Bypass',
+                    '-File', $PSCommandPath
+                )
+                if ($NoTunnel) {
+                    $reexecArgs += '-NoTunnel'
+                }
+                Start-Process -FilePath 'powershell.exe' -ArgumentList $reexecArgs
                 exit 0
             }
             Restart-AllChildren
