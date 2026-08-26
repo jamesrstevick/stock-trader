@@ -416,6 +416,7 @@
     document.querySelectorAll('nav.side button').forEach(function (btn) {
       btn.classList.toggle('active', btn.getAttribute('data-page') === name);
     });
+    if (name !== 'trader') closeClosedPositionsModal({ skipFocus: true });
     if (name === 'about') loadAbout();
     if (name === 'trader') loadTrader();
     if (name === 'log') loadLog();
@@ -495,10 +496,13 @@
       id === 'nav-logout' ||
       id === 'btn-refresh-log' ||
       id === 'watchlist-expand-btn' ||
-      id === 'watchlist-owned-filter'
+      id === 'watchlist-owned-filter' ||
+      id === 'realized-gl-open' ||
+      id === 'closed-positions-close'
     ) {
       return true;
     }
+    if (btn.closest && btn.closest('#closed-positions-modal')) return true;
     if (btn.closest && btn.closest('#log-more')) return true;
     return false;
   }
@@ -2178,6 +2182,8 @@
   // Default: Total G/L [%] high → low; click any header to change.
   var positionsSort = { key: 'open_pct', dir: 'desc' };
   var positionsSortBound = false;
+  var closedPositions = [];
+  var closedPositionsBound = false;
 
   function sortPositions(rows, key, dir) {
     var mult = dir === 'asc' ? 1 : -1;
@@ -2638,15 +2644,27 @@
         var unreal = sc.unrealized_pl != null ? Number(sc.unrealized_pl) : 0;
         var totalPl = sc.total_pl != null ? Number(sc.total_pl) : realized + unreal;
         var tradeCount = sc.trade_count != null ? sc.trade_count : 0;
+        closedPositions = Array.isArray(sc.closed_positions) ? sc.closed_positions : [];
+        var realizedTone = plTone(realized);
         algoCards.innerHTML =
-          card('Realized G/L', money(realized), 'Closed positions only') +
-          card('Unrealized G/L', money(unreal), 'Open positions') +
-          card('Total G/L', money(totalPl), 'Realized + unrealized') +
+          '<button type="button" class="card card-expand" id="realized-gl-open"' +
+          ' aria-haspopup="dialog" aria-controls="closed-positions-modal">' +
+          '<div class="label">Realized G/L</div>' +
+          '<div class="value' + (realizedTone ? ' ' + realizedTone : '') + '">' +
+          escapeHtml(money(realized)) + '</div>' +
+          '<div class="hint">Closed positions only</div>' +
+          '<span class="card-expand-arrow" aria-hidden="true"></span>' +
+          '</button>' +
+          card('Unrealized G/L', money(unreal), 'Open positions', plTone(unreal)) +
+          card('Total G/L', money(totalPl), 'Realized + unrealized', plTone(totalPl)) +
           card(
             'Deployed',
             money(sc.buy_dollars),
             'Market Value ' + money(sc.open_market_value) + '\n' + tradeCount + ' trades'
           );
+        bindClosedPositionsUi();
+        var closedModal = document.getElementById('closed-positions-modal');
+        if (closedModal && !closedModal.hidden) renderClosedPositionsTable();
       }
 
       var nextList = document.getElementById('algo-next-tasks-list');
@@ -2761,6 +2779,7 @@
       if (algoPills) algoPills.innerHTML = '';
       if (algoCards) algoCards.innerHTML = '';
       positionsRows = [];
+      closedPositions = [];
       watchlistRows = [];
       watchlistColumns = [];
       tbody.innerHTML = '<tr><td colspan="9" class="empty">Could not load portfolio.</td></tr>';
@@ -3299,6 +3318,126 @@
     );
   }
 
+  function moneyPl(v) {
+    if (v === null || v === undefined || v === '') return '—';
+    var n = Number(v);
+    if (isNaN(n)) return '—';
+    var s = money(n);
+    if (n > 0 && s.charAt(0) !== '+') return '+' + s;
+    return s;
+  }
+
+  function sharesLabel(v) {
+    if (v === null || v === undefined || v === '') return '—';
+    var n = Number(v);
+    if (isNaN(n)) return '—';
+    if (Math.abs(n - Math.round(n)) < 1e-9) return String(Math.round(n));
+    return n.toLocaleString(undefined, { maximumFractionDigits: 4 });
+  }
+
+  function closedPositionsSum(rows) {
+    var sum = 0;
+    (rows || []).forEach(function (row) {
+      if (row == null || row.realized_pl == null || row.realized_pl === '') return;
+      var n = Number(row.realized_pl);
+      if (!isNaN(n)) sum += n;
+    });
+    return sum;
+  }
+
+  function renderClosedPositionsTable() {
+    var table = document.getElementById('closed-positions-table');
+    if (!table) return;
+    var tbody = table.querySelector('tbody');
+    var tfoot = table.querySelector('tfoot');
+    if (!tbody || !tfoot) return;
+    var rows = closedPositions || [];
+    if (!rows.length) {
+      tbody.innerHTML =
+        '<tr><td colspan="8" class="empty">No closed algorithm positions yet.</td></tr>';
+      tfoot.innerHTML = '';
+      return;
+    }
+    tbody.innerHTML = rows.map(function (row) {
+      var pl = row && row.realized_pl != null ? Number(row.realized_pl) : null;
+      var tone = plTone(pl);
+      return (
+        '<tr class="' + tone + '">' +
+          '<td>' + escapeHtml(formatMdY(row.ts)) + '</td>' +
+          '<td>' + escapeHtml(row.ticker || '—') + '</td>' +
+          '<td class="num">' + escapeHtml(sharesLabel(row.quantity)) + '</td>' +
+          '<td class="num">' + escapeHtml(money(row.purchase_price)) + '</td>' +
+          '<td class="num">' + escapeHtml(money(row.sell_price)) + '</td>' +
+          '<td class="num">' + escapeHtml(money(row.cost_basis)) + '</td>' +
+          '<td class="num">' + escapeHtml(money(row.sale_value)) + '</td>' +
+          '<td class="num">' + escapeHtml(moneyPl(pl)) + '</td>' +
+        '</tr>'
+      );
+    }).join('');
+    var sum = closedPositionsSum(rows);
+    var sumTone = plTone(sum);
+    tfoot.innerHTML =
+      '<tr class="closed-sum ' + sumTone + '">' +
+        '<td colspan="7" class="num">Sum G/L</td>' +
+        '<td class="num">' + escapeHtml(moneyPl(sum)) + '</td>' +
+      '</tr>';
+  }
+
+  function openClosedPositionsModal() {
+    var modal = document.getElementById('closed-positions-modal');
+    if (!modal) return;
+    renderClosedPositionsTable();
+    modal.hidden = false;
+    document.body.classList.add('modal-open');
+    var closeBtn = document.getElementById('closed-positions-close');
+    if (closeBtn) closeBtn.focus();
+  }
+
+  function closeClosedPositionsModal(opts) {
+    var skipFocus = !!(opts && opts.skipFocus);
+    var modal = document.getElementById('closed-positions-modal');
+    if (!modal || modal.hidden) {
+      document.body.classList.remove('modal-open');
+      return;
+    }
+    modal.hidden = true;
+    document.body.classList.remove('modal-open');
+    if (skipFocus) return;
+    var opener = document.getElementById('realized-gl-open');
+    if (opener) opener.focus();
+  }
+
+  function bindClosedPositionsUi() {
+    if (closedPositionsBound) return;
+    closedPositionsBound = true;
+    var algoCards = document.getElementById('algo-cards');
+    if (algoCards) {
+      algoCards.addEventListener('click', function (ev) {
+        var btn = ev.target && ev.target.closest
+          ? ev.target.closest('#realized-gl-open')
+          : null;
+        if (btn) openClosedPositionsModal();
+      });
+    }
+    var modal = document.getElementById('closed-positions-modal');
+    var closeBtn = document.getElementById('closed-positions-close');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', function () {
+        closeClosedPositionsModal();
+      });
+    }
+    if (modal) {
+      modal.addEventListener('click', function (ev) {
+        if (ev.target === modal) closeClosedPositionsModal();
+      });
+    }
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key !== 'Escape') return;
+      var open = document.getElementById('closed-positions-modal');
+      if (open && !open.hidden) closeClosedPositionsModal();
+    });
+  }
+
   function possessiveAccountLabel(name) {
     var n = String(name || '').trim();
     if (!n) return 'Account';
@@ -3360,6 +3499,8 @@
     if (whead) whead.innerHTML = '';
     if (wexpand) wexpand.hidden = true;
     if (nextList) nextList.innerHTML = '';
+    closedPositions = [];
+    closeClosedPositionsModal({ skipFocus: true });
     var perfEmpty = document.getElementById('perf-empty');
     var perfReturns = document.getElementById('perf-returns');
     if (perfEmpty) {

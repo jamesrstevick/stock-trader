@@ -123,13 +123,37 @@
   "algorithm": {
     "algorithm_start": "2026-08-03T21:10:18",
     "scorecard": {
-      "realized_pl": 0.0,
+      "realized_pl": -10.8,
       "unrealized_pl": 0.0,
-      "total_pl": 0.0,
-      "buy_dollars": 0.0,
-      "sell_dollars": 0.0,
-      "trade_count": 0,
-      "open_market_value": 0.0
+      "total_pl": -10.8,
+      "buy_dollars": 1998.0,
+      "sell_dollars": 1987.2,
+      "trade_count": 4,
+      "open_market_value": 0.0,
+      "closed_positions": [
+        {
+          "id": 12,
+          "ts": "2026-08-20T14:32:00",
+          "ticker": "CSCO",
+          "quantity": 18,
+          "purchase_price": 55.4,
+          "sell_price": 58.1,
+          "cost_basis": 997.2,
+          "sale_value": 1045.8,
+          "realized_pl": 48.6
+        },
+        {
+          "id": 8,
+          "ts": "2026-08-12T10:05:00",
+          "ticker": "PFE",
+          "quantity": 36,
+          "purchase_price": 27.8,
+          "sell_price": 26.15,
+          "cost_basis": 1000.8,
+          "sale_value": 941.4,
+          "realized_pl": -59.4
+        }
+      ]
     },
     "books": {
       "legacy": [],

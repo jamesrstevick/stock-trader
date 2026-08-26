@@ -299,6 +299,137 @@ table.data tbody tr.watchlist-owned td {
 .card .value.pos { color: var(--good); }
 .card .value.neg { color: var(--bad); }
 
+button.card {
+  display: block;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  width: 100%;
+  appearance: none;
+  -webkit-appearance: none;
+}
+.card.card-expand {
+  position: relative;
+  cursor: pointer;
+  padding-right: 1.7rem;
+  padding-bottom: 1.35rem;
+}
+.card.card-expand:hover,
+.card.card-expand:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+.card-expand-arrow {
+  position: absolute;
+  right: 0.7rem;
+  bottom: 0.55rem;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-right: 2px solid var(--muted);
+  border-bottom: 2px solid var(--muted);
+  pointer-events: none;
+}
+.card.card-expand:hover .card-expand-arrow,
+.card.card-expand:focus-visible .card-expand-arrow {
+  border-color: var(--accent);
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.25rem;
+  background: rgba(28, 36, 33, 0.42);
+}
+.modal-overlay[hidden] { display: none; }
+.modal-window {
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  width: min(960px, 100%);
+  max-height: min(82vh, 40rem);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 1.15rem 0.75rem;
+  border-bottom: 1px solid var(--line);
+}
+.modal-head h2 {
+  font-family: var(--display);
+  font-size: 1.15rem;
+  margin: 0;
+}
+.modal-sub {
+  margin: 0.35rem 0 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+  line-height: 1.4;
+}
+.modal-close {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 1.55rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0.1rem 0.45rem;
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+.modal-close:hover,
+.modal-close:focus-visible {
+  color: var(--ink);
+  background: rgba(28, 36, 33, 0.07);
+  outline: none;
+}
+.modal-body {
+  overflow: auto;
+  padding: 0 0.65rem 0.4rem;
+  -webkit-overflow-scrolling: touch;
+}
+#closed-positions-table { width: 100%; }
+#closed-positions-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-elev);
+  z-index: 1;
+}
+#closed-positions-table td.empty {
+  white-space: normal;
+  text-align: center;
+}
+#closed-positions-table tbody tr.pos,
+#closed-positions-table tfoot tr.pos {
+  color: var(--good);
+}
+#closed-positions-table tbody tr.neg,
+#closed-positions-table tfoot tr.neg {
+  color: var(--bad);
+}
+#closed-positions-table tfoot td {
+  position: sticky;
+  bottom: 0;
+  background: var(--bg-elev);
+  font-weight: 600;
+  border-top: 1px solid var(--line);
+  border-bottom: 0;
+  padding-top: 0.7rem;
+  padding-bottom: 0.7rem;
+}
+body.modal-open { overflow: hidden; }
+
 .panel {
   background: var(--bg-elev);
   border: 1px solid var(--line);
@@ -1331,6 +1462,8 @@ table.data .pos-status-muted { color: var(--muted); }
   .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.65rem; }
   .card { padding: 0.85rem 0.9rem; }
   .card .value { font-size: 1.2rem; }
+  .modal-overlay { padding: 0.65rem; }
+  .modal-window { max-height: 90vh; }
   .filter-head { flex-direction: column; align-items: stretch; }
   .filter-select-wrap select {
     width: 100%;

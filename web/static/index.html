@@ -566,6 +566,36 @@
       </section>
     </main>
   </div>
+  <div id="closed-positions-modal" class="modal-overlay" hidden
+       role="dialog" aria-modal="true" aria-labelledby="closed-positions-title">
+    <div class="modal-window" role="document">
+      <div class="modal-head">
+        <div>
+          <h2 id="closed-positions-title">Closed positions</h2>
+          <p class="modal-sub">Algorithm buys only, newest first. G/L should sum to Realized G/L.</p>
+        </div>
+        <button type="button" class="modal-close" id="closed-positions-close" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body scroll-x">
+        <table class="data" id="closed-positions-table">
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Ticker</th>
+              <th class="num">Shares</th>
+              <th class="num">Purchase</th>
+              <th class="num">Sell</th>
+              <th class="num">Cost basis</th>
+              <th class="num">Sale value</th>
+              <th class="num">G/L</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+          <tfoot></tfoot>
+        </table>
+      </div>
+    </div>
+  </div>
   <script src="/static/app.js"></script>
 </body>
 </html>

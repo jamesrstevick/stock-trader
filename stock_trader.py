@@ -6649,8 +6649,16 @@ def _schwab_order_fill_price(details: Optional[Dict[str, Any]]) -> Optional[floa
     return None
 
 
-def _submitted_sell_order_id(ticker: str) -> Optional[str]:
-    """Most recent Events SELL-submitted order id for ticker (awaiting fill)."""
+_SCHWAB_WORKING_ORDER_STATUSES = {
+    'OPEN', 'WORKING', 'QUEUED', 'ACCEPTED', 'AWAITING_PARENT_ORDER',
+    'AWAITING_CONDITION', 'AWAITING_STOP_CONDITION',
+    'AWAITING_MANUAL_REVIEW', 'AWAITING_UR_OUT', 'PENDING_ACTIVATION',
+    'PENDING_CANCEL', 'PENDING_REPLACE', 'NEW',
+}
+
+
+def _latest_submitted_sell(ticker: str) -> Optional[Dict[str, Any]]:
+    """Newest Events SELL-submitted row for ticker (awaiting fill), last 2 days."""
     t = str(ticker or '').strip().upper()
     if not t:
         return None
@@ -6659,7 +6667,7 @@ def _submitted_sell_order_id(ticker: str) -> Optional[str]:
     try:
         cursor.execute(
             '''
-            SELECT ts, detail_json FROM event_log
+            SELECT id, ts, message, detail_json FROM event_log
             WHERE category = 'sell'
             ORDER BY id DESC LIMIT 80
             '''
@@ -6669,10 +6677,12 @@ def _submitted_sell_order_id(ticker: str) -> Optional[str]:
         rows = []
     finally:
         conn.close()
-    cutoff = datetime.now() - timedelta(hours=6)
+    cutoff = datetime.now() - timedelta(hours=48)
     for row in rows:
-        ts_raw = row[0] if row else None
-        raw = row[1] if row and len(row) > 1 else None
+        ev_id = row[0] if row else None
+        ts_raw = row[1] if row and len(row) > 1 else None
+        message = str(row[2] or '') if row and len(row) > 2 else ''
+        raw = row[3] if row and len(row) > 3 else None
         if ts_raw:
             try:
                 ts = datetime.fromisoformat(str(ts_raw).replace('Z', '+00:00')[:19])
@@ -6680,22 +6690,109 @@ def _submitted_sell_order_id(ticker: str) -> Optional[str]:
                     continue
             except (TypeError, ValueError):
                 pass
-        if not raw:
-            continue
-        try:
-            detail = json.loads(raw)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(detail, dict):
+        detail = {}  # type: Dict[str, Any]
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    detail = parsed
+            except (TypeError, ValueError):
+                detail = {}
+        if detail.get('retracted'):
             continue
         if str(detail.get('ticker') or '').strip().upper() != t:
             continue
-        if str(detail.get('phase') or '').strip().lower() != 'submitted':
+        phase = str(detail.get('phase') or '').strip().lower()
+        upper = message.upper()
+        if phase != 'submitted' and 'AWAITING SCHWAB FILL' not in upper:
             continue
         oid = detail.get('order_id')
-        if oid:
-            return str(oid)
+        return {
+            'id': ev_id,
+            'ts': ts_raw,
+            'order_id': str(oid) if oid else None,
+            'message': message,
+            'detail': detail,
+        }
     return None
+
+
+def _submitted_sell_order_id(ticker: str) -> Optional[str]:
+    """Most recent Events SELL-submitted order id for ticker (awaiting fill)."""
+    row = _latest_submitted_sell(ticker)
+    if not row or not row.get('order_id'):
+        return None
+    return str(row['order_id'])
+
+
+def _schwab_order_is_sell_for_ticker(order: Dict[str, Any], ticker: str) -> bool:
+    t = str(ticker or '').strip().upper()
+    if not t or not isinstance(order, dict):
+        return False
+    for leg in order.get('orderLegCollection') or []:
+        if not isinstance(leg, dict):
+            continue
+        inst = str(leg.get('instruction') or '').upper()
+        if inst not in ('SELL', 'SELL_SHORT'):
+            continue
+        instrument = leg.get('instrument') or {}
+        sym = str((instrument or {}).get('symbol') or '').strip().upper()
+        if sym == t:
+            return True
+    return False
+
+
+def _naive_dt(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.replace(tzinfo=None)
+    return value
+
+
+def _filled_sell_order_for_ticker(
+    ticker: str,
+    since: Optional[datetime] = None,
+    account_hash: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Newest FILLED Schwab SELL for ticker, optionally at/after `since`."""
+    t = str(ticker or '').strip().upper()
+    if not t or not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
+        return None
+    account_hash = account_hash or _get_account_hash()
+    if not account_hash:
+        return None
+    try:
+        to_date = datetime.now(timezone.utc) + timedelta(days=1)
+        from_date = datetime.now(timezone.utc) - timedelta(days=5)
+        response = SCHWAB_CLIENT.account_orders(account_hash, from_date, to_date)
+        if response is None or getattr(response, 'status_code', 500) != 200:
+            return None
+        orders = _parse_schwab_orders_payload(response.json())
+    except Exception as e:
+        print('Warning: could not list recent filled sells for %s: %s' % (t, e))
+        return None
+    since_naive = _naive_dt(since)
+    best = None  # type: Optional[Dict[str, Any]]
+    best_entered = ''
+    for order in orders or []:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get('status') or '').upper() != 'FILLED':
+            continue
+        if not _schwab_order_is_sell_for_ticker(order, t):
+            continue
+        entered_raw = str(
+            order.get('enteredTime') or order.get('closeTime') or ''
+        )
+        if since_naive is not None:
+            entered_dt = _naive_dt(_parse_trade_ts(entered_raw))
+            if entered_dt is not None and entered_dt < since_naive:
+                continue
+        if best is None or entered_raw >= best_entered:
+            best = order
+            best_entered = entered_raw
+    return best
 
 
 def _recent_filled_sell_price(
@@ -6726,26 +6823,17 @@ def _recent_filled_sell_price(
             continue
         if str(order.get('status') or '').upper() != 'FILLED':
             continue
-        for leg in order.get('orderLegCollection') or []:
-            if not isinstance(leg, dict):
-                continue
-            inst = str(leg.get('instruction') or '').upper()
-            if inst not in ('SELL', 'SELL_SHORT'):
-                continue
-            instrument = leg.get('instrument') or {}
-            sym = str((instrument or {}).get('symbol') or '').strip().upper()
-            if sym != t:
-                continue
-            px = _schwab_order_fill_price(order)
-            if px is None:
-                continue
-            entered = str(
-                order.get('enteredTime') or order.get('closeTime') or ''
-            )
-            if best_px is None or entered >= best_entered:
-                best_px = px
-                best_entered = entered
-            break
+        if not _schwab_order_is_sell_for_ticker(order, t):
+            continue
+        px = _schwab_order_fill_price(order)
+        if px is None:
+            continue
+        entered = str(
+            order.get('enteredTime') or order.get('closeTime') or ''
+        )
+        if best_px is None or entered >= best_entered:
+            best_px = px
+            best_entered = entered
     return best_px
 
 
@@ -6834,6 +6922,52 @@ def _realized_pl_for_trade(t: Dict[str, Any]) -> Optional[float]:
         return None
 
 
+def _closed_position_from_sell(t: Dict[str, Any]) -> Dict[str, Any]:
+    """One closed (or partial-close) algo sell for the Realized G/L audit list."""
+    qty_n = None  # type: Optional[float]
+    try:
+        if t.get('quantity') is not None:
+            qty_n = float(t['quantity'])
+    except (TypeError, ValueError):
+        qty_n = None
+    qty_out = None  # type: Optional[Any]
+    if qty_n is not None:
+        qty_i = int(round(qty_n))
+        qty_out = qty_i if abs(qty_n - qty_i) < 1e-9 else qty_n
+    px = None  # type: Optional[float]
+    try:
+        if t.get('price') is not None:
+            px = float(t['price'])
+    except (TypeError, ValueError):
+        px = None
+    basis = None  # type: Optional[float]
+    try:
+        if t.get('cost_basis_per_share') is not None:
+            basis = float(t['cost_basis_per_share'])
+    except (TypeError, ValueError):
+        basis = None
+    cost_basis = (qty_n * basis) if (qty_n is not None and basis is not None) else None
+    sale_value = None  # type: Optional[float]
+    try:
+        if t.get('dollars') is not None:
+            sale_value = float(t['dollars'])
+    except (TypeError, ValueError):
+        sale_value = None
+    if sale_value is None and qty_n is not None and px is not None:
+        sale_value = qty_n * px
+    return {
+        'id': t.get('id'),
+        'ts': t.get('ts'),
+        'ticker': t.get('ticker'),
+        'quantity': qty_out,
+        'purchase_price': basis,
+        'sell_price': px,
+        'cost_basis': cost_basis,
+        'sale_value': sale_value,
+        'realized_pl': _realized_pl_for_trade(t),
+    }
+
+
 def _log_position_closed_on_sync(ex: Dict[str, Any]) -> None:
     """
     Broker stop (or other) fill: shares vanished on Schwab sync.
@@ -6856,8 +6990,11 @@ def _log_position_closed_on_sync(ex: Dict[str, Any]) -> None:
         qty = None
     px = _sync_close_fill_price(ex)
     basis = _positive_float(ex.get('average_price'))
-    submitted_oid = _submitted_sell_order_id(str(ticker)) if ticker else None
-    if submitted_oid:
+    submitted = _latest_submitted_sell(str(ticker)) if ticker else None
+    submitted_oid = None  # type: Optional[str]
+    if submitted and submitted.get('order_id'):
+        submitted_oid = str(submitted['order_id'])
+    if submitted:
         exit_info = {
             'exit_kind': 'market_sell',
             'short_label': 'SOLD',
@@ -6897,7 +7034,7 @@ def _log_position_closed_on_sync(ex: Dict[str, Any]) -> None:
             record_rebuy_guard(str(ticker), sell_price=px, cost_basis=basis)
         except Exception:
             pass
-    if not had_stop and not recorded:
+    if not had_stop and not recorded and not submitted:
         return
     msg = format_sold_log_message(ticker, qty, px, cost_basis=basis)
     print(f"  {msg} ({label})")
@@ -6913,6 +7050,7 @@ def _log_position_closed_on_sync(ex: Dict[str, Any]) -> None:
             'source': source,
             'phase': 'filled',
             'fill_is_execution': True,
+            'order_id': oid,
             'stop_order_id': oid,
             'stop_order_price': stop_px,
             'stop_limit_price': ex.get('stop_limit_price'),
@@ -6923,6 +7061,12 @@ def _log_position_closed_on_sync(ex: Dict[str, Any]) -> None:
             'realized_pct': pct,
         },
     )
+    try:
+        _retract_submitted_sell_events_for_ticker(str(ticker))
+    except Exception as e:
+        print('  Warning: could not fold SELL-submitted Event for %s: %s' % (
+            ticker, e,
+        ))
 
 
 def refresh_schwab_positions_if_needed(
@@ -7441,6 +7585,28 @@ def _void_false_sync_sell_if_still_held(ticker: str) -> bool:
     return True
 
 
+def _working_sell_for_ticker(
+    ticker: str,
+    open_orders: Optional[List[Dict[str, Any]]],
+) -> Optional[Dict[str, Any]]:
+    """Any working Schwab SELL for ticker (stop-limit or market)."""
+    t = str(ticker or '').strip().upper()
+    if not t:
+        return None
+    stop = _working_stop_limits_by_ticker(open_orders).get(t)
+    if stop:
+        return stop
+    for order in open_orders or []:
+        if not isinstance(order, dict):
+            continue
+        inst = str(order.get('instruction') or '').upper()
+        if inst not in ('SELL', 'SELL_SHORT'):
+            continue
+        if str(order.get('ticker') or '').strip().upper() == t:
+            return order
+    return None
+
+
 def _confirm_schwab_close(
     ticker: str,
     stored_stop_id: Optional[str],
@@ -7450,25 +7616,43 @@ def _confirm_schwab_close(
     """
     Whether a locally held ticker that is missing from a Schwab positions
     payload is a real close. Schwab working orders win over a glitchy snapshot.
+
+    Stop-limit fills and catch-up market sells both count once Schwab shows
+    FILLED (ACK is not enough).
     """
-    live = find_working_stop_limit_sell(
-        ticker, account_hash=account_hash, open_orders=open_orders
-    )
+    live = _working_sell_for_ticker(ticker, open_orders)
     if live:
-        return False, 'working_stop'
+        otype = str(live.get('order_type') or live.get('orderType') or '').upper()
+        if otype == 'STOP_LIMIT':
+            return False, 'working_stop'
+        return False, 'working_sell'
     oid = str(stored_stop_id or '')
     if oid and oid not in ('PENDING', 'SIM-STOP') and not oid.startswith('SIM'):
         details = get_schwab_order_details(oid, account_hash=account_hash)
         status = str((details or {}).get('status') or '').upper()
         if status == 'FILLED':
             return True, 'stop_filled'
-        if status in {
-            'OPEN', 'WORKING', 'QUEUED', 'ACCEPTED', 'AWAITING_PARENT_ORDER',
-            'AWAITING_CONDITION', 'AWAITING_STOP_CONDITION',
-            'AWAITING_MANUAL_REVIEW', 'AWAITING_UR_OUT', 'PENDING_ACTIVATION',
-            'PENDING_CANCEL', 'PENDING_REPLACE', 'NEW',
-        }:
+        if status in _SCHWAB_WORKING_ORDER_STATUSES:
             return False, 'stop_still_open'
+    submitted = _latest_submitted_sell(ticker)
+    submitted_oid = (submitted or {}).get('order_id')
+    if submitted_oid:
+        details = get_schwab_order_details(
+            str(submitted_oid), account_hash=account_hash,
+        )
+        status = str((details or {}).get('status') or '').upper()
+        if status == 'FILLED':
+            return True, 'market_sell_filled'
+        if status in _SCHWAB_WORKING_ORDER_STATUSES:
+            return False, 'market_sell_open'
+    if submitted:
+        filled = _filled_sell_order_for_ticker(
+            ticker,
+            since=datetime.now() - timedelta(hours=24),
+            account_hash=account_hash,
+        )
+        if filled is not None:
+            return True, 'market_sell_filled'
     return False, 'unconfirmed'
 
 
@@ -10877,6 +11061,35 @@ def apply_event_reality_repairs(plans: List[Dict[str, Any]]) -> int:
     return n
 
 
+def _retract_submitted_sell_events_for_ticker(ticker: str) -> int:
+    """Fold 'awaiting Schwab fill' rows once a SOLD Event is logged."""
+    t = str(ticker or '').strip().upper()
+    if not t:
+        return 0
+    n = 0
+    for ev in _load_trade_events(limit=200):
+        detail = ev.get('detail') or {}
+        if detail.get('retracted'):
+            continue
+        if str(detail.get('ticker') or '').strip().upper() != t:
+            continue
+        phase = str(detail.get('phase') or '').strip().lower()
+        msg = str(ev.get('message') or '')
+        if phase != 'submitted' and 'AWAITING SCHWAB FILL' not in msg.upper():
+            continue
+        ev_id = ev.get('id')
+        if not ev_id:
+            continue
+        ok = _retract_event_row(
+            int(ev_id),
+            'SELL submitted for %s filled at Schwab' % t,
+            'market_sell_filled',
+        )
+        if ok:
+            n += 1
+    return n
+
+
 def _retract_false_sold_events_for_ticker(ticker: str) -> int:
     """Retract SOLD / SELL-submitted Events for a name that is still held."""
     t = str(ticker or '').strip().upper()
@@ -11532,6 +11745,7 @@ def get_algorithm_performance() -> Dict[str, Any]:
     excluded_realized = 0.0
     algo_buy_dollars = 0.0
     algo_sell_dollars = 0.0
+    algo_closed = []  # type: List[Dict[str, Any]]
     start_key = (start or '')[:19]
     origins = books.get('all_origins') or {}
     if start_key:
@@ -11557,8 +11771,10 @@ def get_algorithm_performance() -> Dict[str, Any]:
                     excluded_realized += realized
                 continue
             algo_trades.append(t)
-            if t.get('side') == 'sell' and realized is not None:
-                algo_realized += realized
+            if t.get('side') == 'sell':
+                algo_closed.append(_closed_position_from_sell(t))
+                if realized is not None:
+                    algo_realized += realized
             if t.get('side') == 'buy' and t.get('dollars') is not None:
                 algo_buy_dollars += float(t['dollars'])
             if t.get('side') == 'sell' and t.get('dollars') is not None:
@@ -11595,6 +11811,10 @@ def get_algorithm_performance() -> Dict[str, Any]:
     conn.close()
 
     algo_total_pl = algo_realized + algo_unrealized
+    algo_closed.sort(
+        key=lambda row: ((row.get('ts') or ''), row.get('id') or 0),
+        reverse=True,
+    )
 
     return {
         'algorithm_start': start,
@@ -11615,6 +11835,7 @@ def get_algorithm_performance() -> Dict[str, Any]:
             'sell_dollars': algo_sell_dollars,
             'trade_count': len(algo_trades),
             'open_market_value': algo_mv,
+            'closed_positions': algo_closed,
         },
         # Backward-compatible aliases (algo-only, not whole-account)
         'realized_pl_since_start': algo_realized,
