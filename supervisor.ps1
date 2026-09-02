@@ -190,7 +190,6 @@ $script:nextStart = @{
 $script:busy = $false
 $script:lastCommand = $null
 $script:skipTunnel = -not $tunnelEnabled
-$script:reexecing = $false
 
 function Get-GitSnapshot {
     $branch = $null
@@ -313,28 +312,6 @@ function Invoke-PipInstall {
     if ($LASTEXITCODE -ne 0) { throw 'pip install failed' }
 }
 
-function Release-SupervisorMutex {
-    try {
-        if ($script:SupervisorMutex) {
-            $script:SupervisorMutex.ReleaseMutex() | Out-Null
-            $script:SupervisorMutex.Dispose()
-            $script:SupervisorMutex = $null
-        }
-    } catch {}
-}
-
-function Start-ReplacementSupervisor {
-    # Build one argument string *before* Start-Process. Windows PowerShell 5.1
-    # treats `+` after -ArgumentList as another positional parameter.
-    $quotedFile = '"' + $PSCommandPath + '"'
-    $quotedRoot = '"' + $Root + '"'
-    $psArgs = '-NoProfile -ExecutionPolicy Bypass -File ' + $quotedFile
-    if ($NoTunnel) { $psArgs = $psArgs + ' -NoTunnel' }
-    $cmdLine = 'start "JameTraderHost" /D ' + $quotedRoot + ' powershell.exe ' + $psArgs
-    $argList = '/c ' + $cmdLine
-    Start-Process -FilePath "$env:ComSpec" -WorkingDirectory $Root -ArgumentList $argList
-}
-
 function Restart-AllChildren {
     Write-HostLog 'Restarting children'
     Stop-AllChildren
@@ -391,11 +368,11 @@ function Invoke-HostCommand {
                 $message = 'Updated {0} -> {1}  - restarting processes' -f $shaBefore, $shaAfter
             }
             Request-CatchUp
-            Restart-AllChildren
             $supHashAfter = $null
             try { $supHashAfter = (Get-FileHash -Path $PSCommandPath -Algorithm SHA256).Hash } catch {}
             if ($supHashBefore -and $supHashAfter -and ($supHashBefore -ne $supHashAfter)) {
                 Write-HostLog 'supervisor.ps1 changed  - re-exec after restarting children'
+                Restart-AllChildren
                 $script:lastCommand = @{
                     id = [string]$Cmd.id
                     action = $action
@@ -405,17 +382,18 @@ function Invoke-HostCommand {
                 }
                 $script:busy = $false
                 Write-StatusFile
-                try {
-                    $script:reexecing = $true
-                    Release-SupervisorMutex
-                    Start-ReplacementSupervisor
-                    exit 0
-                } catch {
-                    $script:reexecing = $false
-                    Write-HostLog ("Re-exec failed: {0}  - keep this window; children already restarted" -f $_.Exception.Message)
-                    $message = $message + ' (reopen supervisor.ps1 once to load the new script)'
+                $reexecArgs = @(
+                    '-NoProfile',
+                    '-ExecutionPolicy', 'Bypass',
+                    '-File', $PSCommandPath
+                )
+                if ($NoTunnel) {
+                    $reexecArgs += '-NoTunnel'
                 }
+                Start-Process -FilePath 'powershell.exe' -ArgumentList $reexecArgs
+                exit 0
             }
+            Restart-AllChildren
         } elseif ($action -eq 'restart') {
             Restart-AllChildren
             $message = 'Restarted loop, dashboard, and tunnel'
@@ -475,15 +453,15 @@ try {
         Start-Sleep -Seconds 2
     }
 } finally {
-    if ($script:reexecing) {
-        Write-HostLog 'Supervisor handing off to replacement process'
-        Release-SupervisorMutex
-    } else {
-        Write-HostLog 'Supervisor stopping  - killing children'
-        Stop-AllChildren
-        if (Test-Path $StatusPath) {
-            Remove-Item $StatusPath -Force -ErrorAction SilentlyContinue
-        }
-        Release-SupervisorMutex
+    Write-HostLog 'Supervisor stopping  - killing children'
+    Stop-AllChildren
+    if (Test-Path $StatusPath) {
+        Remove-Item $StatusPath -Force -ErrorAction SilentlyContinue
     }
+    try {
+        if ($script:SupervisorMutex) {
+            $script:SupervisorMutex.ReleaseMutex() | Out-Null
+            $script:SupervisorMutex.Dispose()
+        }
+    } catch {}
 }
