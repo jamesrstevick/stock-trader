@@ -135,8 +135,8 @@
               </p>
               <ul>
                 <li><strong>Trailing stop</strong> — once a position is up enough from cost, the stop follows the peak down by a buffer; it only ratchets up, never down.</li>
-                <li><strong>Tighter off-watchlist</strong> — if the name later fails the filter, the buffer and hard floor tighten.</li>
-                <li><strong>Hard stop</strong> — a last-resort floor versus the purchase price if a trail never armed, or the thesis is gone.</li>
+                <li><strong>Hard stop</strong> — a set floor at a percent below purchase so the name has room to move. It stays put until trail arms at +10%.</li>
+                <li><strong>Tighter off-watchlist</strong> — if an owned name later fails the filter, that floor (and the trail buffer) tighten once toward price.</li>
               </ul>
             </li>
             <li>

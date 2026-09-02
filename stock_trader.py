@@ -913,6 +913,7 @@ def _init_database_unlocked(
         ('stop_limit_price', 'REAL'),   # last submitted limit price
         ('stop_order_qty', 'INTEGER'),  # qty on that resting order
         ('stop_defer_logged', 'INTEGER'),  # 1 after same-day defer log (once)
+        ('floor_tightened', 'INTEGER'),    # 1 after off-watchlist hard floor applied
     ]:
         if col not in pos_cols:
             try:
@@ -1010,7 +1011,8 @@ def _init_database_unlocked(
     # Metadata fields only (ownership moved to positions table)
     watchlist_schema.extend([
         'date_added TEXT',
-        'last_updated TEXT'
+        'last_updated TEXT',
+        'passes_filter INTEGER',  # 1 = in active filter; 0 = owned keep, off thesis
     ])
     
     # Create watchlist table
@@ -1091,6 +1093,11 @@ def _init_database_unlocked(
                     print(f"Migrated: dropped column watchlist.{col}")
                 except sqlite3.OperationalError:
                     pass  # SQLite < 3.35: leave column in place but unused
+
+    try:
+        _ensure_column(cursor, 'watchlist', 'passes_filter', 'INTEGER')
+    except sqlite3.OperationalError:
+        pass
     
     # Job run timestamps for crash-resumable scheduled work (e.g. weekly market refresh)
     cursor.execute('''
@@ -5508,6 +5515,7 @@ def update_watchlist(filter_name: str = 'safe') -> Dict[str, int]:
         else:
             values_dict['date_added'] = current_timestamp
             values_dict['last_updated'] = current_timestamp
+        values_dict['passes_filter'] = 1
         pending.append((ticker, values_dict, is_update))
 
     to_remove = [
@@ -5550,6 +5558,12 @@ def update_watchlist(filter_name: str = 'safe') -> Dict[str, int]:
         for ticker in to_remove:
             cursor.execute('DELETE FROM watchlist WHERE ticker = ?', (ticker,))
             stats['removed'] += 1
+        if 'passes_filter' in watchlist_columns:
+            for ticker in kept:
+                cursor.execute(
+                    'UPDATE watchlist SET passes_filter = 0 WHERE ticker = ?',
+                    (ticker,),
+                )
         conn.commit()
     finally:
         conn.close()
@@ -10072,11 +10086,29 @@ def is_min_hold_met(ticker: str) -> Tuple[bool, str]:
 
 
 def ticker_on_watchlist(ticker: str) -> bool:
+    """True when the name currently passes the active filter (watchlist thesis).
+
+    Owned names that fail the filter stay in the watchlist table for display
+    (`kept_with_shares`) but count as off-watchlist for stop math.
+    """
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM watchlist WHERE ticker = ?", (ticker,))
-    found = cursor.fetchone() is not None
-    conn.close()
+    try:
+        cursor.execute('PRAGMA table_info(watchlist)')
+        cols = [row[1] for row in cursor.fetchall()]
+        if 'passes_filter' in cols:
+            cursor.execute(
+                'SELECT 1 FROM watchlist WHERE ticker = ? '
+                'AND COALESCE(passes_filter, 1) != 0',
+                (ticker,),
+            )
+        else:
+            cursor.execute(
+                'SELECT 1 FROM watchlist WHERE ticker = ?', (ticker,),
+            )
+        found = cursor.fetchone() is not None
+    finally:
+        conn.close()
     return found
 
 
@@ -10354,6 +10386,44 @@ def enroll_to_algorithm(ticker: str, note: Optional[str] = None) -> None:
     )
 
 
+def _locked_floor_stop(
+    purchase,  # type: float
+    on_watchlist,  # type: bool
+    existing_stop_price=None,  # type: Optional[float]
+    floor_tightened=False,  # type: bool
+):
+    # type: (...) -> Tuple[float, float, bool]
+    """
+    Hard floor is % below purchase, set once.
+
+    Later dollar moves are only the one-time off-watchlist tighten
+    (−15% → −8% by default). Returns (stop_price, stop_gain_pct, tighten_pending).
+    """
+    hard_on = float(getattr(config, 'HARD_STOP_ON_WATCHLIST_PCT', -0.15))
+    hard_off = float(getattr(config, 'HARD_STOP_OFF_WATCHLIST_PCT', -0.08))
+    hard = hard_off if not on_watchlist else hard_on
+    desired_px = float(purchase) * (1.0 + hard)
+    existing = None  # type: Optional[float]
+    if existing_stop_price is not None:
+        try:
+            existing = float(existing_stop_price)
+            if existing <= 0:
+                existing = None
+        except (TypeError, ValueError):
+            existing = None
+    if existing is None:
+        return desired_px, hard, (not on_watchlist)
+    if (not on_watchlist) and (not floor_tightened):
+        on_px = float(purchase) * (1.0 + hard_on)
+        off_px = desired_px
+        # Only jump from the loose on-list floor. A stop that already drifted
+        # toward price (the old recompute bug) is frozen, not chased further.
+        if existing + 0.009 < ((on_px + off_px) / 2.0):
+            return off_px, hard, True
+    gain = (existing / float(purchase)) - 1.0
+    return existing, gain, False
+
+
 def compute_trail_state_for_position(
     ticker: str,
     purchase: float,
@@ -10361,9 +10431,14 @@ def compute_trail_state_for_position(
     peak_gain: Optional[float] = None,
     stop_gain: Optional[float] = None,
     trail_active: bool = False,
+    existing_stop_price: Optional[float] = None,
+    floor_tightened: bool = False,
 ) -> Dict[str, Any]:
     """
     Same trail/hard-stop math as propose_sells (bring a name 'up to speed').
+
+    Floor (pre-trail) is locked at first place vs purchase; trail still
+    follows peak − buffer. Off-watchlist may raise the floor once.
 
     Returns peak/stop/kind without writing proposals. Caller may persist.
     """
@@ -10387,6 +10462,7 @@ def compute_trail_state_for_position(
     on_wl = ticker_on_watchlist(ticker)
     buffer = buffer_off if not on_wl else buffer_on
     hard = hard_off if not on_wl else hard_on
+    floor_tighten = False
 
     new_stop = float(stop_gain) if stop_gain is not None else None
     if active:
@@ -10402,11 +10478,24 @@ def compute_trail_state_for_position(
             active = False
             new_stop = hard
         stop_kind = 'trail' if active else 'hard'
+        if active:
+            stop_price = purchase * (1.0 + float(new_stop))
+        else:
+            stop_price, new_stop, floor_tighten = _locked_floor_stop(
+                purchase,
+                on_wl,
+                existing_stop_price=None,
+                floor_tightened=False,
+            )
     else:
-        new_stop = hard
+        stop_price, new_stop, floor_tighten = _locked_floor_stop(
+            purchase,
+            on_wl,
+            existing_stop_price=existing_stop_price,
+            floor_tightened=floor_tightened,
+        )
         stop_kind = 'hard'
 
-    stop_price = purchase * (1.0 + float(new_stop))
     return {
         'ticker': ticker,
         'purchase': purchase,
@@ -10418,7 +10507,8 @@ def compute_trail_state_for_position(
         'stop_kind': stop_kind,
         'trail_active': active,
         'on_watchlist': on_wl,
-        'breached': gain <= float(new_stop),
+        'floor_tighten': floor_tighten,
+        'breached': float(price) <= float(stop_price),
     }
 
 
@@ -10433,7 +10523,8 @@ def bring_positions_up_to_speed(
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT ticker, shares_owned, average_price, peak_gain_pct, stop_gain_pct, trail_active
+        SELECT ticker, shares_owned, average_price, peak_gain_pct, stop_gain_pct,
+               trail_active, stop_order_price, floor_tightened
         FROM positions WHERE shares_owned > 0
     """)
     rows = cursor.fetchall()
@@ -10444,7 +10535,9 @@ def bring_positions_up_to_speed(
         want = {str(t).strip().upper() for t in tickers}
 
     results = []  # type: List[Dict[str, Any]]
-    for ticker, shares, avg_price, peak_gain, stop_gain, trail_active in rows:
+    for (
+        ticker, shares, avg_price, peak_gain, stop_gain, trail_active, stop_px, floor_tn
+    ) in rows:
         if want is not None and ticker not in want:
             continue
         if int(shares or 0) <= 0:
@@ -10471,6 +10564,8 @@ def bring_positions_up_to_speed(
             peak_gain=peak_gain,
             stop_gain=stop_gain,
             trail_active=bool(trail_active),
+            existing_stop_price=stop_px,
+            floor_tightened=bool(floor_tn),
         )
         _update_position_trail_state(
             ticker,
@@ -10665,7 +10760,7 @@ def restore_algorithm_trails_from_events(
     cursor.execute(
         '''
         SELECT ticker, shares_owned, average_price, peak_gain_pct, stop_gain_pct,
-               trail_active
+               trail_active, stop_order_price, floor_tightened
         FROM positions WHERE shares_owned > 0
         '''
     )
@@ -10673,7 +10768,9 @@ def restore_algorithm_trails_from_events(
     conn.close()
     activate = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10))
     results = []  # type: List[Dict[str, Any]]
-    for ticker, shares, avg_price, peak_gain, stop_gain, trail_active in rows:
+    for (
+        ticker, shares, avg_price, peak_gain, stop_gain, trail_active, stop_px, floor_tn
+    ) in rows:
         if int(shares or 0) <= 0:
             continue
         book = get_position_book(ticker)
@@ -10706,6 +10803,9 @@ def restore_algorithm_trails_from_events(
                 'events_stop': (events or {}).get('stop_price'),
             })
             continue
+        existing_px = stop_px
+        if existing_px is None and events:
+            existing_px = events.get('stop_price')
         state = compute_trail_state_for_position(
             str(ticker),
             purchase,
@@ -10715,6 +10815,8 @@ def restore_algorithm_trails_from_events(
             trail_active=bool(trail_active) or (
                 peak is not None and float(peak) >= activate
             ),
+            existing_stop_price=existing_px,
+            floor_tightened=bool(floor_tn),
         )
         if persist:
             _update_position_trail_state(
@@ -12271,6 +12373,22 @@ def _update_position_trail_state(
     conn.close()
 
 
+def _set_floor_tightened(ticker: str, tightened: bool) -> None:
+    """Remember that the off-watchlist hard floor was applied (one-time)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            'UPDATE positions SET floor_tightened = ? WHERE ticker = ?',
+            (1 if tightened else 0, ticker),
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+
+
 def propose_buys(ranked: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """
     Propose $ORDER_AMOUNT_DOLLARS buys from top of ranked watchlist.
@@ -12489,19 +12607,24 @@ def propose_sells() -> List[Dict[str, Any]]:
     - defer_stop_limit: would place stop but same ET purchase day (PDT) — wait until next day
     - skip_sell: would sell but min-hold blocks
     Trail: peak +10% activate, 10% buffer on-list / 7% off-list (stop = peak − buffer).
-    Hard stop: -15% on-list / -8% off-list (also used as stop-limit while in work mode).
+    Hard stop: locked % below purchase (−15% on-list / −8% off-list); the floor
+    is set once and only raised if the name fails the filter, until trail arms.
     """
+    init_database()
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT ticker, shares_owned, average_price, peak_gain_pct, stop_gain_pct, trail_active
+        SELECT ticker, shares_owned, average_price, peak_gain_pct, stop_gain_pct,
+               trail_active, stop_order_price, floor_tightened
         FROM positions WHERE shares_owned > 0
     """)
     rows = cursor.fetchall()
     conn.close()
 
     proposals = []  # type: List[Dict[str, Any]]
-    for ticker, shares, avg_price, peak_gain, stop_gain, trail_active in rows:
+    for (
+        ticker, shares, avg_price, peak_gain, stop_gain, trail_active, stop_px, floor_tn
+    ) in rows:
         shares = int(shares or 0)
         if shares <= 0:
             continue
@@ -12550,6 +12673,8 @@ def propose_sells() -> List[Dict[str, Any]]:
             peak_gain=peak_gain,
             stop_gain=stop_gain,
             trail_active=bool(trail_active),
+            existing_stop_price=stop_px,
+            floor_tightened=bool(floor_tn),
         )
         peak = state['peak_gain_pct']
         new_stop = state['stop_gain_pct']
@@ -12558,6 +12683,7 @@ def propose_sells() -> List[Dict[str, Any]]:
         stop_price = state['stop_price']
         gain = state['gain_pct']
         on_wl = state['on_watchlist']
+        floor_tighten = bool(state.get('floor_tighten'))
         buffer = float(
             getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.07)
             if not on_wl
@@ -12581,6 +12707,7 @@ def propose_sells() -> List[Dict[str, Any]]:
             'stop_kind': stop_kind,
             'trail_active': active,
             'on_watchlist': on_wl,
+            'floor_tighten': floor_tighten,
         }
 
         # Immediate market sell if price already at/through the stop
@@ -12635,11 +12762,19 @@ def propose_sells() -> List[Dict[str, Any]]:
             )
         else:
             activate_pct = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10))
-            reason = (
-                f'place stop-limit @ ${stop_price:.2f} ({float(new_stop)*100:.1f}% hard stop); '
-                f'work mode gain {gain*100:.1f}% < activate {activate_pct*100:.0f}%, '
-                f'{"off" if not on_wl else "on"} watchlist'
-            )
+            if floor_tighten:
+                reason = (
+                    f'tighten floor stop-limit @ ${stop_price:.2f} '
+                    f'({float(new_stop)*100:.1f}% vs cost); '
+                    f'off watchlist — one-time harder floor'
+                )
+            else:
+                reason = (
+                    f'place stop-limit @ ${stop_price:.2f} '
+                    f'({float(new_stop)*100:.1f}% hard stop, locked vs cost); '
+                    f'work mode gain {gain*100:.1f}% < activate {activate_pct*100:.0f}%, '
+                    f'{"off" if not on_wl else "on"} watchlist'
+                )
         proposals.append(dict(base, action='place_stop_limit', reason=reason))
 
     return proposals
@@ -12899,6 +13034,12 @@ def run_sell_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
                     f"    (live: broker stop unchanged "
                     f"${result.get('stop_price'):.2f} id={result.get('order_id')})"
                 )
+                if (
+                    not p.get('trail_active')
+                    and not p.get('on_watchlist')
+                    and p.get('ticker')
+                ):
+                    _set_floor_tightened(str(p.get('ticker')), True)
             elif action in ('placed', 'replaced'):
                 print(
                     f"    (live: STOP_LIMIT {action} "
@@ -12906,6 +13047,12 @@ def run_sell_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
                     f"limit=${result.get('limit_price'):.2f} "
                     f"id={result.get('order_id')})"
                 )
+                if (
+                    not p.get('trail_active')
+                    and not p.get('on_watchlist')
+                    and p.get('ticker')
+                ):
+                    _set_floor_tightened(str(p.get('ticker')), True)
             elif action == 'skipped':
                 print(f"    (live: skipped broker stop — {result.get('reason')})")
             else:
@@ -13662,15 +13809,18 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
             'title': 'Trail buffer below peak',
             'set_to': '%.0f%% on watchlist · %.0f%% once off' % (trail_buf, trail_off),
             'why': (
-                'Stop sits at peak minus buffer and rises with new highs; '
-                're-syncs when buffers change; tighter once the thesis (watchlist) breaks'
+                'Stop sits at peak minus buffer and rises with new highs after +10%; '
+                'tighter once the name fails the filter'
             ),
         },
         {
             'id': 'hard_stop',
             'title': 'Hard stop vs cost',
             'set_to': '−%.0f%% on watchlist · −%.0f%% once off' % (hard_on, hard_off),
-            'why': 'Catastrophe floor when a trail never armed, or thesis is gone',
+            'why': (
+                'Set once at a percent below purchase; does not move until trail '
+                'arms, except a one-time tighten if the name fails the filter'
+            ),
         },
         {
             'id': 'broker_stop',

@@ -281,13 +281,13 @@
         "id": "trail_buffer",
         "title": "Trail buffer below peak",
         "set_to": "10% on watchlist · 7% once off",
-        "why": "Stop sits at peak minus buffer and rises with new highs; re-syncs when buffers change; tighter once the thesis (watchlist) breaks"
+        "why": "Stop sits at peak minus buffer and rises with new highs after +10%; tighter once the name fails the filter"
       },
       {
         "id": "hard_stop",
         "title": "Hard stop vs cost",
         "set_to": "−15% on watchlist · −8% once off",
-        "why": "Catastrophe floor when a trail never armed, or thesis is gone"
+        "why": "Set once at a percent below purchase; does not move until trail arms, except a one-time tighten if the name fails the filter"
       },
       {
         "id": "broker_stop",

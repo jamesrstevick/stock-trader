@@ -8,7 +8,7 @@ On your home machine (or Pi), `python main.py --loop` wakes on a schedule:
 
 - **Yahoo refresh** — oldest / missing tickers first (~150/hour), skips names already updated today, keeps the universe roughly within a few days.
 - **Watchlist + buys** — re-ranks with the active filter (default: `safe`), then considers ~$1k buys when cash rules allow.
-- **Sell check** — every ~15 minutes: arm trails after +10%, refresh stops to peak−buffer / hard floors, tighten when the thesis (watchlist) changes.
+- **Sell check** — every ~15 minutes: arm trails after +10%, keep the hard floor locked vs cost, ratchet the trail with new highs, tighten once if the name fails the filter.
 
 A separate FastAPI dashboard (`python web_app.py`) uses **in-app login** (username/password, ~30-day session). Each user has their own Schwab link, filter, watchlist, positions, and log. Yahoo fundamentals are shared. Live data comes from the local API, or mock fixtures with `?mock=1`.
 
@@ -20,7 +20,7 @@ A separate FastAPI dashboard (`python web_app.py`) uses **in-app login** (userna
 4. **Cash floor** and **account size floor** block buys that would breach them; sells still run.
 5. **Buys only from the active watchlist filter**, sized ~$1,000 per new name.
 6. **Rebuy debounce** — after a sell, wait 5 weekdays **or** a ≥5% drop below last sell (whichever first).
-7. **Trailing stop** arms at +10% peak; ~10% / ~7% buffers (on / off watchlist); hard stops ~−15% / −8%.
+7. **Trailing stop** arms at +10% peak; ~10% / ~7% buffers (on / off watchlist). Hard floor is a **set** % below purchase (~−15% / −8%) and does not move until trail, except a one-time tighten if the name fails the filter.
 8. **Resting STOP_LIMIT** at Schwab so protection remains if the bot is briefly offline.
 
 Exact values come from `config.py` and show live on the About page.
