@@ -1843,24 +1843,95 @@ def format_stop_limit_log_message(
     stop_price: float,
     previous_stop: Optional[float] = None,
     deferred: bool = False,
+    why: Optional[str] = None,
 ) -> str:
     px = _fmt_log_px(stop_price)
     if deferred:
-        return 'STOP-LIMIT set @ %s for %s (deferred to avoid same-day trading)' % (
+        msg = 'STOP-LIMIT set @ %s for %s (deferred to avoid same-day trading)' % (
             px, ticker,
         )
-    if previous_stop is not None:
+    elif previous_stop is not None:
         try:
             prev = float(previous_stop)
             new = float(stop_price)
             verb = 'increased' if new >= prev else 'decreased'
             delta = round(abs(new - prev), 2)
-            return 'STOP-LIMIT %s %s to %s for %s' % (
+            msg = 'STOP-LIMIT %s %s to %s for %s' % (
                 verb, _fmt_log_px(delta), _fmt_log_px(new), ticker,
             )
         except (TypeError, ValueError):
+            msg = 'STOP-LIMIT set @ %s for %s' % (px, ticker)
+    else:
+        msg = 'STOP-LIMIT set @ %s for %s' % (px, ticker)
+    why_s = str(why).strip() if why else ''
+    if why_s and ' — ' not in msg:
+        return msg + ' — ' + why_s
+    return msg
+
+
+def stop_limit_why_phrase(proposal: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Short Events clause: why a STOP_LIMIT was set or moved."""
+    if not proposal:
+        return None
+    if proposal.get('floor_tighten'):
+        return 'failed the filter, floor tightened'
+    if proposal.get('trail_active'):
+        if proposal.get('trail_just_armed'):
+            try:
+                activate_pct = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10))
+            except (TypeError, ValueError):
+                activate_pct = 0.10
+            return 'trail armed after +%.0f%% peak' % (activate_pct * 100.0)
+        peak = proposal.get('peak_gain_pct')
+        try:
+            if peak is not None:
+                return 'trail followed %.0f%% peak' % (float(peak) * 100.0)
+        except (TypeError, ValueError):
             pass
-    return 'STOP-LIMIT set @ %s for %s' % (px, ticker)
+        return 'trail followed a new peak'
+    if proposal.get('on_watchlist') is False:
+        return 'off-watchlist hard floor vs cost'
+    return 'hard floor locked vs cost'
+
+
+def _stop_why_from_event(
+    msg: str,
+    detail: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    if isinstance(detail, dict) and detail.get('why'):
+        s = str(detail.get('why')).strip()
+        if s:
+            return s
+    text = msg or ''
+    if ' — ' in text:
+        tail = text.rsplit(' — ', 1)[-1].strip()
+        tail = re.sub(r'\s+\(\d+ moves\)$', '', tail).strip()
+        if tail:
+            return tail
+    return None
+
+
+def _stop_limit_event_extra(
+    proposal: Optional[Dict[str, Any]],
+    **kwargs
+) -> Dict[str, Any]:
+    extra = {}  # type: Dict[str, Any]
+    if proposal:
+        why = proposal.get('stop_why') or stop_limit_why_phrase(proposal)
+        if why:
+            extra['why'] = why
+        if proposal.get('reason'):
+            extra['reason'] = proposal.get('reason')
+        extra['trail_active'] = bool(proposal.get('trail_active'))
+        extra['floor_tighten'] = bool(proposal.get('floor_tighten'))
+        if 'on_watchlist' in proposal:
+            extra['on_watchlist'] = bool(proposal.get('on_watchlist'))
+        if proposal.get('peak_gain_pct') is not None:
+            extra['peak_gain_pct'] = proposal.get('peak_gain_pct')
+        if proposal.get('stop_kind'):
+            extra['stop_kind'] = proposal.get('stop_kind')
+    extra.update(kwargs)
+    return extra
 
 
 def log_stop_limit_event(
@@ -1871,8 +1942,12 @@ def log_stop_limit_event(
     dry_run: bool = False,
     extra: Optional[Dict[str, Any]] = None,
 ) -> None:
+    why = None
+    if extra and extra.get('why'):
+        why = extra.get('why')
     msg = format_stop_limit_log_message(
         ticker, stop_price, previous_stop=previous_stop, deferred=deferred,
+        why=why,
     )
     detail = dict(extra) if extra else {}
     detail['ticker'] = ticker
@@ -1891,6 +1966,8 @@ def log_stop_limit_event(
     detail['order_type'] = 'STOP_LIMIT'
     if dry_run:
         detail['dry_run'] = True
+    if why:
+        detail['why'] = str(why)
     log_event('stop-limit', msg, detail=detail)
 
 
@@ -2032,6 +2109,7 @@ def _legacy_event_plan(
         return {'action': 'delete'}
 
     if msg.startswith('STOP-LIMIT '):
+        why = _stop_why_from_event(msg, detail)
         tkr = ticker
         if not tkr:
             fm = re.search(r'\bfor\s+([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b', msg)
@@ -2049,7 +2127,7 @@ def _legacy_event_plan(
                 'action': 'update',
                 'category': 'sell',
                 'message': format_stop_limit_log_message(
-                    tkr, new_px, previous_stop=prev_px,
+                    tkr, new_px, previous_stop=prev_px, why=why,
                 ),
                 'kind': 'stop_moved',
                 'ticker': tkr,
@@ -2071,7 +2149,7 @@ def _legacy_event_plan(
                     'action': 'update',
                     'category': 'sell',
                     'message': format_stop_limit_log_message(
-                        tkr, new_px, previous_stop=prev_px,
+                        tkr, new_px, previous_stop=prev_px, why=why,
                     ),
                     'kind': 'stop_moved',
                     'ticker': tkr,
@@ -2163,7 +2241,9 @@ def _legacy_event_plan(
             return {
                 'action': 'update',
                 'category': 'sell',
-                'message': format_stop_limit_log_message(tkr, stop_px),
+                'message': format_stop_limit_log_message(
+                    tkr, stop_px, why=_stop_why_from_event(msg, detail),
+                ),
                 'kind': 'stop_set',
                 'ticker': tkr,
                 'stop_px': stop_px,
@@ -2184,6 +2264,7 @@ def _legacy_event_plan(
                 'category': 'sell',
                 'message': format_stop_limit_log_message(
                     tkr, stop_px, deferred=True,
+                    why=_stop_why_from_event(msg, detail),
                 ),
                 'kind': 'stop_deferred',
                 'ticker': tkr,
@@ -2315,6 +2396,7 @@ def _legacy_event_plan(
                 'category': 'sell',
                 'message': format_stop_limit_log_message(
                     tkr, stop_px, deferred=deferred_bit,
+                    why=_stop_why_from_event(msg, detail),
                 ),
                 'kind': 'stop_deferred' if deferred_bit else 'stop_set',
                 'ticker': tkr,
@@ -2487,6 +2569,7 @@ def _rewrite_legacy_event_log(conn: sqlite3.Connection) -> None:
             ):
                 plan['message'] = format_stop_limit_log_message(
                     ticker, float(stop_px), previous_stop=float(prev),
+                    why=_stop_why_from_event(str(plan.get('message') or message), detail),
                 )
                 plan['kind'] = 'stop_moved'
                 action = 'update'
@@ -8021,6 +8104,7 @@ def ensure_broker_stop_limit(
     stop_price: float,
     spot_price: Optional[float] = None,
     open_orders: Optional[List[Dict[str, Any]]] = None,
+    log_extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Place or replace resting STOP_LIMIT as needed.
@@ -8031,6 +8115,14 @@ def ensure_broker_stop_limit(
     qty = int(quantity)
     stop = round(float(stop_price), 2)
     limit = stop_limit_price_from_stop(stop)
+
+    def _xtra(**kwargs):
+        out = {}  # type: Dict[str, Any]
+        if log_extra:
+            out.update(log_extra)
+        out.update(kwargs)
+        return out
+
     live = find_working_stop_limit_sell(
         ticker, open_orders=open_orders
     )
@@ -8111,7 +8203,7 @@ def ensure_broker_stop_limit(
         if order_id:
             _emit_stop_limit_placed_or_moved(
                 ticker, stop, previous_stop=existing_stop,
-                extra={'order_id': order_id, 'quantity': qty, 'limit_price': limit},
+                extra=_xtra(order_id=order_id, quantity=qty, limit_price=limit),
             )
             return {
                 'action': 'replaced' if existing_stop is not None else 'placed',
@@ -8141,7 +8233,7 @@ def ensure_broker_stop_limit(
         if order_id:
             _emit_stop_limit_placed_or_moved(
                 ticker, stop, previous_stop=existing_stop,
-                extra={'order_id': order_id, 'quantity': qty, 'limit_price': limit},
+                extra=_xtra(order_id=order_id, quantity=qty, limit_price=limit),
             )
             return {
                 'action': 'placed',
@@ -8170,7 +8262,7 @@ def ensure_broker_stop_limit(
     if new_id:
         _emit_stop_limit_placed_or_moved(
             ticker, stop, previous_stop=existing_stop,
-            extra={'order_id': new_id, 'quantity': qty, 'limit_price': limit},
+            extra=_xtra(order_id=new_id, quantity=qty, limit_price=limit),
         )
         return {
             'action': 'replaced',
@@ -12684,6 +12776,7 @@ def propose_sells() -> List[Dict[str, Any]]:
         gain = state['gain_pct']
         on_wl = state['on_watchlist']
         floor_tighten = bool(state.get('floor_tighten'))
+        trail_just_armed = bool(active) and not bool(trail_active)
         buffer = float(
             getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.07)
             if not on_wl
@@ -12706,9 +12799,11 @@ def propose_sells() -> List[Dict[str, Any]]:
             'stop_price': stop_price,
             'stop_kind': stop_kind,
             'trail_active': active,
+            'trail_just_armed': trail_just_armed,
             'on_watchlist': on_wl,
             'floor_tighten': floor_tighten,
         }
+        base['stop_why'] = stop_limit_why_phrase(base)
 
         # Immediate market sell if price already at/through the stop
         if state['breached']:
@@ -12998,10 +13093,7 @@ def run_sell_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
                 float(stop_px),
                 deferred=True,
                 dry_run=bool(dry_run),
-                extra={
-                    'quantity': p.get('quantity'),
-                    'reason': p.get('reason'),
-                },
+                extra=_stop_limit_event_extra(p, quantity=p.get('quantity')),
             )
             _set_stop_defer_logged(ticker, True)
         elif p.get('action') == 'place_stop_limit' and dry_run and not trade_dry_run_enabled():
@@ -13014,11 +13106,9 @@ def run_sell_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
                 ticker,
                 float(stop_px),
                 previous_stop=stored.get('stop_order_price'),
-                extra={
-                    'quantity': p.get('quantity'),
-                    'reason': p.get('reason'),
-                    'dry_run': True,
-                },
+                extra=_stop_limit_event_extra(
+                    p, quantity=p.get('quantity'), dry_run=True,
+                ),
             )
         elif p.get('action') == 'place_stop_limit':
             result = ensure_broker_stop_limit(
@@ -13027,6 +13117,7 @@ def run_sell_pass(dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
                 float(p['stop_price']),
                 spot_price=p.get('price'),
                 open_orders=live_orders,
+                log_extra=_stop_limit_event_extra(p),
             )
             action = result.get('action')
             if action == 'unchanged':
@@ -14287,7 +14378,7 @@ def get_dashboard_watchlist() -> Dict[str, Any]:
         if not wl_cols:
             return empty
         select_cols = []
-        for col in ['ticker', 'current_price', 'target_price'] + [
+        for col in ['ticker', 'current_price', 'target_price', 'passes_filter'] + [
             f for f in filter_fields if f != 'analyst_upside'
         ]:
             if col in wl_cols and col not in select_cols:
@@ -14311,7 +14402,19 @@ def get_dashboard_watchlist() -> Dict[str, Any]:
                     upside = (target_f - price_f) / price_f
             except (TypeError, ValueError):
                 upside = None
-            values = {'ticker': ticker, 'analyst_upside': upside}
+            on_filter = True
+            if 'passes_filter' in d:
+                try:
+                    pf = d.get('passes_filter')
+                    if pf is not None and int(pf) == 0:
+                        on_filter = False
+                except (TypeError, ValueError):
+                    on_filter = True
+            values = {
+                'ticker': ticker,
+                'analyst_upside': upside,
+                'passes_filter': 1 if on_filter else 0,
+            }
             for field in filter_fields:
                 if field == 'analyst_upside':
                     continue

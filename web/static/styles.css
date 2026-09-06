@@ -190,6 +190,19 @@ button.pill-filter.active {
 table.data tbody tr.watchlist-owned td {
   background: var(--accent-soft);
 }
+.wl-ticker-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.wl-off-pill {
+  font-size: 0.68rem;
+  padding: 0.1rem 0.42rem;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+}
 
 .log-day-break {
   display: flex;
@@ -617,6 +630,7 @@ table.data .pos-status-muted { color: var(--muted); }
 .event .pl.pos { color: var(--good); }
 .event .pl.neg { color: var(--bad); }
 .event .log-moves { color: var(--muted); font-weight: 500; }
+.event .log-why { color: var(--muted); font-weight: 500; }
 
 .empty {
   color: var(--muted);

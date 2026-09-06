@@ -1,25 +1,42 @@
 {
   "events": [
     {
-      "id": 6,
+      "id": 8,
       "ts": "2026-08-03T17:55:00",
       "level": "info",
       "category": "sell",
       "message": "SOLD 12 MET @ $70.20"
     },
     {
-      "id": 5,
+      "id": 7,
       "ts": "2026-08-03T17:52:00",
       "level": "info",
       "category": "sell",
-      "message": "STOP-LIMIT increased $2.20 to $70.20 for MET"
+      "message": "STOP-LIMIT increased $2.20 to $70.20 for MET — trail followed 12% peak",
+      "detail": { "ticker": "MET", "stop_price": 70.2, "previous_stop": 68.0, "why": "trail followed 12% peak", "order_type": "STOP_LIMIT" }
     },
     {
-      "id": 4,
+      "id": 6,
       "ts": "2026-08-03T17:51:00",
       "level": "info",
       "category": "buy",
       "message": "BOUGHT 27 RELX @ $36.66"
+    },
+    {
+      "id": 5,
+      "ts": "2026-08-03T17:40:00",
+      "level": "info",
+      "category": "sell",
+      "message": "STOP-LIMIT increased $9.71 to $184.61 for DOV — failed the filter, floor tightened",
+      "detail": { "ticker": "DOV", "stop_price": 184.61, "previous_stop": 174.9, "why": "failed the filter, floor tightened", "order_type": "STOP_LIMIT", "floor_tighten": true }
+    },
+    {
+      "id": 4,
+      "ts": "2026-08-03T16:05:00",
+      "level": "info",
+      "category": "sell",
+      "message": "STOP-LIMIT set @ $27.83 for KDP — hard floor locked vs cost",
+      "detail": { "ticker": "KDP", "stop_price": 27.83, "why": "hard floor locked vs cost", "order_type": "STOP_LIMIT" }
     },
     {
       "id": 3,

@@ -2388,6 +2388,20 @@
     return n.toFixed(1) + '%';
   }
 
+  function watchlistOffFilter(row) {
+    if (!row) return false;
+    var pf = row.passes_filter;
+    if (pf === 0 || pf === '0' || pf === false) return true;
+    return row.on_filter === false || row.on_filter === 0;
+  }
+
+  function formatWatchlistTicker(row) {
+    var t = escapeHtml(row.ticker == null ? '' : String(row.ticker));
+    if (!watchlistOffFilter(row)) return t;
+    return '<span class="wl-ticker-cell">' + t +
+      ' <span class="pill bad wl-off-pill" title="Fails the active filter; uses off-watchlist stops">off watchlist</span></span>';
+  }
+
   function formatWatchlistCell(value, kind, key) {
     if (key === 'ticker') return escapeHtml(value == null ? '' : String(value));
     if (kind === 'text') return escapeHtml(value == null || value === '' ? '—' : String(value));
@@ -2462,8 +2476,10 @@
       watchlistColumns.forEach(function (col) {
         var val = row[col.key];
         var cls = watchlistCellClass(col.kind, col.key, val);
-        html += '<td' + (cls ? ' class="' + cls + '"' : '') + '>' +
-          formatWatchlistCell(val, col.kind, col.key) + '</td>';
+        var cell = col.key === 'ticker'
+          ? formatWatchlistTicker(row)
+          : formatWatchlistCell(val, col.kind, col.key);
+        html += '<td' + (cls ? ' class="' + cls + '"' : '') + '>' + cell + '</td>';
       });
       tr.innerHTML = html;
       tbody.appendChild(tr);
@@ -2952,16 +2968,26 @@
   function formatEventMessage(ev) {
     var msg = String((ev && ev.message) || '');
     var movesHtml = '';
+    var whyHtml = '';
     var mm = msg.match(/^(.*)(\s+\(\d+ moves\))$/);
     if (mm) {
       msg = mm[1];
       movesHtml = ' <span class="log-moves">' + escapeHtml(mm[2].trim()) + '</span>';
     }
+    var why = (ev && ev.detail && ev.detail.why) ? String(ev.detail.why).trim() : '';
+    var whyM = msg.match(/^(.*?)\s+—\s+(.+)$/);
+    if (whyM) {
+      msg = whyM[1];
+      if (!why) why = whyM[2].trim();
+    }
+    if (why) {
+      whyHtml = ' <span class="log-why">— ' + escapeHtml(why) + '</span>';
+    }
     var m = msg.match(/^(.*?)(\s*)(\([+\-] \$[0-9,]+\.\d{2}(?: \| [0-9.]+%)?\))$/);
-    if (!m) return escapeHtml(msg) + movesHtml;
+    if (!m) return escapeHtml(msg) + whyHtml + movesHtml;
     var tone = m[3].indexOf('(-') === 0 ? 'neg' : 'pos';
     // Keep a space between price and the P/L parenthetical
-    return escapeHtml(m[1]) + ' <span class="pl ' + tone + '">' + escapeHtml(m[3]) + '</span>' + movesHtml;
+    return escapeHtml(m[1]) + ' <span class="pl ' + tone + '">' + escapeHtml(m[3]) + '</span>' + whyHtml + movesHtml;
   }
 
   function stopEventMeta(ev) {
@@ -3066,14 +3092,26 @@
       var prefix = meta.dryRun ? 'DRY-RUN ' : '';
       var toPx = g.latestPx != null ? ('$' + Number(g.latestPx).toFixed(2)) : '';
       var lift = total != null ? ('$' + Math.abs(total).toFixed(2)) : '';
+      var why = '';
+      var d = ev.detail || {};
+      if (d.why) why = String(d.why).trim();
+      if (!why) {
+        var whyM = String(ev.message || '').match(/\s+—\s+(.+)$/);
+        if (whyM) why = whyM[1].replace(/\s+\(\d+ moves\)$/, '').trim();
+      }
       var msg;
       if (lift && toPx) {
         msg = prefix + 'STOP-LIMIT increased ' + lift + ' to ' + toPx + ' for ' + meta.ticker;
       } else {
-        msg = String(ev.message || '');
+        msg = String(ev.message || '').replace(/\s+—\s+.+$/, '').replace(/\s+\(\d+ moves\)$/, '');
       }
+      if (why) msg += ' — ' + why;
       msg += ' (' + g.n + ' moves)';
-      return Object.assign({}, ev, { message: msg, _collapsedMoves: g.n });
+      var next = Object.assign({}, ev, { message: msg, _collapsedMoves: g.n });
+      if (why) {
+        next.detail = Object.assign({}, d, { why: why });
+      }
+      return next;
     }).filter(function (ev) { return !!ev; });
   }
 

@@ -30,7 +30,7 @@ Exact values come from `config.py` and show live on the About page.
 | Page | Purpose |
 |------|---------|
 | **Trader** | Positions, orders, algo scorecard + next tasks, performance vs S&P 500 |
-| **Events** | Buys, sells, stops, and watchlist changes |
+| **Events** | Buys, sells, stops (with why they moved), and watchlist changes |
 | **Actions** | **Schwab reconnect** (paste-back OAuth) and future remote controls |
 | **About** | System overview, active filter, jobs, trading rules |
 

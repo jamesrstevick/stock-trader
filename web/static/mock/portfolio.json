@@ -97,7 +97,7 @@
     ],
     "rows": [
       {"ticker": "MET", "rank": 1, "market_cap": 52000000000, "beta": 0.92, "short_float": 0.012, "pe_ratio": 12.4, "peg_ratio": 1.1, "analyst_upside": 0.28, "recommendation_mean": 1.8, "dividend_yield": 2.1},
-      {"ticker": "DELL", "rank": 2, "market_cap": 85000000000, "beta": 1.05, "short_float": 0.031, "pe_ratio": 18.2, "peg_ratio": 0.9, "analyst_upside": 0.22, "recommendation_mean": 1.9, "dividend_yield": 1.6},
+      {"ticker": "DELL", "rank": 2, "market_cap": 85000000000, "beta": 1.05, "short_float": 0.031, "pe_ratio": 18.2, "peg_ratio": 0.9, "analyst_upside": 0.22, "recommendation_mean": 1.9, "dividend_yield": 1.6, "passes_filter": 0},
       {"ticker": "JPM", "rank": 3, "market_cap": 580000000000, "beta": 1.12, "short_float": 0.008, "pe_ratio": 11.8, "peg_ratio": 1.4, "analyst_upside": 0.19, "recommendation_mean": 2.0, "dividend_yield": 2.4},
       {"ticker": "CSCO", "rank": 4, "market_cap": 210000000000, "beta": 0.88, "short_float": 0.015, "pe_ratio": 16.1, "peg_ratio": 1.6, "analyst_upside": 0.17, "recommendation_mean": 2.0, "dividend_yield": 3.1},
       {"ticker": "IBM", "rank": 5, "market_cap": 190000000000, "beta": 0.71, "short_float": 0.022, "pe_ratio": 22.0, "peg_ratio": 1.8, "analyst_upside": 0.16, "recommendation_mean": 1.7, "dividend_yield": 2.8},
