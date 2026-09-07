@@ -1643,12 +1643,17 @@ _LOG_CATEGORY_ALIASES = {
 
 # Bump when user-facing event_log copy changes. Next process start rewrites stored rows
 # (DELL Pull from GitHub restarts the loop/dashboard, so this is "first pull").
-_EVENT_LOG_CLEAN_VERSION = 7
+_EVENT_LOG_CLEAN_VERSION = 8
 _EVENT_LOG_CLEAN_FLAG = 'event_log_clean_version'
 _LOG_TICKER_RE = re.compile(r'\b([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b')
 _LOG_MONEY_RE = re.compile(r'\$([0-9]+(?:\.[0-9]+)?)')
 _LOG_QTY_SH_RE = re.compile(r'(?:^|\s)(\d+)\s+sh\b', re.I)
 _LOG_WAS_SH_RE = re.compile(r'\bwas\s+(\d+)\s+sh\b', re.I)
+_BOUGHT_LOG_RE = re.compile(
+    r'^(?:DRY-RUN\s+)?BOUGHT\s+(?:(\d+)\s+)?([A-Z]{1,6}(?:\.[A-Z]{1,2})?)'
+    r'(?:\s+@\s+\$([0-9.]+))?',
+    re.I,
+)
 
 
 def normalize_log_category(category: Optional[str]) -> str:
@@ -1892,6 +1897,231 @@ def stop_limit_why_phrase(proposal: Optional[Dict[str, Any]]) -> Optional[str]:
     if proposal.get('on_watchlist') is False:
         return 'off-watchlist hard floor vs cost'
     return 'hard floor locked vs cost'
+
+
+def infer_stop_limit_why(
+    purchase,  # type: Optional[float]
+    stop_px,  # type: Optional[float]
+    previous_stop=None,  # type: Optional[float]
+    already_trailing=False,  # type: bool
+    off_filter=False,  # type: bool
+    detail=None,  # type: Optional[Dict[str, Any]]
+):
+    # type: (...) -> Optional[str]
+    """Recover a why clause for a stored STOP-LIMIT row from prices vs cost."""
+    if isinstance(detail, dict):
+        reason = str(detail.get('reason') or '').lower()
+        if 'harder floor' in reason or 'tighten floor' in reason:
+            return 'failed the filter, floor tightened'
+        if 'trail armed' in reason:
+            try:
+                activate_pct = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10))
+            except (TypeError, ValueError):
+                activate_pct = 0.10
+            return 'trail armed after +%.0f%% peak' % (activate_pct * 100.0)
+    try:
+        cost = float(purchase) if purchase is not None else None
+        stop = float(stop_px) if stop_px is not None else None
+    except (TypeError, ValueError):
+        return None
+    if cost is None or cost <= 0 or stop is None or stop <= 0:
+        return None
+    prev = None  # type: Optional[float]
+    if previous_stop is not None:
+        try:
+            prev = float(previous_stop)
+            if prev <= 0:
+                prev = None
+        except (TypeError, ValueError):
+            prev = None
+    hard_on = float(getattr(config, 'HARD_STOP_ON_WATCHLIST_PCT', -0.15))
+    hard_off = float(getattr(config, 'HARD_STOP_OFF_WATCHLIST_PCT', -0.08))
+    activate = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10))
+    buffer_on = float(getattr(config, 'TRAIL_BUFFER_PCT', 0.10))
+    buffer_off = float(getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.07))
+    on_px = cost * (1.0 + hard_on)
+    off_px = cost * (1.0 + hard_off)
+    tol = max(0.25, abs(cost) * 0.006)
+
+    def _near(a, b):
+        return abs(float(a) - float(b)) <= tol
+
+    if _near(stop, on_px):
+        return 'hard floor locked vs cost'
+    if _near(stop, off_px):
+        midpoint = (on_px + off_px) / 2.0
+        if prev is not None and prev + 0.009 < midpoint:
+            return 'failed the filter, floor tightened'
+        if prev is not None and _near(prev, on_px):
+            return 'failed the filter, floor tightened'
+        return 'off-watchlist hard floor vs cost'
+    if stop > off_px + tol:
+        stop_gain = (stop / cost) - 1.0
+        buffer = buffer_off if off_filter else buffer_on
+        peak = stop_gain + buffer
+        prev_floor = prev is not None and prev <= off_px + tol
+        if (not already_trailing) and (prev is None or prev_floor):
+            return 'trail armed after +%.0f%% peak' % (activate * 100.0)
+        if peak >= activate - 0.005:
+            return 'trail followed %.0f%% peak' % (peak * 100.0)
+        return 'trail followed a new peak'
+    return None
+
+
+def _event_stop_px(plan, detail, message):
+    # type: (Dict[str, Any], Dict[str, Any], str) -> Optional[float]
+    px = _detail_float(detail, 'stop_price')
+    if px is not None:
+        return px
+    if plan.get('stop_px') is not None:
+        try:
+            return float(plan.get('stop_px'))
+        except (TypeError, ValueError):
+            pass
+    msg = str(plan.get('message') or message or '')
+    to_m = re.search(r'\bto\s+\$([0-9.]+)', msg, re.I)
+    if to_m:
+        try:
+            return float(to_m.group(1))
+        except (TypeError, ValueError):
+            pass
+    at_m = re.search(r'@\s+\$([0-9.]+)', msg, re.I)
+    if at_m:
+        try:
+            return float(at_m.group(1))
+        except (TypeError, ValueError):
+            pass
+    return _first_money(msg)
+
+
+def _prev_stop_from_increase_msg(msg, new_px=None):
+    # type: (str, Optional[float]) -> Optional[float]
+    bumped = re.search(
+        r'STOP-LIMIT\s+(increased|decreased)\s+\$([0-9.]+)\s+to\s+\$([0-9.]+)',
+        msg or '',
+        re.I,
+    )
+    if not bumped:
+        return None
+    try:
+        first_px = float(bumped.group(2))
+        to_px = float(new_px) if new_px is not None else float(bumped.group(3))
+    except (TypeError, ValueError):
+        return None
+    if to_px <= 0:
+        return None
+    if first_px >= to_px * 0.5:
+        return first_px
+    if (bumped.group(1) or '').lower() == 'decreased':
+        return round(to_px + first_px, 2)
+    return round(to_px - first_px, 2)
+
+
+def _load_stop_why_cost_seed(cursor):
+    # type: (sqlite3.Cursor) -> Dict[Any, float]
+    """ticker-cost map: last sell basis, then live position average (wins)."""
+    seed = {}  # type: Dict[Any, float]
+    try:
+        cursor.execute(
+            '''
+            SELECT user_id, ticker, cost_basis_per_share FROM trade_history
+            WHERE side = 'sell' AND cost_basis_per_share IS NOT NULL
+              AND cost_basis_per_share > 0
+            ORDER BY ts ASC
+            '''
+        )
+        for uid_p, tkr_p, px_p in cursor.fetchall():
+            try:
+                seed[(uid_p, str(tkr_p).strip().upper())] = float(px_p)
+            except (TypeError, ValueError):
+                continue
+    except sqlite3.OperationalError:
+        try:
+            cursor.execute(
+                '''
+                SELECT ticker, cost_basis_per_share FROM trade_history
+                WHERE side = 'sell' AND cost_basis_per_share IS NOT NULL
+                  AND cost_basis_per_share > 0
+                ORDER BY ts ASC
+                '''
+            )
+            for tkr_p, px_p in cursor.fetchall():
+                try:
+                    seed[(None, str(tkr_p).strip().upper())] = float(px_p)
+                except (TypeError, ValueError):
+                    continue
+        except sqlite3.OperationalError:
+            pass
+    try:
+        cursor.execute(
+            '''
+            SELECT user_id, ticker, average_price FROM positions
+            WHERE average_price IS NOT NULL AND average_price > 0
+            '''
+        )
+        for uid_p, tkr_p, px_p in cursor.fetchall():
+            try:
+                seed[(uid_p, str(tkr_p).strip().upper())] = float(px_p)
+            except (TypeError, ValueError):
+                continue
+    except sqlite3.OperationalError:
+        try:
+            cursor.execute(
+                '''
+                SELECT ticker, average_price FROM positions
+                WHERE average_price IS NOT NULL AND average_price > 0
+                '''
+            )
+            for tkr_p, px_p in cursor.fetchall():
+                try:
+                    seed[(None, str(tkr_p).strip().upper())] = float(px_p)
+                except (TypeError, ValueError):
+                    continue
+        except sqlite3.OperationalError:
+            pass
+    return seed
+
+
+def _cost_for_stop_why(uid, ticker, cost_book, seed_cost):
+    # type: (Any, str, Dict[Any, float], Dict[Any, float]) -> Optional[float]
+    tkr = str(ticker or '').strip().upper()
+    if not tkr:
+        return None
+    for key in ((uid, tkr), (None, tkr)):
+        if key in cost_book:
+            return cost_book[key]
+        if key in seed_cost:
+            return seed_cost[key]
+    return None
+
+
+def _note_bought_cost(cost_book, shares_book, uid, ticker, qty, px):
+    # type: (Dict[Any, float], Dict[Any, int], Any, str, Optional[int], Optional[float]) -> None
+    tkr = str(ticker or '').strip().upper()
+    if not tkr or px is None:
+        return
+    try:
+        fill = float(px)
+    except (TypeError, ValueError):
+        return
+    if fill <= 0:
+        return
+    key = (uid, tkr)
+    old_sh = int(shares_book.get(key) or 0)
+    old_px = cost_book.get(key)
+    add_sh = None  # type: Optional[int]
+    if qty is not None:
+        try:
+            add_sh = int(qty)
+        except (TypeError, ValueError):
+            add_sh = None
+    if add_sh and add_sh > 0 and old_sh > 0 and old_px:
+        shares_book[key] = old_sh + add_sh
+        cost_book[key] = ((old_px * old_sh) + (fill * add_sh)) / float(old_sh + add_sh)
+    else:
+        cost_book[key] = fill
+        if add_sh and add_sh > 0:
+            shares_book[key] = old_sh + add_sh
 
 
 def _stop_why_from_event(
@@ -2526,6 +2756,11 @@ def _rewrite_legacy_event_log(conn: sqlite3.Connection) -> None:
                 })
         except sqlite3.OperationalError:
             sells_by_key = {}
+    seed_cost = _load_stop_why_cost_seed(cursor)
+    cost_book = {}  # type: Dict[Any, float]
+    shares_book = {}  # type: Dict[Any, int]
+    trailing = {}  # type: Dict[Any, bool]
+    off_filter = {}  # type: Dict[Any, bool]
     n_update = 0
     n_delete = 0
     for row in rows:
@@ -2546,6 +2781,30 @@ def _rewrite_legacy_event_log(conn: sqlite3.Connection) -> None:
             last_deferred[uid] = {}
         kind = plan.get('kind')
         ticker = plan.get('ticker')
+        bought_m = _BOUGHT_LOG_RE.match(str(plan.get('message') or message or '').strip())
+        dry_fill = bool(detail.get('dry_run')) or str(
+            plan.get('message') or message or ''
+        ).upper().startswith('DRY-RUN')
+        if (kind == 'bought' or bought_m) and not dry_fill:
+            tkr_b = ticker
+            qty_b = plan.get('qty')
+            px_b = plan.get('px') or _detail_float(detail, 'price')
+            if bought_m:
+                tkr_b = (bought_m.group(2) or tkr_b or '').upper()
+                if qty_b is None and bought_m.group(1):
+                    try:
+                        qty_b = int(bought_m.group(1))
+                    except (TypeError, ValueError):
+                        qty_b = None
+                if px_b is None and bought_m.group(3):
+                    try:
+                        px_b = float(bought_m.group(3))
+                    except (TypeError, ValueError):
+                        px_b = None
+            if tkr_b:
+                _note_bought_cost(cost_book, shares_book, uid, tkr_b, qty_b, px_b)
+                if not ticker:
+                    ticker = tkr_b
         if action == 'delete':
             cursor.execute('DELETE FROM event_log WHERE id = ?', (ev_id,))
             n_delete += 1
@@ -2558,27 +2817,67 @@ def _rewrite_legacy_event_log(conn: sqlite3.Connection) -> None:
             last_deferred[uid][ticker] = True
         elif kind in ('stop_set', 'stop_moved') and ticker:
             prev = last_stop[uid].get(ticker)
-            stop_px = plan.get('stop_px')
-            if stop_px is None:
-                stop_px = _first_money(str(plan.get('message') or message))
+            stop_px = _event_stop_px(plan, detail, message)
             if (
                 prev is not None
                 and stop_px is not None
                 and abs(float(prev) - float(stop_px)) >= 0.01
                 and kind == 'stop_set'
             ):
-                plan['message'] = format_stop_limit_log_message(
-                    ticker, float(stop_px), previous_stop=float(prev),
-                    why=_stop_why_from_event(str(plan.get('message') or message), detail),
-                )
+                kind = 'stop_moved'
                 plan['kind'] = 'stop_moved'
                 action = 'update'
+            why = _stop_why_from_event(str(plan.get('message') or message), detail)
+            if not why:
+                prev_for_why = prev
+                if prev_for_why is None:
+                    prev_for_why = _detail_float(detail, 'previous_stop')
+                if prev_for_why is None:
+                    prev_for_why = _prev_stop_from_increase_msg(
+                        str(plan.get('message') or message), stop_px,
+                    )
+                tkey = (uid, str(ticker).upper())
+                why = infer_stop_limit_why(
+                    _cost_for_stop_why(uid, ticker, cost_book, seed_cost),
+                    stop_px,
+                    previous_stop=prev_for_why,
+                    already_trailing=bool(trailing.get(tkey)),
+                    off_filter=bool(off_filter.get(tkey)),
+                    detail=detail,
+                )
+            if why and stop_px is not None:
+                prev_for_msg = None  # type: Optional[float]
+                if kind == 'stop_moved':
+                    prev_for_msg = prev
+                    if prev_for_msg is None:
+                        prev_for_msg = _detail_float(detail, 'previous_stop')
+                    if prev_for_msg is None:
+                        prev_for_msg = _prev_stop_from_increase_msg(
+                            str(plan.get('message') or message), stop_px,
+                        )
+                plan['message'] = format_stop_limit_log_message(
+                    ticker, float(stop_px), previous_stop=prev_for_msg, why=why,
+                )
+                detail['why'] = why
+                plan['detail'] = detail
+                plan['update_detail'] = True
+                action = 'update'
+            if why:
+                tkey = (uid, str(ticker).upper())
+                if 'trail' in why:
+                    trailing[tkey] = True
+                else:
+                    trailing[tkey] = False
+                if 'failed the filter' in why or 'off-watchlist' in why:
+                    off_filter[tkey] = True
             if stop_px is not None:
                 last_stop[uid][ticker] = float(stop_px)
             last_deferred[uid][ticker] = False
         elif kind == 'sold' and ticker:
             last_deferred[uid][ticker] = False
             last_stop[uid].pop(ticker, None)
+            trailing.pop((uid, str(ticker).upper()), None)
+            off_filter.pop((uid, str(ticker).upper()), None)
             trade = _nearest_sell_trade(sells_by_key, uid, ticker, ev_ts)
             qty = plan.get('qty')
             if qty is None:
