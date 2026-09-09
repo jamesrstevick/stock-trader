@@ -426,7 +426,8 @@
           </div>
           <p class="action-card-desc">
             When on, new buys are GTC limit orders at a discount below the live market price
-            instead of market orders. Outstanding limits are cancelled if the name leaves the watchlist.
+            instead of market orders. Outstanding limits are cancelled if the name leaves the watchlist,
+            and are replaced immediately if you change the discount.
           </p>
           <div class="setup-fields buy-limit-fields">
             <label class="action-field">
@@ -452,9 +453,9 @@
               <span class="action-field-label">
                 <span class="action-field-title">
                   <span class="action-field-name">Discount %</span>
-                  <span class="info-tip" tabindex="0" aria-label="Whole number from 1 to 99. Limit price is this percent below the current market.">
+                  <span class="info-tip" tabindex="0" aria-label="Whole number from 1 to 99. Limit price is this percent below the market when the buy was placed. Changing it immediately reprices open buy limits.">
                     <span class="info-tip-mark" aria-hidden="true">i</span>
-                    <span class="info-tip-text">Whole number from 1 to 99. Limit price is this percent below the current market.</span>
+                    <span class="info-tip-text">Whole number from 1 to 99. Limit price is this percent below the market when the buy was placed. Changing it immediately reprices open buy limits.</span>
                   </span>
                 </span>
               </span>

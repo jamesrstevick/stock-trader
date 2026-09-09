@@ -94,6 +94,7 @@
             min_pct_exclusive: 0,
             max_pct_exclusive: 100,
           },
+          rebase: { replaced: 0, unchanged: 0, failed: 0, skipped: 0, dry_run: true, orders: [] },
         };
       }
       return {
@@ -1664,12 +1665,27 @@
           buyLimitLocalDraft = false;
           buyLimitPctEditing = false;
           renderBuyLimitCard(res.buy_limit || res);
+          var rebase = res.rebase || {};
+          var nRep = Number(rebase.replaced) || 0;
+          var nFail = Number(rebase.failed) || 0;
+          var msg;
+          if (!on) {
+            msg = 'Buy limit orders off — market buys.';
+          } else {
+            msg = 'Buy limit orders on — buys at ' + (res.buy_limit && res.buy_limit.discount_pct) + '% below market.';
+            if (nRep > 0) {
+              msg += rebase.dry_run
+                ? (' Dry-run: would reprice ' + nRep + ' open buy' + (nRep === 1 ? '' : 's') + '.')
+                : (' Repriced ' + nRep + ' open buy' + (nRep === 1 ? '' : 's') + '.');
+            }
+            if (nFail > 0) {
+              msg += ' ' + nFail + ' could not be replaced (left at the old price).';
+            }
+          }
           setActionFeedback(
             'buy-limit-feedback',
-            on
-              ? ('Buy limit orders on — buys at ' + (res.buy_limit && res.buy_limit.discount_pct) + '% below market.')
-              : 'Buy limit orders off — market buys.',
-            true
+            msg,
+            nFail === 0
           );
           await refreshSchwabUi();
         } catch (e) {

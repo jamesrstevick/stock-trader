@@ -957,6 +957,8 @@ def _init_database_unlocked(
     ''')
     _ensure_column(cursor, 'pending_orders', 'order_type', 'TEXT')
     _ensure_column(cursor, 'pending_orders', 'limit_price', 'REAL')
+    _ensure_column(cursor, 'pending_orders', 'market_price', 'REAL')
+    _ensure_column(cursor, 'pending_orders', 'limit_pct', 'INTEGER')
 
     # Create watchlist table - stores stocks selected by filters with all yfinance + Schwab data
     # Get all columns from fundamentals table to include in watchlist
@@ -1643,7 +1645,7 @@ _LOG_CATEGORY_ALIASES = {
 
 # Bump when user-facing event_log copy changes. Next process start rewrites stored rows
 # (DELL Pull from GitHub restarts the loop/dashboard, so this is "first pull").
-_EVENT_LOG_CLEAN_VERSION = 8
+_EVENT_LOG_CLEAN_VERSION = 9
 _EVENT_LOG_CLEAN_FLAG = 'event_log_clean_version'
 _LOG_TICKER_RE = re.compile(r'\b([A-Z]{1,6}(?:\.[A-Z]{1,2})?)\b')
 _LOG_MONEY_RE = re.compile(r'\$([0-9]+(?:\.[0-9]+)?)')
@@ -1874,6 +1876,56 @@ def format_stop_limit_log_message(
     return msg
 
 
+def trailing_locked_in_why(stop_gain_pct):
+    # type: (Optional[float]) -> Optional[str]
+    """Events clause: trail stop as % gain vs cost that is now protected."""
+    if stop_gain_pct is None:
+        return None
+    try:
+        locked = float(stop_gain_pct)
+    except (TypeError, ValueError):
+        return None
+    if locked < 0:
+        locked = 0.0
+    return 'trailing, %.0f%% gains locked in' % (locked * 100.0)
+
+
+_LEGACY_TRAIL_FOLLOWED_RE = re.compile(
+    r'^trail followed (\d+(?:\.\d+)?)%\s+peak$',
+    re.I,
+)
+_LEGACY_TRAIL_ARMED_RE = re.compile(r'^trail armed after\b', re.I)
+
+
+def _is_legacy_trail_why(why):
+    # type: (Optional[str]) -> bool
+    s = (why or '').strip()
+    if not s:
+        return False
+    if s.lower() == 'trail followed a new peak':
+        return True
+    return bool(
+        _LEGACY_TRAIL_FOLLOWED_RE.match(s) or _LEGACY_TRAIL_ARMED_RE.match(s)
+    )
+
+
+def _legacy_trail_why_to_locked(why, off_filter=False):
+    # type: (Optional[str], bool) -> Optional[str]
+    s = (why or '').strip()
+    if not s:
+        return None
+    m = _LEGACY_TRAIL_FOLLOWED_RE.match(s)
+    if m:
+        peak_pct = float(m.group(1))
+        buffer = 7.0 if off_filter else 10.0
+        locked = (peak_pct - buffer) / 100.0
+        return trailing_locked_in_why(locked)
+    if _LEGACY_TRAIL_ARMED_RE.match(s) or s.lower() == 'trail followed a new peak':
+        locked = 0.03 if off_filter else 0.0
+        return trailing_locked_in_why(locked)
+    return s
+
+
 def stop_limit_why_phrase(proposal: Optional[Dict[str, Any]]) -> Optional[str]:
     """Short Events clause: why a STOP_LIMIT was set or moved."""
     if not proposal:
@@ -1881,19 +1933,21 @@ def stop_limit_why_phrase(proposal: Optional[Dict[str, Any]]) -> Optional[str]:
     if proposal.get('floor_tighten'):
         return 'failed the filter, floor tightened'
     if proposal.get('trail_active'):
-        if proposal.get('trail_just_armed'):
-            try:
-                activate_pct = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10))
-            except (TypeError, ValueError):
-                activate_pct = 0.10
-            return 'trail armed after +%.0f%% peak' % (activate_pct * 100.0)
+        why = trailing_locked_in_why(proposal.get('stop_gain_pct'))
+        if why:
+            return why
         peak = proposal.get('peak_gain_pct')
         try:
             if peak is not None:
-                return 'trail followed %.0f%% peak' % (float(peak) * 100.0)
+                buffer = float(
+                    getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.07)
+                    if proposal.get('on_watchlist') is False
+                    else getattr(config, 'TRAIL_BUFFER_PCT', 0.10)
+                )
+                return trailing_locked_in_why(float(peak) - buffer)
         except (TypeError, ValueError):
             pass
-        return 'trail followed a new peak'
+        return 'trailing, gains locked in'
     if proposal.get('on_watchlist') is False:
         return 'off-watchlist hard floor vs cost'
     return 'hard floor locked vs cost'
@@ -1913,12 +1967,6 @@ def infer_stop_limit_why(
         reason = str(detail.get('reason') or '').lower()
         if 'harder floor' in reason or 'tighten floor' in reason:
             return 'failed the filter, floor tightened'
-        if 'trail armed' in reason:
-            try:
-                activate_pct = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10))
-            except (TypeError, ValueError):
-                activate_pct = 0.10
-            return 'trail armed after +%.0f%% peak' % (activate_pct * 100.0)
     try:
         cost = float(purchase) if purchase is not None else None
         stop = float(stop_px) if stop_px is not None else None
@@ -1936,9 +1984,6 @@ def infer_stop_limit_why(
             prev = None
     hard_on = float(getattr(config, 'HARD_STOP_ON_WATCHLIST_PCT', -0.15))
     hard_off = float(getattr(config, 'HARD_STOP_OFF_WATCHLIST_PCT', -0.08))
-    activate = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10))
-    buffer_on = float(getattr(config, 'TRAIL_BUFFER_PCT', 0.10))
-    buffer_off = float(getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.07))
     on_px = cost * (1.0 + hard_on)
     off_px = cost * (1.0 + hard_off)
     tol = max(0.25, abs(cost) * 0.006)
@@ -1956,15 +2001,7 @@ def infer_stop_limit_why(
             return 'failed the filter, floor tightened'
         return 'off-watchlist hard floor vs cost'
     if stop > off_px + tol:
-        stop_gain = (stop / cost) - 1.0
-        buffer = buffer_off if off_filter else buffer_on
-        peak = stop_gain + buffer
-        prev_floor = prev is not None and prev <= off_px + tol
-        if (not already_trailing) and (prev is None or prev_floor):
-            return 'trail armed after +%.0f%% peak' % (activate * 100.0)
-        if peak >= activate - 0.005:
-            return 'trail followed %.0f%% peak' % (peak * 100.0)
-        return 'trail followed a new peak'
+        return trailing_locked_in_why((stop / cost) - 1.0) or 'trailing, gains locked in'
     return None
 
 
@@ -2828,23 +2865,28 @@ def _rewrite_legacy_event_log(conn: sqlite3.Connection) -> None:
                 plan['kind'] = 'stop_moved'
                 action = 'update'
             why = _stop_why_from_event(str(plan.get('message') or message), detail)
-            if not why:
-                prev_for_why = prev
-                if prev_for_why is None:
-                    prev_for_why = _detail_float(detail, 'previous_stop')
-                if prev_for_why is None:
-                    prev_for_why = _prev_stop_from_increase_msg(
-                        str(plan.get('message') or message), stop_px,
-                    )
-                tkey = (uid, str(ticker).upper())
-                why = infer_stop_limit_why(
-                    _cost_for_stop_why(uid, ticker, cost_book, seed_cost),
-                    stop_px,
-                    previous_stop=prev_for_why,
-                    already_trailing=bool(trailing.get(tkey)),
-                    off_filter=bool(off_filter.get(tkey)),
-                    detail=detail,
+            prev_for_why = prev
+            if prev_for_why is None:
+                prev_for_why = _detail_float(detail, 'previous_stop')
+            if prev_for_why is None:
+                prev_for_why = _prev_stop_from_increase_msg(
+                    str(plan.get('message') or message), stop_px,
                 )
+            tkey = (uid, str(ticker).upper())
+            inferred = infer_stop_limit_why(
+                _cost_for_stop_why(uid, ticker, cost_book, seed_cost),
+                stop_px,
+                previous_stop=prev_for_why,
+                already_trailing=bool(trailing.get(tkey)),
+                off_filter=bool(off_filter.get(tkey)),
+                detail=detail,
+            )
+            if _is_legacy_trail_why(why):
+                why = inferred or _legacy_trail_why_to_locked(
+                    why, off_filter=bool(off_filter.get(tkey)),
+                )
+            elif not why:
+                why = inferred
             if why and stop_px is not None:
                 prev_for_msg = None  # type: Optional[float]
                 if kind == 'stop_moved':
@@ -6449,6 +6491,19 @@ def buy_limit_price_from_market(market_price: float, pct: Optional[int] = None) 
     return round(max(px, 0.01), 2)
 
 
+def implied_market_from_buy_limit(limit_price: float, pct: int) -> Optional[float]:
+    """Undo a discount limit back to the market print it was based on."""
+    try:
+        px = float(limit_price)
+        p = int(pct)
+    except (TypeError, ValueError):
+        return None
+    remain = 1.0 - (float(p) / 100.0)
+    if remain <= 0 or px <= 0:
+        return None
+    return px / remain
+
+
 def get_buy_limit_settings() -> Dict[str, Any]:
     """Actions card payload for buy-limit orders."""
     try:
@@ -6472,9 +6527,23 @@ def get_buy_limit_settings() -> Dict[str, Any]:
 
 
 def save_buy_limit_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Validate and persist buy-limit Actions settings."""
+    """Validate and persist buy-limit Actions settings.
+
+    When still enabled, immediately replace working algo GTC buys so they sit
+    at the new discount vs the original market print (works after hours).
+    """
     enabled = bool(payload.get('enabled'))
     default_pct = int(getattr(config, 'BUY_LIMIT_DEFAULT_PCT', 10))
+    try:
+        prev = uc.get_user_settings(_uid())
+    except Exception:
+        prev = {}
+    prev_pct = prev.get('buy_limit_pct')
+    try:
+        prev_pct_i = int(prev_pct) if prev_pct is not None else None
+    except (TypeError, ValueError):
+        prev_pct_i = None
+    rebase_old_pct = prev_pct_i if prev_pct_i is not None else default_pct
     raw_pct = payload.get('discount_pct', payload.get('buy_limit_pct'))
     pct = None  # type: Optional[int]
     if raw_pct is not None and raw_pct != '':
@@ -6504,12 +6573,7 @@ def save_buy_limit_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
                 'buy_limit': get_buy_limit_settings(),
             }
         if pct is None:
-            try:
-                prev = uc.get_user_settings(_uid()).get('buy_limit_pct')
-                if prev is not None:
-                    pct = int(prev)
-            except Exception:
-                pct = None
+            pct = prev_pct_i if prev_pct_i is not None else None
     kwargs = {'buy_limit_enabled': enabled}  # type: Dict[str, Any]
     if pct is not None:
         kwargs['buy_limit_pct'] = pct
@@ -6521,7 +6585,23 @@ def save_buy_limit_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
             'error': str(e) or 'Could not save buy-limit settings.',
             'buy_limit': get_buy_limit_settings(),
         }
-    return {'ok': True, 'buy_limit': get_buy_limit_settings()}
+    rebase = None  # type: Optional[Dict[str, Any]]
+    if enabled and pct is not None:
+        try:
+            rebase = rebase_working_buy_limits(int(rebase_old_pct), int(pct))
+        except Exception as e:
+            print('Warning: could not rebase open buy limits: %s' % e)
+            rebase = {
+                'replaced': 0,
+                'unchanged': 0,
+                'failed': 0,
+                'skipped': 0,
+                'error': str(e) or 'rebase failed',
+            }
+    out = {'ok': True, 'buy_limit': get_buy_limit_settings()}  # type: Dict[str, Any]
+    if rebase is not None:
+        out['rebase'] = rebase
+    return out
 
 
 def schwab_order_submit_allowed() -> bool:
@@ -8082,6 +8162,31 @@ def build_stop_limit_sell_order(
     }
 
 
+def build_gtc_limit_buy_order(
+    ticker: str,
+    quantity: int,
+    limit_price: float,
+) -> Dict[str, Any]:
+    """Schwab GTC LIMIT BUY JSON body (regular-hours session)."""
+    return {
+        'orderType': 'LIMIT',
+        'session': 'NORMAL',
+        'duration': 'GOOD_TILL_CANCEL',
+        'price': round(float(limit_price), 2),
+        'orderStrategyType': 'SINGLE',
+        'orderLegCollection': [
+            {
+                'instruction': 'BUY',
+                'quantity': int(quantity),
+                'instrument': {
+                    'symbol': ticker,
+                    'assetType': 'EQUITY',
+                },
+            }
+        ],
+    }
+
+
 def stop_limit_price_from_stop(stop_price: float) -> float:
     """Limit a small % below stop so the order can fill after trigger."""
     slip = float(getattr(config, 'STOP_LIMIT_SLIPPAGE_PCT', 0.005))
@@ -8397,6 +8502,457 @@ def replace_stop_limit_sell(
         return None
 
 
+def replace_gtc_limit_buy(
+    ticker: str,
+    order_id: str,
+    quantity: int,
+    limit_price: float,
+    account_hash: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Replace a working GTC LIMIT BUY. Returns new order_id if the replace stuck.
+
+    After hours is fine (GTC). Never cancel+place: a naked cancel would leave
+    no buy if the follow-up place failed.
+    """
+    qty = int(quantity)
+    px = round(float(limit_price), 2)
+    if qty < 1 or px <= 0:
+        return None
+    if trade_dry_run_enabled():
+        print(
+            '[DRY-RUN] Would replace GTC LIMIT BUY %s %s @ $%.2f'
+            % (qty, ticker, px)
+        )
+        return order_id or 'SIM-BUY'
+    if not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
+        print('Cannot replace buy for %s: Schwab not available' % ticker)
+        return None
+    account_hash = account_hash or _get_account_hash()
+    if not account_hash:
+        print('Cannot replace buy for %s: no account hash' % ticker)
+        return None
+    if not order_id or str(order_id).startswith('SIM'):
+        return None
+    order = build_gtc_limit_buy_order(ticker, qty, px)
+    try:
+        print(
+            '  Replacing GTC LIMIT BUY %s %s @ $%.2f (order %s)...'
+            % (qty, ticker, px, order_id)
+        )
+        response = SCHWAB_CLIENT.replace_order(account_hash, order_id, order)
+        new_id = _extract_order_id(response)
+        code = getattr(response, 'status_code', None)
+        if code in (200, 201):
+            return new_id or order_id
+
+        def _live_matches():
+            live = find_working_buy(ticker, account_hash=account_hash)
+            if not live or live.get('limit_price') is None:
+                return None
+            if abs(float(live['limit_price']) - px) < 0.015:
+                return live
+            return None
+
+        time.sleep(0.5)
+        live_ok = _live_matches()
+        if live_ok:
+            return live_ok.get('order_id') or new_id or order_id
+        print(
+            '✗ LIMIT BUY replace not confirmed for %s: %s %s'
+            % (
+                ticker,
+                code if code is not None else '?',
+                getattr(response, 'text', ''),
+            )
+        )
+        print('  Leaving existing buy for %s (no cancel+place)' % ticker)
+        return None
+    except Exception as e:
+        print('Error replacing LIMIT BUY for %s: %s' % (ticker, e))
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def _list_pending_limit_buys() -> List[Dict[str, Any]]:
+    """Algo pending LIMIT buys (local book)."""
+    rows = []  # type: List[Dict[str, Any]]
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        has_origin = True
+        try:
+            cursor.execute(
+                '''
+                SELECT id, ticker, quantity_ordered, order_id, order_type,
+                       limit_price, market_price, limit_pct
+                FROM pending_orders
+                '''
+            )
+        except sqlite3.OperationalError:
+            has_origin = False
+            cursor.execute(
+                '''
+                SELECT id, ticker, quantity_ordered, order_id, order_type,
+                       limit_price
+                FROM pending_orders
+                '''
+            )
+        for r in cursor.fetchall():
+            order_type = str(r[4] or '').upper()
+            limit_price = r[5] if len(r) > 5 else None
+            if order_type == 'MARKET':
+                continue
+            if order_type != 'LIMIT' and limit_price is None:
+                continue
+            ticker = str(r[1] or '').strip().upper()
+            if not ticker:
+                continue
+            rows.append({
+                'id': r[0],
+                'ticker': ticker,
+                'quantity_ordered': r[2],
+                'order_id': r[3],
+                'order_type': order_type or 'LIMIT',
+                'limit_price': limit_price,
+                'market_price': r[6] if has_origin else None,
+                'limit_pct': r[7] if has_origin else None,
+            })
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+    return rows
+
+
+def _buy_limit_origins_from_events(
+    tickers: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Latest BUY-LIMIT event origin (market_price) per ticker / order_id."""
+    wanted = set()  # type: set
+    for t in tickers or []:
+        u = str(t or '').strip().upper()
+        if u:
+            wanted.add(u)
+    by_ticker = {}  # type: Dict[str, Dict[str, Any]]
+    by_oid = {}  # type: Dict[str, Dict[str, Any]]
+    if not wanted:
+        return {'by_ticker': by_ticker, 'by_oid': by_oid}
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            '''
+            SELECT detail_json FROM event_log
+            WHERE category = 'buy'
+            ORDER BY id DESC
+            LIMIT 400
+            '''
+        )
+        for row in cursor.fetchall():
+            raw = row[0] if row else None
+            if not raw:
+                continue
+            try:
+                detail = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(detail, dict):
+                continue
+            mp = _positive_float(detail.get('market_price'))
+            if mp is None:
+                continue
+            origin = {
+                'market_price': mp,
+                'limit_pct': detail.get('limit_pct'),
+            }
+            oid = str(detail.get('order_id') or '')
+            if oid and oid not in by_oid:
+                by_oid[oid] = origin
+            tkr = str(detail.get('ticker') or '').strip().upper()
+            if tkr in wanted and tkr not in by_ticker:
+                by_ticker[tkr] = origin
+            if len(by_ticker) >= len(wanted):
+                break
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+    return {'by_ticker': by_ticker, 'by_oid': by_oid}
+
+
+def _original_market_for_pending_buy(
+    row: Dict[str, Any],
+    live_limit: float,
+    old_pct: int,
+    event_origin: Optional[Dict[str, Any]],
+) -> Optional[float]:
+    """Market print the resting limit was based on."""
+    mp = _positive_float(row.get('market_price'))
+    if mp is not None:
+        return mp
+    if event_origin:
+        mp = _positive_float(event_origin.get('market_price'))
+        if mp is not None:
+            return mp
+    row_pct = row.get('limit_pct')
+    try:
+        row_pct_i = int(row_pct) if row_pct is not None else None
+    except (TypeError, ValueError):
+        row_pct_i = None
+    if row_pct_i is not None and 0 < row_pct_i < 100:
+        mp = implied_market_from_buy_limit(live_limit, row_pct_i)
+        if mp is not None:
+            return mp
+    if old_pct and 0 < int(old_pct) < 100:
+        return implied_market_from_buy_limit(live_limit, int(old_pct))
+    return None
+
+
+def _update_pending_buy_limit(
+    old_order_id: Optional[str],
+    new_order_id: Optional[str],
+    ticker: str,
+    quantity: int,
+    new_limit: float,
+    market_price: Optional[float],
+    limit_pct: int,
+) -> None:
+    """Point pending_orders at the replaced GTC buy."""
+    tkr = str(ticker or '').strip().upper()
+    qty = int(quantity)
+    px = round(float(new_limit), 2)
+    dollars = px * qty if qty else 0.0
+    oid_old = str(old_order_id or '')
+    oid_new = str(new_order_id or oid_old)
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        try:
+            cursor.execute(
+                '''
+                UPDATE pending_orders
+                SET order_id = ?, limit_price = ?, order_amount_dollars = ?,
+                    order_type = 'LIMIT', quantity_ordered = ?,
+                    market_price = COALESCE(?, market_price),
+                    limit_pct = ?
+                WHERE ticker = ? AND (
+                    order_id = ? OR order_id = ? OR order_id IS NULL
+                )
+                ''',
+                (
+                    oid_new, px, dollars, qty, market_price, int(limit_pct),
+                    tkr, oid_old, oid_new,
+                ),
+            )
+        except sqlite3.OperationalError:
+            cursor.execute(
+                '''
+                UPDATE pending_orders
+                SET order_id = ?, limit_price = ?, order_amount_dollars = ?,
+                    order_type = 'LIMIT', quantity_ordered = ?
+                WHERE ticker = ? AND (order_id = ? OR order_id = ?)
+                ''',
+                (oid_new, px, dollars, qty, tkr, oid_old, oid_new),
+            )
+        if cursor.rowcount == 0 and tkr and qty:
+            try:
+                cursor.execute(
+                    '''
+                    INSERT INTO pending_orders (
+                        ticker, date_ordered, quantity_ordered, order_amount_dollars,
+                        order_id, order_type, limit_price, market_price, limit_pct
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        tkr, datetime.now().strftime('%Y-%m-%dT%H:%M:%S'),
+                        qty, dollars, oid_new, 'LIMIT', px, market_price,
+                        int(limit_pct),
+                    ),
+                )
+            except sqlite3.OperationalError:
+                cursor.execute(
+                    '''
+                    INSERT INTO pending_orders (
+                        ticker, date_ordered, quantity_ordered, order_amount_dollars,
+                        order_id, order_type, limit_price
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        tkr, datetime.now().strftime('%Y-%m-%dT%H:%M:%S'),
+                        qty, dollars, oid_new, 'LIMIT', px,
+                    ),
+                )
+        try:
+            cursor.execute(
+                '''
+                UPDATE positions SET average_price = ?
+                WHERE ticker = ? AND (shares_owned IS NULL OR shares_owned = 0)
+                ''',
+                (px, tkr),
+            )
+        except sqlite3.OperationalError:
+            pass
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def rebase_working_buy_limits(old_pct: int, new_pct: int) -> Dict[str, Any]:
+    """
+    Replace working algo GTC buys so they sit at new_pct below the original
+    market print. Safe after hours (replace only; never cancel).
+    """
+    result = {
+        'replaced': 0,
+        'unchanged': 0,
+        'failed': 0,
+        'skipped': 0,
+        'dry_run': bool(trade_dry_run_enabled()),
+        'orders': [],
+    }  # type: Dict[str, Any]
+    try:
+        new_i = int(new_pct)
+        old_i = int(old_pct)
+    except (TypeError, ValueError):
+        result['error'] = 'Invalid discount percent'
+        return result
+    if new_i <= 0 or new_i >= 100:
+        result['error'] = 'Discount percent must be 1–99'
+        return result
+
+    pending = _list_pending_limit_buys()
+    if not pending:
+        return result
+
+    account_hash = None  # type: Optional[str]
+    open_orders = []  # type: List[Dict[str, Any]]
+    grouped = {}  # type: Dict[str, List[Dict[str, Any]]]
+    if SCHWAB_AVAILABLE and SCHWAB_CLIENT is not None:
+        try:
+            account_hash = _get_account_hash()
+            open_orders = get_open_orders(account_hash)
+            grouped = _working_buys_grouped(open_orders)
+        except Exception as e:
+            print('Warning: could not list open orders for buy-limit rebase: %s' % e)
+
+    origins = _buy_limit_origins_from_events([p.get('ticker') or '' for p in pending])
+    by_ticker = origins.get('by_ticker') or {}
+    by_oid = origins.get('by_oid') or {}
+
+    for row in pending:
+        ticker = str(row.get('ticker') or '').strip().upper()
+        live = _oldest_working_buy(grouped.get(ticker) or [])
+        live_type = str((live or {}).get('order_type') or '').upper()
+        if live and live_type and live_type not in ('LIMIT', ''):
+            result['skipped'] += 1
+            continue
+        oid = str((live or {}).get('order_id') or row.get('order_id') or '')
+        qty_raw = (live or {}).get('quantity')
+        if qty_raw is None:
+            qty_raw = row.get('quantity_ordered')
+        try:
+            qty = int(qty_raw) if qty_raw is not None else 0
+        except (TypeError, ValueError):
+            qty = 0
+        old_limit = _positive_float((live or {}).get('limit_price'))
+        if old_limit is None:
+            old_limit = _positive_float(row.get('limit_price'))
+        if not ticker or not oid or qty < 1 or old_limit is None:
+            result['skipped'] += 1
+            continue
+
+        event_origin = by_oid.get(oid) or by_ticker.get(ticker)
+        market = _original_market_for_pending_buy(
+            row, old_limit, old_i, event_origin,
+        )
+        if market is None:
+            print('Cannot rebase %s: no original market price' % ticker)
+            result['failed'] += 1
+            result['orders'].append({
+                'ticker': ticker,
+                'action': 'failed',
+                'reason': 'no_original_market',
+            })
+            continue
+
+        new_limit = buy_limit_price_from_market(market, new_i)
+        if abs(float(old_limit) - float(new_limit)) < 0.015:
+            result['unchanged'] += 1
+            continue
+
+        new_id = replace_gtc_limit_buy(
+            ticker, oid, qty, new_limit, account_hash=account_hash,
+        )
+        dry = trade_dry_run_enabled()
+        if not new_id:
+            result['failed'] += 1
+            result['orders'].append({
+                'ticker': ticker,
+                'action': 'failed',
+                'order_id': oid,
+                'old_limit': old_limit,
+                'new_limit': new_limit,
+            })
+            continue
+        result['replaced'] += 1
+        result['orders'].append({
+            'ticker': ticker,
+            'action': 'would_replace' if dry else 'replaced',
+            'order_id': new_id,
+            'old_order_id': oid,
+            'old_limit': old_limit,
+            'new_limit': new_limit,
+            'market_price': market,
+        })
+        if not dry:
+            try:
+                _update_pending_buy_limit(
+                    oid, new_id, ticker, qty, new_limit, market, new_i,
+                )
+            except Exception as e:
+                print('Warning: could not update pending buy for %s: %s' % (ticker, e))
+        try:
+            log_event(
+                'buy',
+                format_buy_limit_log_message(
+                    ticker, float(new_limit), dry_run=dry,
+                ),
+                detail={
+                    'ticker': ticker,
+                    'quantity': qty,
+                    'price': float(new_limit),
+                    'limit_price': float(new_limit),
+                    'old_limit_price': float(old_limit),
+                    'limit_pct': new_i,
+                    'old_limit_pct': old_i,
+                    'market_price': float(market),
+                    'order_id': new_id,
+                    'old_order_id': oid,
+                    'order_type': 'LIMIT',
+                    'duration': 'GOOD_TILL_CANCEL',
+                    'phase': 'limit_rebased',
+                    'dry_run': dry,
+                },
+            )
+        except Exception:
+            pass
+        if not dry:
+            time.sleep(0.25)
+    return result
+
+
+def rebase_working_buy_limits_to_current() -> Optional[Dict[str, Any]]:
+    """Reprice working algo buys to the saved discount (no-op if already there)."""
+    if not buy_limit_orders_enabled():
+        return None
+    pct = buy_limit_discount_pct()
+    if pct <= 0:
+        return None
+    return rebase_working_buy_limits(pct, pct)
+
+
 def ensure_broker_stop_limit(
     ticker: str,
     quantity: int,
@@ -8709,23 +9265,7 @@ def execute_buy(ticker: str, quantity: int):
             )
 
             if use_limit and limit_price is not None:
-                order = {
-                    "orderType": "LIMIT",
-                    "session": "NORMAL",
-                    "duration": "GOOD_TILL_CANCEL",
-                    "price": limit_price,
-                    "orderStrategyType": "SINGLE",
-                    "orderLegCollection": [
-                        {
-                            "instruction": "BUY",
-                            "quantity": quantity,
-                            "instrument": {
-                                "symbol": ticker,
-                                "assetType": "EQUITY"
-                            }
-                        }
-                    ]
-                }
+                order = build_gtc_limit_buy_order(ticker, quantity, limit_price)
                 print(
                     f"Placing GTC LIMIT BUY for {quantity} shares of {ticker} "
                     f"@ ${limit_price:.2f} ({limit_pct}% below market ${float(price):.2f})..."
@@ -8782,27 +9322,48 @@ def execute_buy(ticker: str, quantity: int):
                     pending_order_type = 'MARKET'
                     pending_limit_price = None
                 date_ordered = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+                pending_market = float(price) if use_limit else None
+                pending_pct = int(limit_pct) if use_limit else None
                 conn = get_connection()
                 cur = conn.cursor()
+                inserted = False
                 try:
                     cur.execute(
                         """
                         INSERT INTO pending_orders (
                             ticker, date_ordered, quantity_ordered, order_amount_dollars,
-                            order_id, order_type, limit_price
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            order_id, order_type, limit_price, market_price, limit_pct
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             ticker, date_ordered, quantity, order_amount_dollars,
                             order_id, pending_order_type, pending_limit_price,
+                            pending_market, pending_pct,
                         ),
                     )
+                    inserted = True
                 except sqlite3.OperationalError:
-                    # Older DB without order_type / limit_price columns
-                    cur.execute(
-                        "INSERT INTO pending_orders (ticker, date_ordered, quantity_ordered, order_amount_dollars, order_id) VALUES (?, ?, ?, ?, ?)",
-                        (ticker, date_ordered, quantity, order_amount_dollars, order_id),
-                    )
+                    pass
+                if not inserted:
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO pending_orders (
+                                ticker, date_ordered, quantity_ordered, order_amount_dollars,
+                                order_id, order_type, limit_price
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                ticker, date_ordered, quantity, order_amount_dollars,
+                                order_id, pending_order_type, pending_limit_price,
+                            ),
+                        )
+                    except sqlite3.OperationalError:
+                        # Older DB without order_type / limit_price columns
+                        cur.execute(
+                            "INSERT INTO pending_orders (ticker, date_ordered, quantity_ordered, order_amount_dollars, order_id) VALUES (?, ?, ?, ?, ?)",
+                            (ticker, date_ordered, quantity, order_amount_dollars, order_id),
+                        )
                 # Seed purchase timestamp / trail fields for min-hold (sync will fill shares when filled)
                 now_iso = datetime.now().isoformat()
                 cur.execute("""
@@ -10261,8 +10822,9 @@ def cancel_pending_buys_not_on_watchlist(account_hash: Optional[str] = None) -> 
 
 def sync_schwab_account(force_positions: bool = True) -> Dict[str, Any]:
     """
-    Reconcile pending buys against Schwab open orders, then refresh positions
-    (marks, shares, stop-limit exits). Used after orders and by schwab_sync job.
+    Reconcile pending buys against Schwab open orders, reprice buy limits to
+    the current discount, then refresh positions (marks, shares, stop-limit exits).
+    Used after orders and by schwab_sync job.
     """
     cleared = 0
     off_wl = 0
@@ -10274,10 +10836,23 @@ def sync_schwab_account(force_positions: bool = True) -> Dict[str, Any]:
         cleared = reconcile_pending_orders()
     except Exception as e:
         print(f"Warning: pending-order reconcile failed: {e}")
+    rebased = 0
+    try:
+        rebase = rebase_working_buy_limits_to_current()
+        if rebase:
+            rebased = int(rebase.get('replaced') or 0)
+            if rebased:
+                print(
+                    'Repriced %d working buy limit(s) to current discount'
+                    % rebased
+                )
+    except Exception as e:
+        print(f"Warning: buy-limit rebase failed: {e}")
     pos = refresh_schwab_positions_if_needed(force=bool(force_positions))
     return {
         'pending_cleared': cleared,
         'pending_off_watchlist_cancelled': off_wl,
+        'buy_limits_rebased': rebased,
         'positions': pos,
     }
 
@@ -14173,7 +14748,8 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
             ),
             'why': (
                 'When on, new buys rest as GTC limits at a discount; '
-                'outstanding limits are cancelled if the name leaves the watchlist'
+                'outstanding limits are cancelled if the name leaves the watchlist, '
+                'and are replaced immediately if you change the discount'
             ),
         },
         {

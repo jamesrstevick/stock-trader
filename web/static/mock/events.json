@@ -12,8 +12,8 @@
       "ts": "2026-08-03T17:52:00",
       "level": "info",
       "category": "sell",
-      "message": "STOP-LIMIT increased $2.20 to $70.20 for MET — trail followed 12% peak",
-      "detail": { "ticker": "MET", "stop_price": 70.2, "previous_stop": 68.0, "why": "trail followed 12% peak", "order_type": "STOP_LIMIT" }
+      "message": "STOP-LIMIT increased $2.20 to $70.20 for MET — trailing, 2% gains locked in",
+      "detail": { "ticker": "MET", "stop_price": 70.2, "previous_stop": 68.0, "why": "trailing, 2% gains locked in", "order_type": "STOP_LIMIT" }
     },
     {
       "id": 6,
