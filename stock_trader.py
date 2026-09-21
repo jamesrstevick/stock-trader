@@ -2613,22 +2613,16 @@ def _legacy_event_plan(
                 qty = None
         if qty is None:
             qty = _qty_from_legacy_message(msg, detail)
-        px = _detail_float(detail, 'price', 'stop_order_price', 'stop_limit_price')
+        # Displayed SOLD @ is the fill — never the intended stop/limit.
+        px = _detail_float(detail, 'price')
         if px is None:
-            stop_m = re.search(r'@ stop \$([0-9.]+)', msg, re.I)
-            if stop_m:
-                try:
-                    px = float(stop_m.group(1))
-                except (TypeError, ValueError):
-                    px = None
-        if px is None:
-            at_m = re.search(r'@\s+\$([0-9.]+)', msg, re.I)
+            at_m = re.search(r'@(?!\s*stop)\s+\$([0-9.]+)', msg, re.I)
             if at_m:
                 try:
                     px = float(at_m.group(1))
                 except (TypeError, ValueError):
                     px = None
-        if px is None:
+        if px is None and 'stop $' not in msg.lower():
             px = _first_money(msg)
         return {
             'action': 'update',
@@ -4393,6 +4387,10 @@ def _run_trader_pass_for_user(
             maybe_backfill_stop_fill_trades()
         except Exception as e:
             print('maybe_backfill_stop_fill_trades (%s): %s' % (uname, e))
+        try:
+            maybe_backfill_execution_prices()
+        except Exception as e:
+            print('maybe_backfill_execution_prices (%s): %s' % (uname, e))
         try:
             maybe_record_daily_equity_close()
         except Exception as e:
@@ -6531,6 +6529,8 @@ def save_buy_limit_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     When still enabled, immediately replace working algo GTC buys so they sit
     at the new discount vs the original market print (works after hours).
+    When turned off, cancel those resting limits so the next buy pass uses
+    market orders.
     """
     enabled = bool(payload.get('enabled'))
     default_pct = int(getattr(config, 'BUY_LIMIT_DEFAULT_PCT', 10))
@@ -6586,6 +6586,7 @@ def save_buy_limit_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
             'buy_limit': get_buy_limit_settings(),
         }
     rebase = None  # type: Optional[Dict[str, Any]]
+    cancelled = None  # type: Optional[Dict[str, Any]]
     if enabled and pct is not None:
         try:
             rebase = rebase_working_buy_limits(int(rebase_old_pct), int(pct))
@@ -6598,9 +6599,22 @@ def save_buy_limit_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
                 'skipped': 0,
                 'error': str(e) or 'rebase failed',
             }
+    elif not enabled:
+        try:
+            cancelled = cancel_working_buy_limits()
+        except Exception as e:
+            print('Warning: could not cancel open buy limits: %s' % e)
+            cancelled = {
+                'cancelled': 0,
+                'failed': 0,
+                'skipped': 0,
+                'error': str(e) or 'cancel failed',
+            }
     out = {'ok': True, 'buy_limit': get_buy_limit_settings()}  # type: Dict[str, Any]
     if rebase is not None:
         out['rebase'] = rebase
+    if cancelled is not None:
+        out['cancelled'] = cancelled
     return out
 
 
@@ -7092,10 +7106,17 @@ def _last_mark_price(ex: Dict[str, Any]) -> Optional[float]:
     return _positive_float(ex.get('price'))
 
 
-def _schwab_order_fill_price(details: Optional[Dict[str, Any]]) -> Optional[float]:
-    """Average execution price from a Schwab order payload, or None."""
+def _schwab_order_execution_fill(
+    details: Optional[Dict[str, Any]],
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    (avg fill price, filled qty) from a Schwab order payload.
+
+    Uses execution legs / averageFillPrice. Never the order `price` field —
+    that is the resting LIMIT / STOP_LIMIT, not what Schwab filled at.
+    """
     if not details or not isinstance(details, dict):
-        return None
+        return None, None
     weighted = 0.0
     qty_sum = 0.0
     activities = details.get('orderActivityCollection') or []
@@ -7116,13 +7137,51 @@ def _schwab_order_fill_price(details: Optional[Dict[str, Any]]) -> Optional[floa
                 continue
             weighted += px * qty
             qty_sum += qty
+    px = None  # type: Optional[float]
+    qty = None  # type: Optional[float]
     if qty_sum > 0:
-        return weighted / qty_sum
-    for key in ('averagePrice', 'averageFillPrice', 'filledPrice'):
-        px = _positive_float(details.get(key))
-        if px is not None:
-            return px
-    return None
+        px = weighted / qty_sum
+        qty = qty_sum
+    if px is None:
+        for key in ('averagePrice', 'averageFillPrice', 'filledPrice'):
+            px = _positive_float(details.get(key))
+            if px is not None:
+                break
+    if qty is None:
+        qty = _positive_float(details.get('filledQuantity'))
+    if qty is None:
+        leg_qty = 0.0
+        for leg in details.get('orderLegCollection') or []:
+            if not isinstance(leg, dict):
+                continue
+            n = _positive_float(leg.get('filledQuantity'))
+            if n is not None:
+                leg_qty += n
+        if leg_qty > 0:
+            qty = leg_qty
+    return px, qty
+
+
+def _schwab_order_fill_price(details: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Average execution price from a Schwab order payload, or None."""
+    px, _unused = _schwab_order_execution_fill(details)
+    return px
+
+
+def _as_fill_qty(qty: Any) -> Optional[int]:
+    if qty is None:
+        return None
+    try:
+        n = int(round(float(qty)))
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _schwab_order_fill_qty(details: Optional[Dict[str, Any]]) -> Optional[int]:
+    """Filled share count from a Schwab order payload, or None."""
+    _unused, qty = _schwab_order_execution_fill(details)
+    return _as_fill_qty(qty)
 
 
 _SCHWAB_WORKING_ORDER_STATUSES = {
@@ -7210,6 +7269,23 @@ def _schwab_order_is_sell_for_ticker(order: Dict[str, Any], ticker: str) -> bool
             continue
         inst = str(leg.get('instruction') or '').upper()
         if inst not in ('SELL', 'SELL_SHORT'):
+            continue
+        instrument = leg.get('instrument') or {}
+        sym = str((instrument or {}).get('symbol') or '').strip().upper()
+        if sym == t:
+            return True
+    return False
+
+
+def _schwab_order_is_buy_for_ticker(order: Dict[str, Any], ticker: str) -> bool:
+    t = str(ticker or '').strip().upper()
+    if not t or not isinstance(order, dict):
+        return False
+    for leg in order.get('orderLegCollection') or []:
+        if not isinstance(leg, dict):
+            continue
+        inst = str(leg.get('instruction') or '').upper()
+        if inst not in ('BUY', 'BUY_TO_COVER'):
             continue
         instrument = leg.get('instrument') or {}
         sym = str((instrument or {}).get('symbol') or '').strip().upper()
@@ -7313,16 +7389,11 @@ def _recent_filled_sell_price(
     return best_px
 
 
-def _resolve_close_fill_price(
+def _resolve_close_execution_price(
     ex: Dict[str, Any],
     account_hash: Optional[str] = None,
 ) -> Optional[float]:
-    """
-    Scorecard fill: Schwab execution average, then last mark.
-
-    Never use the intended STOP_LIMIT prices — those are the trail, not the fill
-    (a market sell after a missed trail must ledger ~last, not the Events stop).
-    """
+    """Schwab SELL execution average only — never stop, limit, or last mark."""
     ticker = str(ex.get('ticker') or '').strip().upper()
     ids = []  # type: List[str]
     oid = ex.get('stop_order_id') or ex.get('order_id')
@@ -7334,20 +7405,113 @@ def _resolve_close_fill_price(
     for order_id in ids:
         details = get_schwab_order_details(order_id, account_hash=account_hash)
         px = _schwab_order_fill_price(details)
-        if px is not None:
-            return px
-        if details and str(details.get('status') or '').upper() not in (
-            'FILLED', 'EXPIRED', 'CANCELED', 'CANCELLED', 'REJECTED', 'REPLACED',
-        ):
+        if px is None and details:
             time.sleep(0.8)
             details = get_schwab_order_details(order_id, account_hash=account_hash)
             px = _schwab_order_fill_price(details)
-            if px is not None:
-                return px
-    filled = _recent_filled_sell_price(ticker, account_hash=account_hash)
+        if px is not None:
+            return px
+    return _recent_filled_sell_price(ticker, account_hash=account_hash)
+
+
+def _resolve_close_fill_price(
+    ex: Dict[str, Any],
+    account_hash: Optional[str] = None,
+) -> Optional[float]:
+    """
+    Scorecard fill: Schwab execution average, then last mark.
+
+    Never use the intended STOP_LIMIT prices — those are the trail, not the fill
+    (a market sell after a missed trail must ledger ~last, not the Events stop).
+    """
+    filled = _resolve_close_execution_price(ex, account_hash=account_hash)
     if filled is not None:
         return filled
     return _last_mark_price(ex)
+
+
+def _filled_buy_order_for_ticker(
+    ticker: str,
+    since: Optional[datetime] = None,
+    account_hash: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Newest FILLED Schwab BUY for ticker, optionally at/after `since`."""
+    t = str(ticker or '').strip().upper()
+    if not t or not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
+        return None
+    account_hash = account_hash or _get_account_hash()
+    if not account_hash:
+        return None
+    try:
+        to_date = datetime.now(timezone.utc) + timedelta(days=1)
+        from_date = datetime.now(timezone.utc) - timedelta(days=5)
+        response = SCHWAB_CLIENT.account_orders(account_hash, from_date, to_date)
+        if response is None or getattr(response, 'status_code', 500) != 200:
+            return None
+        orders = _parse_schwab_orders_payload(response.json())
+    except Exception as e:
+        print('Warning: could not list recent filled buys for %s: %s' % (t, e))
+        return None
+    since_naive = _naive_dt(since)
+    best = None  # type: Optional[Dict[str, Any]]
+    best_entered = ''
+    for order in orders or []:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get('status') or '').upper() != 'FILLED':
+            continue
+        if not _schwab_order_is_buy_for_ticker(order, t):
+            continue
+        entered_raw = str(
+            order.get('enteredTime') or order.get('closeTime') or ''
+        )
+        if since_naive is not None:
+            entered_dt = _naive_dt(_parse_trade_ts(entered_raw))
+            if entered_dt is not None and entered_dt < since_naive:
+                continue
+        if best is None or entered_raw >= best_entered:
+            best = order
+            best_entered = entered_raw
+    return best
+
+
+def _resolve_buy_fill(
+    order_id: Optional[str],
+    ticker: Optional[str] = None,
+    account_hash: Optional[str] = None,
+) -> Tuple[Optional[float], Optional[int]]:
+    """
+    Schwab buy execution average and filled qty.
+
+    Never the resting LIMIT price (order `price` / pending_orders.limit_price).
+    """
+    t = str(ticker or '').strip().upper()
+    ids = []  # type: List[str]
+    if order_id:
+        ids.append(str(order_id))
+    for oid in ids:
+        details = get_schwab_order_details(oid, account_hash=account_hash)
+        px, qty = _schwab_order_execution_fill(details)
+        if px is None and details:
+            time.sleep(0.8)
+            details = get_schwab_order_details(oid, account_hash=account_hash)
+            px, qty = _schwab_order_execution_fill(details)
+        if px is not None:
+            qty_i = None  # type: Optional[int]
+            if qty is not None:
+                try:
+                    n = int(round(float(qty)))
+                    if n > 0:
+                        qty_i = n
+                except (TypeError, ValueError):
+                    qty_i = None
+            return px, qty_i
+    filled = _filled_buy_order_for_ticker(t, account_hash=account_hash) if t else None
+    if filled:
+        px, qty = _schwab_order_execution_fill(filled)
+        if px is not None:
+            return px, _schwab_order_fill_qty(filled)
+    return None, None
 
 
 def _sync_close_fill_price(ex: Dict[str, Any]) -> Optional[float]:
@@ -7464,7 +7628,8 @@ def _log_position_closed_on_sync(ex: Dict[str, Any]) -> None:
             qty = int(shares)
     except (TypeError, ValueError):
         qty = None
-    px = _sync_close_fill_price(ex)
+    px_exec = _resolve_close_execution_price(ex)
+    px = px_exec if px_exec is not None else _last_mark_price(ex)
     basis = _positive_float(ex.get('average_price'))
     submitted = _latest_submitted_sell(str(ticker)) if ticker else None
     submitted_oid = None  # type: Optional[str]
@@ -7525,7 +7690,7 @@ def _log_position_closed_on_sync(ex: Dict[str, Any]) -> None:
             'exit_kind': exit_info['exit_kind'],
             'source': source,
             'phase': 'filled',
-            'fill_is_execution': True,
+            'fill_is_execution': px_exec is not None,
             'order_id': oid,
             'stop_order_id': oid,
             'stop_order_price': stop_px,
@@ -8953,6 +9118,192 @@ def rebase_working_buy_limits_to_current() -> Optional[Dict[str, Any]]:
     return rebase_working_buy_limits(pct, pct)
 
 
+def _delete_pending_buy_row(pk=None, order_id=None):
+    # type: (Optional[int], Optional[str]) -> None
+    """Drop a pending_orders row after a buy-limit cancel."""
+    conn = get_connection()
+    try:
+        if pk is not None:
+            conn.execute('DELETE FROM pending_orders WHERE id = ?', (pk,))
+        elif order_id:
+            conn.execute('DELETE FROM pending_orders WHERE order_id = ?', (str(order_id),))
+        else:
+            return
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _is_algo_limit_buy(order):
+    # type: (Optional[Dict[str, Any]]) -> bool
+    """True for working LIMIT buys (skip market / unknown non-limit types)."""
+    if not order:
+        return False
+    ot = str(order.get('order_type') or '').upper()
+    return ot in ('LIMIT', '')
+
+
+def cancel_working_buy_limits() -> Dict[str, Any]:
+    """
+    Cancel resting algo GTC buy limits at Schwab and drop pending_orders rows.
+
+    Used when buy-limit mode is turned off so the next buy pass can use market
+    orders. Does not place replacement buys.
+    """
+    result = {
+        'cancelled': 0,
+        'failed': 0,
+        'skipped': 0,
+        'dry_run': bool(trade_dry_run_enabled()),
+        'orders': [],
+    }  # type: Dict[str, Any]
+    dry = bool(result['dry_run'])
+    pending = _list_pending_limit_buys()
+    account_hash = None  # type: Optional[str]
+    grouped = {}  # type: Dict[str, List[Dict[str, Any]]]
+    if SCHWAB_AVAILABLE and SCHWAB_CLIENT is not None:
+        try:
+            account_hash = _get_account_hash()
+            grouped = _working_buys_grouped(get_open_orders(account_hash))
+        except Exception as e:
+            print('Warning: could not list open orders for buy-limit cancel: %s' % e)
+
+    handled_ids = set()  # type: set
+
+    def _cancel_one(ticker, oid, qty, limit_px, pk=None):
+        # type: (str, str, Optional[int], Optional[float], Optional[int]) -> None
+        tkr = str(ticker or '').strip().upper()
+        order_id = str(oid or '')
+        if order_id and order_id in handled_ids:
+            result['skipped'] += 1
+            return
+        if not tkr:
+            result['skipped'] += 1
+            return
+        sim = (
+            not order_id
+            or order_id in ('PENDING',)
+            or order_id.startswith('SIM')
+        )
+        if dry:
+            print(
+                '[DRY-RUN] Would cancel pending buy %s for %s (buy-limit orders off)'
+                % (order_id or 'n/a', tkr)
+            )
+            log_event(
+                'buy',
+                'DRY-RUN would cancel pending buy for %s (buy-limit orders off)' % tkr,
+                detail={
+                    'ticker': tkr,
+                    'quantity': qty,
+                    'order_id': order_id or None,
+                    'limit_price': limit_px,
+                    'source': 'buy_limit_mode_off_cancel',
+                    'phase': 'cancelled',
+                    'dry_run': True,
+                },
+            )
+            result['cancelled'] += 1
+            result['orders'].append({
+                'ticker': tkr,
+                'action': 'would_cancel',
+                'order_id': order_id or None,
+                'limit_price': limit_px,
+            })
+            if order_id:
+                handled_ids.add(order_id)
+            return
+        ok = True
+        if not sim:
+            ok = cancel_stop_order(order_id, account_hash=account_hash)
+        if not ok:
+            print(
+                'Warning: could not cancel buy-limit %s for %s; leaving pending_orders row'
+                % (order_id, tkr)
+            )
+            result['failed'] += 1
+            result['orders'].append({
+                'ticker': tkr,
+                'action': 'failed',
+                'order_id': order_id or None,
+                'limit_price': limit_px,
+            })
+            return
+        try:
+            _delete_pending_buy_row(
+                pk=pk,
+                order_id=order_id if order_id else None,
+            )
+        except Exception as e:
+            print('Warning: failed to drop pending_orders for %s: %s' % (tkr, e))
+        result['cancelled'] += 1
+        result['orders'].append({
+            'ticker': tkr,
+            'action': 'cancelled',
+            'order_id': order_id or None,
+            'limit_price': limit_px,
+        })
+        msg = 'Cancelled pending buy for %s (buy-limit orders off)' % tkr
+        print('  %s' % msg)
+        log_event(
+            'buy',
+            msg,
+            detail={
+                'ticker': tkr,
+                'quantity': qty,
+                'order_id': order_id or None,
+                'limit_price': limit_px,
+                'source': 'buy_limit_mode_off_cancel',
+                'phase': 'cancelled',
+            },
+        )
+        if order_id:
+            handled_ids.add(order_id)
+        if not sim:
+            time.sleep(0.25)
+
+    for row in pending:
+        ticker = str(row.get('ticker') or '').strip().upper()
+        live = _oldest_working_buy(grouped.get(ticker) or [])
+        if live and not _is_algo_limit_buy(live):
+            result['skipped'] += 1
+            continue
+        oid = str((live or {}).get('order_id') or row.get('order_id') or '')
+        qty_raw = (live or {}).get('quantity')
+        if qty_raw is None:
+            qty_raw = row.get('quantity_ordered')
+        try:
+            qty = int(qty_raw) if qty_raw is not None else None
+        except (TypeError, ValueError):
+            qty = None
+        limit_px = _positive_float((live or {}).get('limit_price'))
+        if limit_px is None:
+            limit_px = _positive_float(row.get('limit_price'))
+        pk = row.get('id')
+        try:
+            pk_i = int(pk) if pk is not None else None
+        except (TypeError, ValueError):
+            pk_i = None
+        _cancel_one(ticker, oid, qty, limit_px, pk=pk_i)
+
+    for ticker, orders in grouped.items():
+        for extra in orders or []:
+            if not _is_algo_limit_buy(extra):
+                continue
+            oid = str(extra.get('order_id') or '')
+            if not oid or oid in handled_ids:
+                continue
+            qty = extra.get('quantity')
+            try:
+                qty_i = int(qty) if qty is not None else None
+            except (TypeError, ValueError):
+                qty_i = None
+            _cancel_one(
+                ticker, oid, qty_i, _positive_float(extra.get('limit_price')),
+            )
+    return result
+
+
 def ensure_broker_stop_limit(
     ticker: str,
     quantity: int,
@@ -9576,7 +9927,8 @@ def record_trade(
     Append one row to trade_history for model/performance tracking.
 
     side: 'buy' or 'sell'
-    price: intended/fill estimate at order time (Schwab fill may differ slightly)
+    price: Schwab execution average when known; quote/limit is only a placeholder
+           until reconcile/sync writes the real fill.
     cost_basis_per_share: for sells, average cost used for realized_pl
     scorecard: 'algorithm' counts on algo-only scorecard; 'excluded' does not
                (legacy / enrolled sells). Auto-detected from position origin if None.
@@ -9649,6 +10001,107 @@ def record_trade(
     )
     # Ledger stays in trade_history only — do not duplicate into the viewer Log.
     return trade_id
+
+
+def _update_trade_history_fill(
+    order_id: Optional[str],
+    price: Optional[float],
+    quantity: Optional[int] = None,
+    side: str = 'buy',
+    trade_id: Optional[int] = None,
+) -> bool:
+    """Replace a placeholder quote/limit on trade_history with the Schwab fill."""
+    oid = str(order_id or '').strip() or None
+    if price is None:
+        return False
+    try:
+        px = float(price)
+    except (TypeError, ValueError):
+        return False
+    if px <= 0:
+        return False
+    side_norm = (side or 'buy').strip().lower()
+    if side_norm not in ('buy', 'sell'):
+        return False
+    qty_i = None  # type: Optional[int]
+    if quantity is not None:
+        try:
+            qty_i = int(quantity)
+        except (TypeError, ValueError):
+            qty_i = None
+        if qty_i is not None and qty_i <= 0:
+            qty_i = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        row = None
+        if trade_id is not None:
+            cursor.execute(
+                '''
+                SELECT id, quantity, cost_basis_per_share, side FROM trade_history
+                WHERE id = ?
+                ''',
+                (int(trade_id),),
+            )
+            row = cursor.fetchone()
+            if row:
+                side_norm = str(row[3] or side_norm).strip().lower() or side_norm
+        elif oid:
+            cursor.execute(
+                '''
+                SELECT id, quantity, cost_basis_per_share FROM trade_history
+                WHERE order_id = ? AND side = ?
+                ORDER BY id DESC LIMIT 1
+                ''',
+                (oid, side_norm),
+            )
+            row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return False
+        use_id = int(row[0])
+        old_qty = row[1]
+        basis = row[2]
+        use_qty = qty_i if qty_i is not None else old_qty
+        try:
+            use_qty = int(use_qty) if use_qty is not None else None
+        except (TypeError, ValueError):
+            use_qty = None
+        dollars = (px * use_qty) if use_qty is not None else None
+        realized = None
+        if side_norm == 'sell' and use_qty is not None and basis is not None:
+            try:
+                realized = (px - float(basis)) * float(use_qty)
+            except (TypeError, ValueError):
+                realized = None
+        if use_qty is not None:
+            cursor.execute(
+                '''
+                UPDATE trade_history
+                SET price = ?, dollars = ?, quantity = ?, realized_pl = ?,
+                    order_id = COALESCE(?, order_id)
+                WHERE id = ?
+                ''',
+                (px, dollars, use_qty, realized, oid, use_id),
+            )
+        else:
+            cursor.execute(
+                '''
+                UPDATE trade_history
+                SET price = ?, dollars = ?, realized_pl = ?,
+                    order_id = COALESCE(?, order_id)
+                WHERE id = ?
+                ''',
+                (px, dollars, realized, oid, use_id),
+            )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print('Warning: could not update trade_history fill for order %s: %s' % (
+            oid or trade_id, e,
+        ))
+        return False
 
 
 def get_trade_history(
@@ -10512,6 +10965,545 @@ def _cancel_extra_working_buys(
     return cancelled
 
 
+def _fill_prices_differ(a: Optional[float], b: Optional[float]) -> bool:
+    if a is None or b is None:
+        return a != b
+    try:
+        return abs(float(a) - float(b)) >= 0.01
+    except (TypeError, ValueError):
+        return True
+
+
+def _rewrite_event_fill(
+    ev_id: int,
+    message: str,
+    detail: Dict[str, Any],
+) -> bool:
+    """Update an Events row to the Schwab execution price."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            UPDATE event_log
+            SET message = ?, detail_json = ?
+            WHERE id = ?
+            ''',
+            (message, json.dumps(detail), int(ev_id)),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print('Warning: could not rewrite fill on event id=%s: %s' % (ev_id, e))
+        return False
+    try:
+        bump_dashboard_rev()
+    except Exception:
+        pass
+    return True
+
+
+def _schwab_raw_order_id(order: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not order or not isinstance(order, dict):
+        return None
+    oid = order.get('orderId') or order.get('order_id')
+    if oid is None or str(oid).strip() == '':
+        return None
+    return str(oid)
+
+
+def _schwab_order_side_ticker(
+    order: Dict[str, Any],
+) -> Tuple[Optional[str], Optional[str]]:
+    if not isinstance(order, dict):
+        return None, None
+    for leg in order.get('orderLegCollection') or []:
+        if not isinstance(leg, dict):
+            continue
+        inst = str(leg.get('instruction') or '').upper()
+        if inst in ('BUY', 'BUY_TO_COVER'):
+            side = 'buy'
+        elif inst in ('SELL', 'SELL_SHORT'):
+            side = 'sell'
+        else:
+            continue
+        instrument = leg.get('instrument') or {}
+        sym = str((instrument or {}).get('symbol') or '').strip().upper()
+        if sym:
+            return side, sym
+    return None, None
+
+
+def _schwab_order_time(order: Dict[str, Any]) -> Optional[datetime]:
+    raw = (
+        order.get('closeTime')
+        or order.get('enteredTime')
+        or order.get('close_time')
+        or order.get('entered_time')
+    )
+    return _naive_dt(_parse_trade_ts(raw))
+
+
+def _list_filled_schwab_orders(
+    account_hash: Optional[str] = None,
+    lookback_days: int = 1095,
+    chunk_days: int = 60,
+) -> List[Dict[str, Any]]:
+    """FILLED Schwab orders over lookback, fetched in date chunks."""
+    if not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
+        return []
+    account_hash = account_hash or _get_account_hash()
+    if not account_hash:
+        return []
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=max(1, int(lookback_days)))
+    chunk = timedelta(days=max(7, int(chunk_days)))
+    by_id = {}  # type: Dict[str, Dict[str, Any]]
+    window_end = now + timedelta(days=1)
+    while window_end > start:
+        window_start = window_end - chunk
+        if window_start < start:
+            window_start = start
+        try:
+            response = SCHWAB_CLIENT.account_orders(
+                account_hash, window_start, window_end,
+            )
+            if response is None or getattr(response, 'status_code', 500) != 200:
+                print(
+                    'Warning: Schwab order history %s → %s status %s'
+                    % (
+                        window_start.date(),
+                        window_end.date(),
+                        getattr(response, 'status_code', None) if response else None,
+                    )
+                )
+            else:
+                for order in _parse_schwab_orders_payload(response.json()) or []:
+                    if not isinstance(order, dict):
+                        continue
+                    if str(order.get('status') or '').upper() != 'FILLED':
+                        continue
+                    oid = _schwab_raw_order_id(order)
+                    if oid:
+                        by_id[oid] = order
+        except Exception as e:
+            print(
+                'Warning: Schwab order history %s → %s failed: %s'
+                % (window_start.date(), window_end.date(), e)
+            )
+        window_end = window_start
+        time.sleep(0.2)
+    return list(by_id.values())
+
+
+def _index_filled_schwab_orders(
+    orders: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[Tuple[str, str], List[Dict[str, Any]]]]:
+    """Map filled orders by id and by (side, ticker)."""
+    by_id = {}  # type: Dict[str, Dict[str, Any]]
+    by_key = {}  # type: Dict[Tuple[str, str], List[Dict[str, Any]]]
+    for order in orders or []:
+        oid = _schwab_raw_order_id(order)
+        px, qty_f = _schwab_order_execution_fill(order)
+        if px is None:
+            continue
+        side, ticker = _schwab_order_side_ticker(order)
+        if not side or not ticker:
+            continue
+        row = {
+            'order': order,
+            'order_id': oid,
+            'side': side,
+            'ticker': ticker,
+            'price': px,
+            'quantity': _as_fill_qty(qty_f),
+            'ts': _schwab_order_time(order),
+        }
+        if oid:
+            by_id[oid] = row
+        by_key.setdefault((side, ticker), []).append(row)
+    return by_id, by_key
+
+
+def _fill_from_order_id(
+    order_id: str,
+    account_hash: Optional[str] = None,
+) -> Tuple[Optional[float], Optional[int], Optional[Dict[str, Any]]]:
+    details = get_schwab_order_details(order_id, account_hash=account_hash)
+    px, qty_f = _schwab_order_execution_fill(details)
+    if px is None and details:
+        time.sleep(0.8)
+        details = get_schwab_order_details(order_id, account_hash=account_hash)
+        px, qty_f = _schwab_order_execution_fill(details)
+    return px, _as_fill_qty(qty_f), details
+
+
+def _match_indexed_fill(
+    by_key: Dict[Tuple[str, str], List[Dict[str, Any]]],
+    used_ids: set,
+    side: str,
+    ticker: str,
+    ev_ts: Optional[datetime],
+    qty: Optional[int],
+    max_hours: float = 72.0,
+) -> Optional[Dict[str, Any]]:
+    rows = by_key.get((side, str(ticker or '').strip().upper())) or []
+    best = None  # type: Optional[Dict[str, Any]]
+    best_dt = None  # type: Optional[float]
+    for row in rows:
+        oid = row.get('order_id')
+        if oid and oid in used_ids:
+            continue
+        fill_qty = row.get('quantity')
+        if qty is not None and fill_qty is not None and int(qty) != int(fill_qty):
+            continue
+        row_ts = row.get('ts')
+        dt = None  # type: Optional[float]
+        if ev_ts is not None and row_ts is not None:
+            dt = abs((row_ts - ev_ts).total_seconds())
+            if dt > max_hours * 3600.0:
+                continue
+        elif ev_ts is not None or row_ts is not None:
+            continue
+        if best is None or (
+            dt is not None and (best_dt is None or dt < best_dt)
+        ):
+            best = row
+            best_dt = dt
+    return best
+
+
+def _event_fill_side(message: str, detail: Dict[str, Any]) -> Optional[str]:
+    if detail.get('retracted') or detail.get('dry_run'):
+        return None
+    phase = str(detail.get('phase') or '').strip().lower()
+    if phase in ('limit_pending', 'submitted', 'cancelled'):
+        return None
+    upper = str(message or '').upper()
+    if 'BUY-LIMIT SET' in upper or 'AWAITING SCHWAB FILL' in upper:
+        return None
+    if upper.startswith('STOP-LIMIT') or 'STOP-LIMIT SET' in upper:
+        return None
+    if upper.startswith('BOUGHT'):
+        return 'buy'
+    if upper.startswith('SOLD'):
+        return 'sell'
+    return None
+
+
+def _apply_execution_fill_to_event(
+    ev: Dict[str, Any],
+    px: float,
+    qty: Optional[int],
+    order_id: Optional[str],
+    quiet: bool = False,
+) -> str:
+    """
+    Write Schwab execution onto a BOUGHT/SOLD Event.
+
+    Returns 'corrected' | 'confirmed' | 'failed'.
+    """
+    ev_id = ev.get('id')
+    if not ev_id:
+        return 'failed'
+    detail = ev.get('detail') if isinstance(ev.get('detail'), dict) else {}
+    detail = dict(detail)
+    msg = str(ev.get('message') or '')
+    side = _event_fill_side(msg, detail)
+    is_bought = side == 'buy'
+    ticker = str(
+        detail.get('ticker') or _event_row_ticker(msg, detail) or ''
+    ).strip().upper()
+    logged_px = _detail_float(detail, 'price')
+    if qty is None:
+        qty = _detail_int(detail, 'quantity', 'shares_owned', 'qty')
+    if (
+        is_bought
+        and detail.get('limit_price') is None
+        and logged_px is not None
+        and _fill_prices_differ(logged_px, px)
+    ):
+        detail['limit_price'] = logged_px
+    if order_id and not detail.get('order_id'):
+        detail['order_id'] = order_id
+    new_msg = (
+        format_bought_log_message(ticker, qty, px)
+        if is_bought
+        else format_sold_log_message(
+            ticker, qty, px,
+            cost_basis=_detail_float(
+                detail, 'average_price', 'cost_basis', 'cost_basis_per_share',
+            ),
+            realized_pl=_detail_float(detail, 'realized_pl'),
+        )
+    )
+    already = (
+        not _fill_prices_differ(logged_px, px)
+        and new_msg == msg
+    )
+    detail['price'] = px
+    detail['fill_is_execution'] = True
+    if qty is not None:
+        detail['quantity'] = qty
+    if not is_bought:
+        basis = _detail_float(
+            detail, 'average_price', 'cost_basis', 'cost_basis_per_share',
+        )
+        pl, pct = _sold_pl_pair(px, qty, basis)
+        if pl is not None:
+            detail['realized_pl'] = pl
+        if pct is not None:
+            detail['realized_pct'] = pct
+        new_msg = format_sold_log_message(
+            ticker, qty, px, cost_basis=basis, realized_pl=pl,
+        )
+    write_msg = msg if already else new_msg
+    if not _rewrite_event_fill(int(ev_id), write_msg, detail):
+        return 'failed'
+    _update_trade_history_fill(
+        order_id or detail.get('order_id') or detail.get('stop_order_id'),
+        px,
+        quantity=qty,
+        side='buy' if is_bought else 'sell',
+    )
+    if already:
+        return 'confirmed'
+    if not quiet:
+        print('  Corrected %s fill to Schwab execution @ %s' % (
+            ticker, _fmt_log_px(px),
+        ))
+    return 'corrected'
+
+
+def backfill_execution_prices(
+    account_hash: Optional[str] = None,
+    hours: Optional[float] = None,
+    event_limit: Optional[int] = None,
+    skip_confirmed: bool = False,
+    quiet: bool = False,
+    lookback_days: int = 1095,
+    use_order_index: bool = True,
+    update_trade_history: bool = True,
+) -> Dict[str, Any]:
+    """
+    Rewrite BOUGHT/SOLD Events (and matching trade_history) to Schwab fills.
+
+    hours=None walks the full event log. skip_confirmed=True (reconcile) only
+    touches rows that are not already marked as a Schwab execution.
+    """
+    report = {
+        'ok': False,
+        'corrected': 0,
+        'confirmed': 0,
+        'unmatched': 0,
+        'skipped': 0,
+        'trades_updated': 0,
+        'orders_indexed': 0,
+    }  # type: Dict[str, Any]
+    if not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
+        report['reason'] = 'schwab_unavailable'
+        return report
+    account_hash = account_hash or _get_account_hash()
+    if not account_hash:
+        report['reason'] = 'no_account'
+        return report
+    cutoff = None  # type: Optional[datetime]
+    if hours is not None:
+        cutoff = datetime.now() - timedelta(hours=float(hours))
+    load_limit = int(event_limit) if event_limit else 20000
+    events = _load_trade_events(limit=load_limit)
+    candidates = []  # type: List[Dict[str, Any]]
+    for ev in events:
+        detail = ev.get('detail') or {}
+        if not isinstance(detail, dict):
+            continue
+        side = _event_fill_side(str(ev.get('message') or ''), detail)
+        if not side:
+            report['skipped'] = int(report['skipped']) + 1
+            continue
+        if skip_confirmed and detail.get('fill_is_execution'):
+            report['skipped'] = int(report['skipped']) + 1
+            continue
+        ts_raw = ev.get('ts')
+        ts = _naive_dt(_parse_trade_ts(ts_raw))
+        if cutoff is not None and ts is not None and ts < cutoff:
+            continue
+        ticker = str(
+            detail.get('ticker')
+            or _event_row_ticker(str(ev.get('message') or ''), detail)
+            or ''
+        ).strip().upper()
+        oid = detail.get('order_id') or detail.get('stop_order_id')
+        candidates.append({
+            'ev': ev,
+            'detail': detail,
+            'side': side,
+            'ticker': ticker,
+            'ts': ts,
+            'order_id': str(oid) if oid else None,
+            'qty': _detail_int(detail, 'quantity', 'shares_owned', 'qty'),
+        })
+    if not candidates:
+        report['ok'] = True
+        return report
+    by_id = {}  # type: Dict[str, Dict[str, Any]]
+    by_key = {}  # type: Dict[Tuple[str, str], List[Dict[str, Any]]]
+    if use_order_index:
+        filled_orders = _list_filled_schwab_orders(
+            account_hash=account_hash,
+            lookback_days=lookback_days,
+        )
+        by_id, by_key = _index_filled_schwab_orders(filled_orders)
+        report['orders_indexed'] = len(by_id)
+    used_ids = set()  # type: set
+    # Oldest first so earlier Events claim earlier fills of the same name.
+    candidates.sort(key=lambda row: (row.get('ts') or datetime.min, row['ev'].get('id') or 0))
+    for row in candidates:
+        ev = row['ev']
+        px = None  # type: Optional[float]
+        qty = row.get('qty')
+        oid_s = row.get('order_id')
+        indexed = by_id.get(oid_s) if oid_s else None
+        if indexed:
+            px = indexed.get('price')
+            qty = indexed.get('quantity') or qty
+            used_ids.add(oid_s)
+        elif oid_s:
+            px, fill_qty, _details = _fill_from_order_id(
+                oid_s, account_hash=account_hash,
+            )
+            if fill_qty:
+                qty = fill_qty
+            if px is not None:
+                used_ids.add(oid_s)
+        if px is None and use_order_index:
+            matched = _match_indexed_fill(
+                by_key,
+                used_ids,
+                str(row['side']),
+                str(row['ticker']),
+                row.get('ts'),
+                qty,
+            )
+            if matched:
+                px = matched.get('price')
+                qty = matched.get('quantity') or qty
+                oid_s = matched.get('order_id') or oid_s
+                if matched.get('order_id'):
+                    used_ids.add(matched['order_id'])
+        if px is None:
+            report['unmatched'] = int(report['unmatched']) + 1
+            if not quiet:
+                print('  No Schwab fill for %s %s (event %s)' % (
+                    row['side'], row['ticker'] or '?', ev.get('id'),
+                ))
+            continue
+        outcome = _apply_execution_fill_to_event(
+            ev, float(px), qty, oid_s, quiet=quiet,
+        )
+        if outcome == 'corrected':
+            report['corrected'] = int(report['corrected']) + 1
+        elif outcome == 'confirmed':
+            report['confirmed'] = int(report['confirmed']) + 1
+        else:
+            report['unmatched'] = int(report['unmatched']) + 1
+    trades_updated = 0
+    if update_trade_history and use_order_index:
+        trades_updated = _backfill_trade_history_fills(
+            by_id, by_key, used_ids, quiet=quiet,
+        )
+    report['trades_updated'] = trades_updated
+    report['ok'] = True
+    return report
+
+
+def _backfill_trade_history_fills(
+    by_id: Dict[str, Dict[str, Any]],
+    by_key: Dict[Tuple[str, str], List[Dict[str, Any]]],
+    used_ids: set,
+    quiet: bool = False,
+) -> int:
+    """Update leftover trade_history rows that still have quote/limit prices."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            '''
+            SELECT id, ts, side, ticker, quantity, price, order_id, mode
+            FROM trade_history
+            ORDER BY ts ASC, id ASC
+            '''
+        )
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        return 0
+    conn.close()
+    n = 0
+    for trade_id, ts, side, ticker, quantity, price, order_id, mode in rows:
+        if _trade_mode_is_simulation(mode):
+            continue
+        side_s = str(side or '').strip().lower()
+        if side_s not in ('buy', 'sell'):
+            continue
+        tkr = str(ticker or '').strip().upper()
+        oid_s = str(order_id) if order_id else None
+        qty = _as_fill_qty(quantity)
+        px = None  # type: Optional[float]
+        indexed = by_id.get(oid_s) if oid_s else None
+        if indexed:
+            px = indexed.get('price')
+            qty = indexed.get('quantity') or qty
+        elif oid_s:
+            px, fill_qty, _details = _fill_from_order_id(oid_s)
+            if fill_qty:
+                qty = fill_qty
+        if px is None:
+            matched = _match_indexed_fill(
+                by_key,
+                used_ids,
+                side_s,
+                tkr,
+                _naive_dt(_parse_trade_ts(ts)),
+                qty,
+            )
+            if matched:
+                px = matched.get('price')
+                qty = matched.get('quantity') or qty
+                oid_s = matched.get('order_id') or oid_s
+                if matched.get('order_id'):
+                    used_ids.add(matched['order_id'])
+        if px is None:
+            continue
+        if not _fill_prices_differ(_positive_float(price), px):
+            continue
+        ok = _update_trade_history_fill(
+            oid_s, px, quantity=qty, side=side_s, trade_id=int(trade_id),
+        )
+        if ok:
+            n += 1
+            if not quiet:
+                print('  trade_history %s %s → %s' % (
+                    side_s.upper(), tkr, _fmt_log_px(px),
+                ))
+    return n
+
+
+def _refresh_recent_execution_prices(account_hash: Optional[str] = None) -> int:
+    """Correct recent BOUGHT/SOLD Events that still show limit/stop/quote."""
+    report = backfill_execution_prices(
+        account_hash=account_hash,
+        hours=48,
+        event_limit=80,
+        skip_confirmed=True,
+        quiet=True,
+        lookback_days=7,
+        use_order_index=False,
+        update_trade_history=False,
+    )
+    return int(report.get('corrected') or 0) + int(report.get('confirmed') or 0)
+
+
 def reconcile_pending_orders(account_hash: Optional[str] = None) -> int:
     """
     Remove from pending_orders any row whose Schwab order filled or cancelled.
@@ -10625,23 +11617,34 @@ def reconcile_pending_orders(account_hash: Optional[str] = None) -> int:
         conn.commit()
         conn.close()
         for row in filled_rows:
-            qty = row.get('quantity')
-            dollars = row.get('dollars')
-            px = None  # type: Optional[float]
+            ticker = row.get('ticker')
+            oid = row.get('order_id')
+            limit_px = None  # type: Optional[float]
             try:
                 if row.get('limit_price') is not None:
-                    px = float(row['limit_price'])
-                elif qty and dollars and float(qty) > 0:
-                    px = float(dollars) / float(qty)
+                    limit_px = float(row['limit_price'])
             except (TypeError, ValueError):
-                px = None
-            ticker = row.get('ticker')
+                limit_px = None
+            qty = row.get('quantity')
             qty_i = None  # type: Optional[int]
             try:
                 if qty is not None:
                     qty_i = int(qty)
             except (TypeError, ValueError):
                 qty_i = None
+            px, fill_qty = _resolve_buy_fill(
+                str(oid) if oid else None,
+                ticker=str(ticker) if ticker else None,
+                account_hash=account_hash,
+            )
+            if fill_qty:
+                qty_i = fill_qty
+            dollars = row.get('dollars')
+            try:
+                if px is not None and qty_i:
+                    dollars = float(px) * float(qty_i)
+            except (TypeError, ValueError):
+                pass
             msg = format_bought_log_message(ticker, qty_i, px)
             print(f"  {msg}")
             log_event(
@@ -10649,15 +11652,21 @@ def reconcile_pending_orders(account_hash: Optional[str] = None) -> int:
                 msg,
                 detail={
                     'ticker': ticker,
-                    'quantity': qty,
+                    'quantity': qty_i if qty_i is not None else qty,
                     'price': px,
-                    'order_id': row.get('order_id'),
+                    'limit_price': limit_px,
+                    'order_id': oid,
                     'dollars': dollars,
                     'source': 'pending_reconcile',
                     'phase': 'filled',
                     'order_type': row.get('order_type'),
+                    'fill_is_execution': px is not None,
                 },
             )
+            if px is not None:
+                _update_trade_history_fill(
+                    oid, px, quantity=qty_i, side='buy',
+                )
         for row in cancelled_rows:
             ticker = row.get('ticker')
             msg = 'Cancelled pending buy for %s' % ticker
@@ -10675,6 +11684,10 @@ def reconcile_pending_orders(account_hash: Optional[str] = None) -> int:
                     'order_type': row.get('order_type'),
                 },
             )
+        try:
+            _refresh_recent_execution_prices(account_hash=account_hash)
+        except Exception as e:
+            print('Warning: could not refresh Schwab fill prices: %s' % e)
         return len(filled_rows) + len(cancelled_rows)
     except sqlite3.OperationalError:
         # pending_orders table may not exist yet
@@ -10837,22 +11850,33 @@ def sync_schwab_account(force_positions: bool = True) -> Dict[str, Any]:
     except Exception as e:
         print(f"Warning: pending-order reconcile failed: {e}")
     rebased = 0
+    cancelled_limits = 0
     try:
-        rebase = rebase_working_buy_limits_to_current()
-        if rebase:
-            rebased = int(rebase.get('replaced') or 0)
-            if rebased:
+        if buy_limit_orders_enabled():
+            rebase = rebase_working_buy_limits_to_current()
+            if rebase:
+                rebased = int(rebase.get('replaced') or 0)
+                if rebased:
+                    print(
+                        'Repriced %d working buy limit(s) to current discount'
+                        % rebased
+                    )
+        else:
+            cancel = cancel_working_buy_limits()
+            cancelled_limits = int((cancel or {}).get('cancelled') or 0)
+            if cancelled_limits:
                 print(
-                    'Repriced %d working buy limit(s) to current discount'
-                    % rebased
+                    'Cancelled %d working buy limit(s) (buy-limit orders off)'
+                    % cancelled_limits
                 )
     except Exception as e:
-        print(f"Warning: buy-limit rebase failed: {e}")
+        print(f"Warning: buy-limit rebase/cancel failed: {e}")
     pos = refresh_schwab_positions_if_needed(force=bool(force_positions))
     return {
         'pending_cleared': cleared,
         'pending_off_watchlist_cancelled': off_wl,
         'buy_limits_rebased': rebased,
+        'buy_limits_cancelled': cancelled_limits,
         'positions': pos,
     }
 
@@ -12513,6 +13537,108 @@ def run_catch_up(
         'live': bool(live),
         'users': reports,
     }
+
+
+def run_backfill_execution_prices(
+    usernames: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    One-shot: rewrite all historical BOUGHT/SOLD Events and trade_history
+    prices to Schwab execution averages.
+    """
+    init_database()
+    want = None  # type: Optional[set]
+    if usernames:
+        want = {str(n).strip().lower() for n in usernames if str(n).strip()}
+    users = uc.list_active_users()
+    if want:
+        users = [
+            u for u in users
+            if str(u.get('username') or '').strip().lower() in want
+        ]
+        missing = want - {
+            str(u.get('username') or '').strip().lower() for u in users
+        }
+        for name in sorted(missing):
+            print('No active user named %s' % name)
+    reports = []  # type: List[Dict[str, Any]]
+    for user in users:
+        uid = int(user['id'])
+        uname = str(user.get('username') or uid)
+        print('\n=== Fill backfill: %s ===' % uname)
+        with uc.use_user(uid):
+            initialize_schwab_client(interactive=False, user_id=uid)
+            _sync_schwab_globals(uid)
+            if not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
+                print('  Schwab not available — skip')
+                reports.append({
+                    'username': uname,
+                    'ok': False,
+                    'reason': 'schwab_unavailable',
+                })
+                continue
+            report = backfill_execution_prices(
+                hours=None,
+                event_limit=20000,
+                skip_confirmed=False,
+                quiet=False,
+                lookback_days=1095,
+                use_order_index=True,
+                update_trade_history=True,
+            )
+            report['username'] = uname
+            if report.get('ok'):
+                set_runtime_flag('execution_fills_backfilled', '1')
+            print(
+                '  %s: corrected=%s confirmed=%s unmatched=%s '
+                'skipped=%s trades_updated=%s orders=%s'
+                % (
+                    uname,
+                    report.get('corrected'),
+                    report.get('confirmed'),
+                    report.get('unmatched'),
+                    report.get('skipped'),
+                    report.get('trades_updated'),
+                    report.get('orders_indexed'),
+                )
+            )
+            reports.append(report)
+    return {'users': reports}
+
+
+def maybe_backfill_execution_prices() -> Optional[Dict[str, Any]]:
+    """Run the historical fill rewrite once per user when Schwab is up."""
+    if get_runtime_flag('execution_fills_backfilled') == '1':
+        return None
+    if not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
+        return None
+    try:
+        print('One-time Schwab fill backfill (Events + trade_history)…')
+        report = backfill_execution_prices(
+            hours=None,
+            event_limit=20000,
+            skip_confirmed=False,
+            quiet=False,
+            lookback_days=1095,
+            use_order_index=True,
+            update_trade_history=True,
+        )
+        if report.get('ok'):
+            set_runtime_flag('execution_fills_backfilled', '1')
+            print(
+                '  Fill backfill done: corrected=%s confirmed=%s unmatched=%s '
+                'trades_updated=%s'
+                % (
+                    report.get('corrected'),
+                    report.get('confirmed'),
+                    report.get('unmatched'),
+                    report.get('trades_updated'),
+                )
+            )
+        return report
+    except Exception as e:
+        print('Warning: execution fill backfill failed: %s' % e)
+        return None
 
 
 def _repo_root() -> str:
@@ -14748,8 +15874,9 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
             ),
             'why': (
                 'When on, new buys rest as GTC limits at a discount; '
-                'outstanding limits are cancelled if the name leaves the watchlist, '
-                'and are replaced immediately if you change the discount'
+                'outstanding limits are cancelled if you turn this off or the name '
+                'leaves the watchlist, and are replaced immediately if you change '
+                'the discount'
             ),
         },
         {

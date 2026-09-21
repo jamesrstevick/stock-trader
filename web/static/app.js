@@ -95,6 +95,7 @@
             max_pct_exclusive: 100,
           },
           rebase: { replaced: 0, unchanged: 0, failed: 0, skipped: 0, dry_run: true, orders: [] },
+          cancelled: { cancelled: 0, failed: 0, skipped: 0, dry_run: true, orders: [] },
         };
       }
       return {
@@ -1666,11 +1667,21 @@
           buyLimitPctEditing = false;
           renderBuyLimitCard(res.buy_limit || res);
           var rebase = res.rebase || {};
+          var cancelled = res.cancelled || {};
           var nRep = Number(rebase.replaced) || 0;
-          var nFail = Number(rebase.failed) || 0;
+          var nCan = Number(cancelled.cancelled) || 0;
+          var nFail = Number(rebase.failed || cancelled.failed) || 0;
           var msg;
           if (!on) {
             msg = 'Buy limit orders off — market buys.';
+            if (nCan > 0) {
+              msg += cancelled.dry_run
+                ? (' Dry-run: would cancel ' + nCan + ' open buy' + (nCan === 1 ? '' : 's') + '.')
+                : (' Cancelled ' + nCan + ' open buy' + (nCan === 1 ? '' : 's') + '.');
+            }
+            if (Number(cancelled.failed) > 0) {
+              msg += ' ' + cancelled.failed + ' could not be cancelled (still working at Schwab).';
+            }
           } else {
             msg = 'Buy limit orders on — buys at ' + (res.buy_limit && res.buy_limit.discount_pct) + '% below market.';
             if (nRep > 0) {
@@ -1678,8 +1689,8 @@
                 ? (' Dry-run: would reprice ' + nRep + ' open buy' + (nRep === 1 ? '' : 's') + '.')
                 : (' Repriced ' + nRep + ' open buy' + (nRep === 1 ? '' : 's') + '.');
             }
-            if (nFail > 0) {
-              msg += ' ' + nFail + ' could not be replaced (left at the old price).';
+            if (Number(rebase.failed) > 0) {
+              msg += ' ' + rebase.failed + ' could not be replaced (left at the old price).';
             }
           }
           setActionFeedback(
