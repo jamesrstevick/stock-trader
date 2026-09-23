@@ -1930,6 +1930,8 @@ def stop_limit_why_phrase(proposal: Optional[Dict[str, Any]]) -> Optional[str]:
     """Short Events clause: why a STOP_LIMIT was set or moved."""
     if not proposal:
         return None
+    if proposal.get('floor_widen'):
+        return 'hard floor widened to current rule'
     if proposal.get('floor_tighten'):
         return 'failed the filter, floor tightened'
     if proposal.get('trail_active'):
@@ -2191,6 +2193,7 @@ def _stop_limit_event_extra(
             extra['reason'] = proposal.get('reason')
         extra['trail_active'] = bool(proposal.get('trail_active'))
         extra['floor_tighten'] = bool(proposal.get('floor_tighten'))
+        extra['floor_widen'] = bool(proposal.get('floor_widen'))
         if 'on_watchlist' in proposal:
             extra['on_watchlist'] = bool(proposal.get('on_watchlist'))
         if proposal.get('peak_gain_pct') is not None:
@@ -12376,18 +12379,33 @@ def enroll_to_algorithm(ticker: str, note: Optional[str] = None) -> None:
     )
 
 
+def _legacy_hard_floor_pcts():
+    # type: () -> Tuple[float, ...]
+    """Prior hard floors (−10% on-list / −5% off-list) before the widen."""
+    return (-0.10, -0.05)
+
+
+def _stop_matches_floor_pct(existing, purchase, pct):
+    # type: (float, float, float) -> bool
+    """True when a resting stop is still the given percent below cost."""
+    gain = (float(existing) / float(purchase)) - 1.0
+    return abs(gain - float(pct)) <= 0.005
+
+
 def _locked_floor_stop(
     purchase,  # type: float
     on_watchlist,  # type: bool
     existing_stop_price=None,  # type: Optional[float]
     floor_tightened=False,  # type: bool
 ):
-    # type: (...) -> Tuple[float, float, bool]
+    # type: (...) -> Tuple[float, float, bool, bool]
     """
     Hard floor is % below purchase, set once.
 
-    Later dollar moves are only the one-time off-watchlist tighten
-    (−15% → −8% by default). Returns (stop_price, stop_gain_pct, tighten_pending).
+    A resting stop still at the previous floors (−10% / −5%) is moved down
+    to the current floor (−15% on-list / −8% off-list). Other dollar moves
+    are only the one-time off-watchlist tighten.
+    Returns (stop_price, stop_gain_pct, tighten_pending, floor_widen).
     """
     hard_on = float(getattr(config, 'HARD_STOP_ON_WATCHLIST_PCT', -0.15))
     hard_off = float(getattr(config, 'HARD_STOP_OFF_WATCHLIST_PCT', -0.08))
@@ -12402,16 +12420,23 @@ def _locked_floor_stop(
         except (TypeError, ValueError):
             existing = None
     if existing is None:
-        return desired_px, hard, (not on_watchlist)
+        return desired_px, hard, (not on_watchlist), False
+    for old_pct in _legacy_hard_floor_pcts():
+        if _stop_matches_floor_pct(existing, purchase, old_pct):
+            # Only lower the stop. A legacy −10% that is already under the
+            # current off-list floor stays put (do not tighten it up).
+            if desired_px + 0.009 < existing:
+                return desired_px, hard, False, True
+            break
     if (not on_watchlist) and (not floor_tightened):
         on_px = float(purchase) * (1.0 + hard_on)
         off_px = desired_px
         # Only jump from the loose on-list floor. A stop that already drifted
         # toward price (the old recompute bug) is frozen, not chased further.
         if existing + 0.009 < ((on_px + off_px) / 2.0):
-            return off_px, hard, True
+            return off_px, hard, True, False
     gain = (existing / float(purchase)) - 1.0
-    return existing, gain, False
+    return existing, gain, False, False
 
 
 def compute_trail_state_for_position(
@@ -12427,7 +12452,8 @@ def compute_trail_state_for_position(
     """
     Same trail/hard-stop math as propose_sells (bring a name 'up to speed').
 
-    Floor (pre-trail) is locked at first place vs purchase; trail still
+    Floor (pre-trail) is locked at first place vs purchase. A stop still at
+    the old −10%/−5% floors is lowered to the current rule. Trail still
     follows peak − buffer. Off-watchlist may raise the floor once.
 
     Returns peak/stop/kind without writing proposals. Caller may persist.
@@ -12453,6 +12479,7 @@ def compute_trail_state_for_position(
     buffer = buffer_off if not on_wl else buffer_on
     hard = hard_off if not on_wl else hard_on
     floor_tighten = False
+    floor_widen = False
 
     new_stop = float(stop_gain) if stop_gain is not None else None
     if active:
@@ -12471,14 +12498,14 @@ def compute_trail_state_for_position(
         if active:
             stop_price = purchase * (1.0 + float(new_stop))
         else:
-            stop_price, new_stop, floor_tighten = _locked_floor_stop(
+            stop_price, new_stop, floor_tighten, floor_widen = _locked_floor_stop(
                 purchase,
                 on_wl,
                 existing_stop_price=None,
                 floor_tightened=False,
             )
     else:
-        stop_price, new_stop, floor_tighten = _locked_floor_stop(
+        stop_price, new_stop, floor_tighten, floor_widen = _locked_floor_stop(
             purchase,
             on_wl,
             existing_stop_price=existing_stop_price,
@@ -12498,6 +12525,7 @@ def compute_trail_state_for_position(
         'trail_active': active,
         'on_watchlist': on_wl,
         'floor_tighten': floor_tighten,
+        'floor_widen': floor_widen,
         'breached': float(price) <= float(stop_price),
     }
 
@@ -13372,6 +13400,12 @@ def run_catch_up_for_current_user(live: bool = False) -> Dict[str, Any]:
                 action = 'replace'
             elif schwab_stop is None:
                 action = 'place_stop_limit'
+            elif (
+                schwab_stop is not None
+                and intended is not None
+                and float(intended) + min_move < float(schwab_stop)
+            ):
+                action = 'replace'
             else:
                 action = 'leave'
         row = {
@@ -13398,8 +13432,18 @@ def run_catch_up_for_current_user(live: bool = False) -> Dict[str, Any]:
         elif action == 'skip_sell':
             note = ' — stop breached but %s' % hold_reason
         elif action == 'replace':
-            note = ' — raise Schwab %s → %s' % (
-                _fmt_px_opt(schwab_stop), _fmt_px_opt(intended),
+            verb = 'raise'
+            try:
+                if (
+                    intended is not None
+                    and schwab_stop is not None
+                    and float(intended) < float(schwab_stop)
+                ):
+                    verb = 'lower'
+            except (TypeError, ValueError):
+                verb = 'raise'
+            note = ' — %s Schwab %s → %s' % (
+                verb, _fmt_px_opt(schwab_stop), _fmt_px_opt(intended),
             )
         print(
             '  [%s] %s  last %s  events %s  schwab %s  intended %s%s'
@@ -14699,8 +14743,10 @@ def propose_sells() -> List[Dict[str, Any]]:
     - defer_stop_limit: would place stop but same ET purchase day (PDT) — wait until next day
     - skip_sell: would sell but min-hold blocks
     Trail: peak +10% activate, 10% buffer on-list / 7% off-list (stop = peak − buffer).
-    Hard stop: locked % below purchase (−15% on-list / −8% off-list); the floor
-    is set once and only raised if the name fails the filter, until trail arms.
+    Hard stop: locked % below purchase (−15% on-list / −8% off-list). A resting
+    stop still at the old −10% / −5% floors is lowered once to the current rule.
+    Otherwise the floor stays put until trail, except a one-time tighten if the
+    name fails the filter.
     """
     init_database()
     conn = get_connection()
@@ -14776,6 +14822,7 @@ def propose_sells() -> List[Dict[str, Any]]:
         gain = state['gain_pct']
         on_wl = state['on_watchlist']
         floor_tighten = bool(state.get('floor_tighten'))
+        floor_widen = bool(state.get('floor_widen'))
         trail_just_armed = bool(active) and not bool(trail_active)
         buffer = float(
             getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.07)
@@ -14802,6 +14849,7 @@ def propose_sells() -> List[Dict[str, Any]]:
             'trail_just_armed': trail_just_armed,
             'on_watchlist': on_wl,
             'floor_tighten': floor_tighten,
+            'floor_widen': floor_widen,
         }
         base['stop_why'] = stop_limit_why_phrase(base)
 
@@ -14857,7 +14905,13 @@ def propose_sells() -> List[Dict[str, Any]]:
             )
         else:
             activate_pct = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10))
-            if floor_tighten:
+            if floor_widen:
+                reason = (
+                    f'widen floor stop-limit @ ${stop_price:.2f} '
+                    f'({float(new_stop)*100:.1f}% vs cost); '
+                    f'replace legacy −10%/−5% hard floor with current rule'
+                )
+            elif floor_tighten:
                 reason = (
                     f'tighten floor stop-limit @ ${stop_price:.2f} '
                     f'({float(new_stop)*100:.1f}% vs cost); '
