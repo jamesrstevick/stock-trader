@@ -98,6 +98,22 @@
           cancelled: { cancelled: 0, failed: 0, skipped: 0, dry_run: true, orders: [] },
         };
       }
+      if (path.indexOf('/api/hard-floors') === 0) {
+        var onPct = body && body.on_pct != null ? Number(body.on_pct) : 15;
+        var offPct = body && body.off_pct != null ? Number(body.off_pct) : 8;
+        return {
+          ok: true,
+          hard_floors: {
+            on_pct: onPct,
+            off_pct: offPct,
+            on_saved: onPct,
+            off_saved: offPct,
+            min_pct_exclusive: 0,
+            max_pct_exclusive: 100,
+          },
+          rebase: { replaced: 0, unchanged: 0, failed: 0, skipped: 0, sold: 0, deferred: 0, dry_run: true, orders: [] },
+        };
+      }
       return {
         ok: true,
         message: 'Mock: would submit Schwab callback (no live exchange)',
@@ -524,6 +540,8 @@
   var buyLimitPctEditing = false;
   var buyLimitLocalDraft = false;
   var lastBuyLimitPayload = null;
+  var hardFloorLocalDraft = false;
+  var lastHardFloorPayload = null;
   var filterBuilderState = { criteria: [], catalog: [], debounce: null };
   var ONBOARD_SNOOZE_KEY = 'onboardingGoLiveSnoozeUntil';
 
@@ -727,6 +745,7 @@
         renderSchwabActionCard(schwab, stage);
         renderAccountSetup(data.account_setup || { setup_complete: !!(currentUser && currentUser.is_admin) }, stage, schwab);
         renderBuyLimitCard(data.buy_limit);
+        renderHardFloorCard(data.hard_floors);
         renderAlgorithmControl(data.algorithm_control, stage);
       }
       return schwab;
@@ -1061,6 +1080,72 @@
       buyLimitPctEditing = false;
     }
     updateBuyLimitChrome();
+  }
+
+  function readHardFloorDraft() {
+    var onEl = document.getElementById('hard-floor-on-pct');
+    var offEl = document.getElementById('hard-floor-off-pct');
+    var onRaw = onEl ? String(onEl.value || '').trim() : '';
+    var offRaw = offEl ? String(offEl.value || '').trim() : '';
+    return {
+      on_pct: onRaw === '' ? null : Number(onRaw),
+      off_pct: offRaw === '' ? null : Number(offRaw),
+    };
+  }
+
+  function isHardFloorDirty() {
+    var draft = readHardFloorDraft();
+    var saved = lastHardFloorPayload || {};
+    function num(v) {
+      if (v == null || v === '' || !Number.isFinite(Number(v))) return null;
+      return Number(v);
+    }
+    return num(draft.on_pct) !== num(saved.on_pct)
+      || num(draft.off_pct) !== num(saved.off_pct);
+  }
+
+  function updateHardFloorChrome() {
+    var onEl = document.getElementById('hard-floor-on-pct');
+    var offEl = document.getElementById('hard-floor-off-pct');
+    var onWrap = document.getElementById('hard-floor-on-wrap');
+    var offWrap = document.getElementById('hard-floor-off-wrap');
+    var actions = document.getElementById('hard-floor-actions');
+    var saveBtn = document.getElementById('hard-floor-save-btn');
+    var pill = document.getElementById('hard-floor-status-pill');
+    var dirty = isHardFloorDirty();
+    var saved = lastHardFloorPayload || {};
+    if (onEl) onEl.disabled = isReadOnly();
+    if (offEl) offEl.disabled = isReadOnly();
+    if (onWrap) onWrap.classList.toggle('hard-floor-unsaved', !!dirty && !isReadOnly());
+    if (offWrap) offWrap.classList.toggle('hard-floor-unsaved', !!dirty && !isReadOnly());
+    if (saveBtn) {
+      saveBtn.disabled = isReadOnly() || !dirty;
+      saveBtn.classList.toggle('hard-floor-unsaved', !!dirty && !isReadOnly());
+    }
+    if (actions) actions.hidden = !dirty || isReadOnly();
+    if (pill) {
+      if (saved.on_pct != null && saved.off_pct != null) {
+        pill.textContent = '−' + saved.on_pct + '% / −' + saved.off_pct + '%';
+        pill.className = 'pill ok';
+      } else {
+        pill.textContent = '—';
+        pill.className = 'pill';
+      }
+    }
+  }
+
+  function renderHardFloorCard(hardFloors) {
+    var card = document.getElementById('hard-floor-card');
+    if (!card) return;
+    if (hardFloors) lastHardFloorPayload = hardFloors;
+    var saved = lastHardFloorPayload || {};
+    var onEl = document.getElementById('hard-floor-on-pct');
+    var offEl = document.getElementById('hard-floor-off-pct');
+    if (!hardFloorLocalDraft) {
+      if (onEl && saved.on_pct != null) onEl.value = String(saved.on_pct);
+      if (offEl && saved.off_pct != null) offEl.value = String(saved.off_pct);
+    }
+    updateHardFloorChrome();
   }
 
   function setActionFeedback(id, msg, ok) {
@@ -1560,6 +1645,96 @@
       dismiss.addEventListener('click', function () {
         setOnboardingGoLiveSnooze(4);
         applyOnboardingBanner(lastOnboardingStage);
+      });
+    }
+  })();
+
+  (function wireHardFloors() {
+    var onEl = document.getElementById('hard-floor-on-pct');
+    var offEl = document.getElementById('hard-floor-off-pct');
+    var saveBtn = document.getElementById('hard-floor-save-btn');
+    var cancelBtn = document.getElementById('hard-floor-cancel-btn');
+
+    function markDraft() {
+      hardFloorLocalDraft = true;
+      setActionFeedback('hard-floor-feedback', '');
+      updateHardFloorChrome();
+    }
+    function digitsOnly(el) {
+      if (!el) return;
+      var v = String(el.value || '').replace(/[^\d]/g, '');
+      if (v !== el.value) el.value = v;
+    }
+    if (onEl) {
+      onEl.addEventListener('input', function () {
+        digitsOnly(onEl);
+        markDraft();
+      });
+    }
+    if (offEl) {
+      offEl.addEventListener('input', function () {
+        digitsOnly(offEl);
+        markDraft();
+      });
+    }
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () {
+        hardFloorLocalDraft = false;
+        setActionFeedback('hard-floor-feedback', '');
+        renderHardFloorCard(lastHardFloorPayload || {});
+      });
+    }
+    if (saveBtn) {
+      saveBtn.addEventListener('click', async function () {
+        if (isReadOnly()) return;
+        var draft = readHardFloorDraft();
+        var on = draft.on_pct;
+        var off = draft.off_pct;
+        function badPct(n) {
+          return n == null || !Number.isFinite(n) || n !== Math.floor(n) || n <= 0 || n >= 100;
+        }
+        if (badPct(on) || badPct(off)) {
+          setActionFeedback('hard-floor-feedback', 'Each floor must be a whole number from 1 to 99.', false);
+          return;
+        }
+        if (off > on) {
+          setActionFeedback(
+            'hard-floor-feedback',
+            'Off-watchlist percent must be the same or smaller than the on-watchlist percent.',
+            false
+          );
+          return;
+        }
+        setActionFeedback('hard-floor-feedback', 'Saving…', true);
+        try {
+          var res = await postJson('/api/hard-floors', { on_pct: on, off_pct: off });
+          hardFloorLocalDraft = false;
+          renderHardFloorCard(res.hard_floors || res);
+          var rebase = res.rebase || {};
+          var nRep = Number(rebase.replaced) || 0;
+          var nSold = Number(rebase.sold) || 0;
+          var nFail = Number(rebase.failed) || 0;
+          var floors = res.hard_floors || {};
+          var msg = 'Loss floors saved — ' + floors.on_pct + '% on watchlist, '
+            + floors.off_pct + '% off watchlist, both below purchase cost.';
+          if (nRep > 0) {
+            msg += rebase.dry_run
+              ? (' Dry-run: would replace ' + nRep + ' floor' + (nRep === 1 ? '' : 's') + '.')
+              : (' Replaced ' + nRep + ' resting floor' + (nRep === 1 ? '' : 's') + '.');
+          }
+          if (nSold > 0) {
+            msg += rebase.dry_run
+              ? (' Dry-run: would sell ' + nSold + ' already through the new floor.')
+              : (' Sold ' + nSold + ' already through the new floor.');
+          }
+          if (nFail > 0) {
+            msg += ' ' + nFail + ' could not be replaced (left at the old stop).';
+          }
+          setActionFeedback('hard-floor-feedback', msg, nFail === 0);
+          await refreshSchwabUi();
+        } catch (e) {
+          setActionFeedback('hard-floor-feedback', e.message || 'Save failed', false);
+        }
       });
     }
   })();

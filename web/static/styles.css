@@ -1124,12 +1124,14 @@ table.data .pos-status-muted { color: var(--muted); }
   border: none;
   background: transparent;
 }
-.buy-limit-unsaved {
+.buy-limit-unsaved,
+.hard-floor-unsaved {
   border-color: var(--accent) !important;
   box-shadow: 0 0 0 2px rgba(15, 110, 86, 0.28), 0 0 16px rgba(15, 110, 86, 0.22);
   animation: buy-limit-unsaved-pulse 2.2s ease-in-out infinite;
 }
-#buy-limit-save-btn.buy-limit-unsaved {
+#buy-limit-save-btn.buy-limit-unsaved,
+#hard-floor-save-btn.hard-floor-unsaved {
   border-color: transparent;
   box-shadow: 0 0 0 2px rgba(15, 110, 86, 0.35), 0 0 18px rgba(15, 110, 86, 0.4);
   animation: buy-limit-unsaved-pulse 2.2s ease-in-out infinite;

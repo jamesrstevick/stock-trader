@@ -369,6 +369,24 @@ async def api_buy_limit_post(request: Request):
     return JSONResponse(result, status_code=status)
 
 
+@app.get('/api/hard-floors')
+def api_hard_floors_get(request: Request):
+    with uc.use_user(int(request.state.user['id'])):
+        return st.get_hard_floor_settings()
+
+
+@app.post('/api/hard-floors')
+async def api_hard_floors_post(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    with uc.use_user(int(request.state.user['id'])):
+        result = st.save_hard_floor_settings(body if isinstance(body, dict) else {})
+    status = 200 if result.get('ok') else 400
+    return JSONResponse(result, status_code=status)
+
+
 @app.get('/api/algorithm')
 def api_algorithm_get(request: Request):
     with uc.use_user(int(request.state.user['id'])):

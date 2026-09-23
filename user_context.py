@@ -294,6 +294,14 @@ def _ensure_user_settings_columns(conn: sqlite3.Connection) -> None:
         conn.execute(
             'ALTER TABLE user_settings ADD COLUMN buy_limit_pct INTEGER'
         )
+    if 'hard_stop_on_pct' not in cols:
+        conn.execute(
+            'ALTER TABLE user_settings ADD COLUMN hard_stop_on_pct INTEGER'
+        )
+    if 'hard_stop_off_pct' not in cols:
+        conn.execute(
+            'ALTER TABLE user_settings ADD COLUMN hard_stop_off_pct INTEGER'
+        )
 
 
 def ensure_user_settings(user_id: int, conn: Optional[sqlite3.Connection] = None) -> None:
@@ -758,6 +766,11 @@ def get_user_settings(user_id: int) -> Dict[str, Any]:
             select_cols.append('setup_complete')
         if has_buy_limit:
             select_cols.extend(['buy_limit_enabled', 'buy_limit_pct'])
+        has_hard_floors = (
+            'hard_stop_on_pct' in cols and 'hard_stop_off_pct' in cols
+        )
+        if has_hard_floors:
+            select_cols.extend(['hard_stop_on_pct', 'hard_stop_off_pct'])
         row = conn.execute(
             'SELECT %s FROM user_settings WHERE user_id = ?' % ', '.join(select_cols),
             (user_id,),
@@ -777,6 +790,8 @@ def get_user_settings(user_id: int) -> Dict[str, Any]:
                 'setup_complete': False,
                 'buy_limit_enabled': False,
                 'buy_limit_pct': None,
+                'hard_stop_on_pct': None,
+                'hard_stop_off_pct': None,
             }
         idx = 6
         setup_complete = False
@@ -793,6 +808,22 @@ def get_user_settings(user_id: int) -> Dict[str, Any]:
                     buy_limit_pct = int(buy_limit_pct)
                 except (TypeError, ValueError):
                     buy_limit_pct = None
+            idx += 2
+        hard_stop_on_pct = None
+        hard_stop_off_pct = None
+        if has_hard_floors:
+            hard_stop_on_pct = row[idx]
+            hard_stop_off_pct = row[idx + 1]
+            try:
+                if hard_stop_on_pct is not None:
+                    hard_stop_on_pct = int(hard_stop_on_pct)
+            except (TypeError, ValueError):
+                hard_stop_on_pct = None
+            try:
+                if hard_stop_off_pct is not None:
+                    hard_stop_off_pct = int(hard_stop_off_pct)
+            except (TypeError, ValueError):
+                hard_stop_off_pct = None
         return {
             'active_filter': row[0] or 'safe',
             'trade_dry_run': bool(row[1]),
@@ -803,6 +834,8 @@ def get_user_settings(user_id: int) -> Dict[str, Any]:
             'setup_complete': setup_complete,
             'buy_limit_enabled': buy_limit_enabled,
             'buy_limit_pct': buy_limit_pct,
+            'hard_stop_on_pct': hard_stop_on_pct,
+            'hard_stop_off_pct': hard_stop_off_pct,
         }
     finally:
         conn.close()
@@ -820,6 +853,7 @@ def update_user_settings(user_id: int, **kwargs) -> Dict[str, Any]:
         'active_filter', 'trade_dry_run', 'minimum_cash',
         'minimum_liquidation_value', 'order_amount_dollars', 'setup_complete',
         'buy_limit_enabled', 'buy_limit_pct',
+        'hard_stop_on_pct', 'hard_stop_off_pct',
     }
     sets = []
     vals = []  # type: List[Any]
@@ -829,6 +863,8 @@ def update_user_settings(user_id: int, **kwargs) -> Dict[str, Any]:
         if k in ('trade_dry_run', 'setup_complete', 'buy_limit_enabled'):
             v = 1 if v else 0
         if k == 'buy_limit_pct' and v is not None:
+            v = int(v)
+        if k in ('hard_stop_on_pct', 'hard_stop_off_pct') and v is not None:
             v = int(v)
         sets.append('%s = ?' % k)
         vals.append(v)

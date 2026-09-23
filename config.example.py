@@ -80,7 +80,8 @@ MARKET_CLOSE_MINUTE = 0
 TRAIL_ACTIVATE_PCT = 0.10
 TRAIL_BUFFER_PCT = 0.10
 TRAIL_BUFFER_OFF_WATCHLIST_PCT = 0.07
-# Hard floor vs purchase, set once; one-time tighten if the owned name fails the filter.
+# Default loss floors vs purchase cost until set on Actions.
+# Actions values win; these are only the fallback.
 HARD_STOP_ON_WATCHLIST_PCT = -0.15
 HARD_STOP_OFF_WATCHLIST_PCT = -0.08
 STOP_LIMIT_SLIPPAGE_PCT = 0.005

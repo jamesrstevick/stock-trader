@@ -1931,9 +1931,11 @@ def stop_limit_why_phrase(proposal: Optional[Dict[str, Any]]) -> Optional[str]:
     if not proposal:
         return None
     if proposal.get('floor_widen'):
-        return 'hard floor widened to current rule'
+        return 'hard floor widened vs purchase cost'
     if proposal.get('floor_tighten'):
-        return 'failed the filter, floor tightened'
+        if proposal.get('on_watchlist') is False:
+            return 'failed the filter, floor tightened'
+        return 'hard floor tightened vs purchase cost'
     if proposal.get('trail_active'):
         why = trailing_locked_in_why(proposal.get('stop_gain_pct'))
         if why:
@@ -1984,8 +1986,8 @@ def infer_stop_limit_why(
                 prev = None
         except (TypeError, ValueError):
             prev = None
-    hard_on = float(getattr(config, 'HARD_STOP_ON_WATCHLIST_PCT', -0.15))
-    hard_off = float(getattr(config, 'HARD_STOP_OFF_WATCHLIST_PCT', -0.08))
+    hard_on = hard_stop_on_watchlist_pct()
+    hard_off = hard_stop_off_watchlist_pct()
     on_px = cost * (1.0 + hard_on)
     off_px = cost * (1.0 + hard_off)
     tol = max(0.25, abs(cost) * 0.006)
@@ -6465,6 +6467,144 @@ def buy_limit_orders_enabled() -> bool:
         return False
 
 
+def _loss_pct_points(frac: float) -> int:
+    """Positive whole-number percent below cost (0.15 → 15)."""
+    return int(round(abs(float(frac)) * 100.0))
+
+
+def _stored_loss_pct(key: str, config_attr: str, default_frac: float) -> float:
+    """
+    User setting (positive percent below purchase) as a negative fraction.
+    Blank setting falls back to config.
+    """
+    try:
+        val = uc.get_user_settings(_uid()).get(key)
+        if val is not None:
+            pct = int(val)
+            if 0 < pct < 100:
+                return -float(pct) / 100.0
+    except Exception:
+        pass
+    raw = float(getattr(config, config_attr, default_frac))
+    if raw > 0:
+        raw = -raw
+    if raw >= 0 or raw <= -1:
+        raw = float(default_frac)
+    return raw
+
+
+def hard_stop_on_watchlist_pct() -> float:
+    """On-watchlist hard floor vs purchase cost, as a negative fraction."""
+    return _stored_loss_pct(
+        'hard_stop_on_pct', 'HARD_STOP_ON_WATCHLIST_PCT', -0.15,
+    )
+
+
+def hard_stop_off_watchlist_pct() -> float:
+    """Off-watchlist hard floor vs purchase cost, as a negative fraction."""
+    return _stored_loss_pct(
+        'hard_stop_off_pct', 'HARD_STOP_OFF_WATCHLIST_PCT', -0.08,
+    )
+
+
+def hard_floor_price(purchase: float, on_watchlist: bool) -> float:
+    """Stop trigger at the saved floor percent below purchase cost."""
+    hard = (
+        hard_stop_on_watchlist_pct()
+        if on_watchlist
+        else hard_stop_off_watchlist_pct()
+    )
+    return float(purchase) * (1.0 + hard)
+
+
+def get_hard_floor_settings() -> Dict[str, Any]:
+    """Actions card payload. Percents are below purchase cost, not below the live quote."""
+    on_frac = hard_stop_on_watchlist_pct()
+    off_frac = hard_stop_off_watchlist_pct()
+    try:
+        settings = uc.get_user_settings(_uid())
+    except Exception:
+        settings = {}
+    return {
+        'on_pct': _loss_pct_points(on_frac),
+        'off_pct': _loss_pct_points(off_frac),
+        'on_saved': settings.get('hard_stop_on_pct'),
+        'off_saved': settings.get('hard_stop_off_pct'),
+        'min_pct_exclusive': 0,
+        'max_pct_exclusive': 100,
+    }
+
+
+def _parse_loss_pct(raw: Any) -> Optional[int]:
+    if raw is None or raw == '':
+        return None
+    try:
+        pct = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if pct != int(pct):
+        return None
+    return int(pct)
+
+
+def save_hard_floor_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Save the two loss floors and reprice resting hard-floor stops from purchase cost.
+
+    A name bought at $100 with a 10% floor is stopped at $90. If it now trades at
+    $91 and the floor becomes 15%, the new stop is $85 (15% below cost), not 15%
+    below $91.
+    """
+    on_pct = _parse_loss_pct(payload.get('on_pct', payload.get('hard_stop_on_pct')))
+    off_pct = _parse_loss_pct(payload.get('off_pct', payload.get('hard_stop_off_pct')))
+    if on_pct is None or off_pct is None or on_pct <= 0 or on_pct >= 100 or off_pct <= 0 or off_pct >= 100:
+        return {
+            'ok': False,
+            'error': 'Each floor must be a whole number from 1 to 99.',
+            'hard_floors': get_hard_floor_settings(),
+        }
+    if off_pct > on_pct:
+        return {
+            'ok': False,
+            'error': (
+                'The off-watchlist floor must be the same or tighter '
+                '(a smaller percent below purchase cost).'
+            ),
+            'hard_floors': get_hard_floor_settings(),
+        }
+    try:
+        uc.update_user_settings(
+            _uid(),
+            hard_stop_on_pct=on_pct,
+            hard_stop_off_pct=off_pct,
+        )
+    except Exception as e:
+        return {
+            'ok': False,
+            'error': str(e) or 'Could not save loss floors.',
+            'hard_floors': get_hard_floor_settings(),
+        }
+    rebase = None  # type: Optional[Dict[str, Any]]
+    try:
+        rebase = rebase_working_hard_floors()
+    except Exception as e:
+        print('Warning: could not reprice hard floors: %s' % e)
+        rebase = {
+            'replaced': 0,
+            'unchanged': 0,
+            'failed': 0,
+            'skipped': 0,
+            'sold': 0,
+            'deferred': 0,
+            'error': str(e) or 'reprice failed',
+        }
+    return {
+        'ok': True,
+        'hard_floors': get_hard_floor_settings(),
+        'rebase': rebase,
+    }
+
+
 def buy_limit_discount_pct() -> int:
     """
     Integer percent below market for buy limits (1–99).
@@ -9537,6 +9677,170 @@ def cancel_position_broker_stop(ticker: str) -> bool:
     return ok
 
 
+def rebase_working_hard_floors() -> Dict[str, Any]:
+    """
+    Cancel and replace resting hard-floor stops so each sits at the saved
+    percent below purchase cost. Trails are left alone. Safe to call after hours
+    for a lower stop; a floor already through the live price sells only while
+    the market is open.
+    """
+    result = {
+        'replaced': 0,
+        'unchanged': 0,
+        'failed': 0,
+        'skipped': 0,
+        'sold': 0,
+        'deferred': 0,
+        'dry_run': bool(trade_dry_run_enabled()),
+        'orders': [],
+    }  # type: Dict[str, Any]
+    init_database()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        SELECT ticker, shares_owned, average_price, peak_gain_pct,
+               trail_active, stop_order_price, floor_tightened
+        FROM positions WHERE shares_owned > 0
+        '''
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    open_orders = None  # type: Optional[List[Dict[str, Any]]]
+    if not trade_dry_run_enabled():
+        try:
+            open_orders = get_open_orders() or []
+        except Exception as e:
+            print('Warning: could not list open orders for floor rebase: %s' % e)
+            open_orders = None
+    market_open = bool(is_us_equity_market_open())
+
+    for ticker, shares, avg_price, peak_gain, trail_active, stop_px, floor_tn in rows:
+        shares = int(shares or 0)
+        if shares <= 0:
+            continue
+        if get_algorithm_start() and get_position_book(ticker) != 'algorithm':
+            result['skipped'] += 1
+            continue
+        if bool(trail_active):
+            result['skipped'] += 1
+            result['orders'].append({
+                'ticker': ticker,
+                'action': 'skipped',
+                'reason': 'trail',
+            })
+            continue
+        if avg_price is None or float(avg_price) <= 0:
+            result['failed'] += 1
+            result['orders'].append({
+                'ticker': ticker,
+                'action': 'failed',
+                'reason': 'missing average_price',
+            })
+            continue
+
+        purchase = float(avg_price)
+        on_wl = ticker_on_watchlist(str(ticker))
+        stop_price, new_stop, floor_tighten, floor_widen = _locked_floor_stop(
+            purchase,
+            on_wl,
+            existing_stop_price=stop_px,
+            floor_tightened=bool(floor_tn),
+        )
+        stop_price = round(float(stop_price), 2)
+        peak = float(peak_gain) if peak_gain is not None else 0.0
+        _update_position_trail_state(str(ticker), peak, float(new_stop), False)
+
+        proposal = {
+            'floor_widen': bool(floor_widen),
+            'floor_tighten': bool(floor_tighten),
+            'trail_active': False,
+            'on_watchlist': on_wl,
+            'stop_gain_pct': new_stop,
+            'stop_kind': 'hard',
+            'reason': 'loss floor vs purchase cost',
+        }
+        hold_ok, hold_reason = is_min_hold_met(str(ticker))
+        if not hold_ok:
+            result['deferred'] += 1
+            result['orders'].append({
+                'ticker': ticker,
+                'action': 'deferred',
+                'stop_price': stop_price,
+                'reason': hold_reason,
+            })
+            continue
+
+        price = get_trade_price(str(ticker))
+        if price and float(price) <= float(stop_price):
+            if not market_open:
+                result['deferred'] += 1
+                result['orders'].append({
+                    'ticker': ticker,
+                    'action': 'deferred',
+                    'stop_price': stop_price,
+                    'reason': 'market closed; floor already breached',
+                })
+                continue
+            try:
+                cancelled = cancel_position_broker_stop(str(ticker))
+            except Exception as e:
+                cancelled = False
+                print('Warning: cancel stop before floor sell failed for %s: %s' % (ticker, e))
+            if not cancelled and not trade_dry_run_enabled():
+                result['failed'] += 1
+                result['orders'].append({
+                    'ticker': ticker,
+                    'action': 'failed',
+                    'reason': 'stop still working',
+                })
+                continue
+            exit_info = describe_sell_exit('hard', False)
+            execute_sell(
+                str(ticker),
+                shares,
+                note='hard floor vs purchase cost already breached',
+                exit_kind=exit_info['exit_kind'],
+            )
+            result['sold'] += 1
+            result['orders'].append({
+                'ticker': ticker,
+                'action': 'sold' if not trade_dry_run_enabled() else 'would_sell',
+                'stop_price': stop_price,
+            })
+            continue
+
+        if stop_px is not None and abs(float(stop_px) - stop_price) < 0.05:
+            result['unchanged'] += 1
+            continue
+
+        placed = ensure_broker_stop_limit(
+            str(ticker),
+            shares,
+            stop_price,
+            spot_price=float(price) if price else None,
+            open_orders=open_orders,
+            log_extra=_stop_limit_event_extra(proposal, quantity=shares),
+        )
+        action = str(placed.get('action') or '')
+        if action in ('placed', 'replaced'):
+            result['replaced'] += 1
+        elif action == 'unchanged':
+            result['unchanged'] += 1
+        elif action == 'skipped':
+            result['deferred'] += 1
+        else:
+            result['failed'] += 1
+        result['orders'].append({
+            'ticker': ticker,
+            'action': action or 'failed',
+            'stop_price': placed.get('stop_price') or stop_price,
+            'reason': placed.get('reason'),
+        })
+    return result
+
+
 def execute_buy(ticker: str, quantity: int):
     """Execute buy order. Submits to Schwab only when TRADE_DRY_RUN is False."""
     # Safety check: Verify stock is in watchlist
@@ -12379,19 +12683,6 @@ def enroll_to_algorithm(ticker: str, note: Optional[str] = None) -> None:
     )
 
 
-def _legacy_hard_floor_pcts():
-    # type: () -> Tuple[float, ...]
-    """Prior hard floors (−10% on-list / −5% off-list) before the widen."""
-    return (-0.10, -0.05)
-
-
-def _stop_matches_floor_pct(existing, purchase, pct):
-    # type: (float, float, float) -> bool
-    """True when a resting stop is still the given percent below cost."""
-    gain = (float(existing) / float(purchase)) - 1.0
-    return abs(gain - float(pct)) <= 0.005
-
-
 def _locked_floor_stop(
     purchase,  # type: float
     on_watchlist,  # type: bool
@@ -12400,16 +12691,18 @@ def _locked_floor_stop(
 ):
     # type: (...) -> Tuple[float, float, bool, bool]
     """
-    Hard floor is % below purchase, set once.
+    Hard floor is the saved percent below purchase cost, not below the live quote.
 
-    A resting stop still at the previous floors (−10% / −5%) is moved down
-    to the current floor (−15% on-list / −8% off-list). Other dollar moves
-    are only the one-time off-watchlist tighten.
-    Returns (stop_price, stop_gain_pct, tighten_pending, floor_widen).
+    Bought at $100 with a 10% floor → stop $90. At a $91 quote, changing the
+    floor to 15% moves the stop to $85. Returns
+    (stop_price, stop_gain_pct, tighten_pending, floor_widen).
     """
-    hard_on = float(getattr(config, 'HARD_STOP_ON_WATCHLIST_PCT', -0.15))
-    hard_off = float(getattr(config, 'HARD_STOP_OFF_WATCHLIST_PCT', -0.08))
-    hard = hard_off if not on_watchlist else hard_on
+    del floor_tightened  # floor follows the current on/off setting vs cost
+    hard = (
+        hard_stop_off_watchlist_pct()
+        if not on_watchlist
+        else hard_stop_on_watchlist_pct()
+    )
     desired_px = float(purchase) * (1.0 + hard)
     existing = None  # type: Optional[float]
     if existing_stop_price is not None:
@@ -12421,22 +12714,12 @@ def _locked_floor_stop(
             existing = None
     if existing is None:
         return desired_px, hard, (not on_watchlist), False
-    for old_pct in _legacy_hard_floor_pcts():
-        if _stop_matches_floor_pct(existing, purchase, old_pct):
-            # Only lower the stop. A legacy −10% that is already under the
-            # current off-list floor stays put (do not tighten it up).
-            if desired_px + 0.009 < existing:
-                return desired_px, hard, False, True
-            break
-    if (not on_watchlist) and (not floor_tightened):
-        on_px = float(purchase) * (1.0 + hard_on)
-        off_px = desired_px
-        # Only jump from the loose on-list floor. A stop that already drifted
-        # toward price (the old recompute bug) is frozen, not chased further.
-        if existing + 0.009 < ((on_px + off_px) / 2.0):
-            return off_px, hard, True, False
-    gain = (existing / float(purchase)) - 1.0
-    return existing, gain, False, False
+    if abs(existing - desired_px) < 0.05:
+        gain = (existing / float(purchase)) - 1.0
+        return existing, gain, False, False
+    widen = desired_px + 0.009 < existing
+    tighten = existing + 0.009 < desired_px
+    return desired_px, hard, bool(tighten), bool(widen)
 
 
 def compute_trail_state_for_position(
@@ -12452,17 +12735,16 @@ def compute_trail_state_for_position(
     """
     Same trail/hard-stop math as propose_sells (bring a name 'up to speed').
 
-    Floor (pre-trail) is locked at first place vs purchase. A stop still at
-    the old −10%/−5% floors is lowered to the current rule. Trail still
-    follows peak − buffer. Off-watchlist may raise the floor once.
+    Floor (pre-trail) is the saved percent below purchase cost. Trail still
+    follows peak − buffer. Off-watchlist uses the tighter saved floor.
 
     Returns peak/stop/kind without writing proposals. Caller may persist.
     """
     activate = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10))
     buffer_on = float(getattr(config, 'TRAIL_BUFFER_PCT', 0.10))
     buffer_off = float(getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.07))
-    hard_on = float(getattr(config, 'HARD_STOP_ON_WATCHLIST_PCT', -0.15))
-    hard_off = float(getattr(config, 'HARD_STOP_OFF_WATCHLIST_PCT', -0.08))
+    hard_on = hard_stop_on_watchlist_pct()
+    hard_off = hard_stop_off_watchlist_pct()
 
     gain = (price - purchase) / purchase
     peak = float(peak_gain) if peak_gain is not None else gain
@@ -14743,10 +15025,9 @@ def propose_sells() -> List[Dict[str, Any]]:
     - defer_stop_limit: would place stop but same ET purchase day (PDT) — wait until next day
     - skip_sell: would sell but min-hold blocks
     Trail: peak +10% activate, 10% buffer on-list / 7% off-list (stop = peak − buffer).
-    Hard stop: locked % below purchase (−15% on-list / −8% off-list). A resting
-    stop still at the old −10% / −5% floors is lowered once to the current rule.
-    Otherwise the floor stays put until trail, except a one-time tighten if the
-    name fails the filter.
+    Hard stop: saved percent below purchase cost (on-list / off-list). Changing
+    either percent cancels and replaces the resting floor from that cost.
+    Trail still follows peak − buffer.
     """
     init_database()
     conn = get_connection()
@@ -14908,8 +15189,7 @@ def propose_sells() -> List[Dict[str, Any]]:
             if floor_widen:
                 reason = (
                     f'widen floor stop-limit @ ${stop_price:.2f} '
-                    f'({float(new_stop)*100:.1f}% vs cost); '
-                    f'replace legacy −10%/−5% hard floor with current rule'
+                    f'({float(new_stop)*100:.1f}% vs purchase cost)'
                 )
             elif floor_tighten:
                 reason = (
@@ -15861,8 +16141,8 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
     trail_act = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10)) * 100.0
     trail_buf = float(getattr(config, 'TRAIL_BUFFER_PCT', 0.10)) * 100.0
     trail_off = float(getattr(config, 'TRAIL_BUFFER_OFF_WATCHLIST_PCT', 0.07)) * 100.0
-    hard_on = abs(float(getattr(config, 'HARD_STOP_ON_WATCHLIST_PCT', -0.15))) * 100.0
-    hard_off = abs(float(getattr(config, 'HARD_STOP_OFF_WATCHLIST_PCT', -0.08))) * 100.0
+    hard_on = abs(hard_stop_on_watchlist_pct()) * 100.0
+    hard_off = abs(hard_stop_off_watchlist_pct()) * 100.0
     slip = float(getattr(config, 'STOP_LIMIT_SLIPPAGE_PCT', 0.005)) * 100.0
     sell_mins = int(getattr(config, 'SELL_CHECK_INTERVAL_MINUTES', 15))
     open_h = int(getattr(config, 'MARKET_OPEN_HOUR', 9))
@@ -15965,8 +16245,9 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
             'title': 'Hard stop vs cost',
             'set_to': '−%.0f%% on watchlist · −%.0f%% once off' % (hard_on, hard_off),
             'why': (
-                'Set once at a percent below purchase; does not move until trail '
-                'arms, except a one-time tighten if the name fails the filter'
+                'Percent below purchase cost, from Actions. Changing it reprices '
+                'resting floors from that cost, not from the live quote. Tighter '
+                'once the name fails the filter. Trail replaces the floor after it arms.'
             ),
         },
         {
@@ -16143,6 +16424,7 @@ def get_dashboard_status() -> Dict[str, Any]:
         'account_setup': setup,
         'algorithm_control': algo_ctl,
         'buy_limit': get_buy_limit_settings(),
+        'hard_floors': get_hard_floor_settings(),
         'onboarding_stage': stage,
         'actions_attention': needs_attention,
         'user': {

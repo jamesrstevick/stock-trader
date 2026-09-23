@@ -135,7 +135,7 @@
               </p>
               <ul>
                 <li><strong>Trailing stop</strong> — once a position is up enough from cost, the stop follows the peak down by a buffer; it only ratchets up, never down.</li>
-                <li><strong>Hard stop</strong> — a set floor at a percent below purchase so the name has room to move. It stays put until trail arms at +10%.</li>
+                <li><strong>Hard stop</strong> — a floor at a percent below the purchase price (set on Actions). Changing that percent reprices the resting stop from the purchase price. It gives way to the trail once the position is up 10%.</li>
                 <li><strong>Tighter off-watchlist</strong> — if an owned name later fails the filter, that floor (and the trail buffer) tighten once toward price.</li>
               </ul>
             </li>
@@ -473,6 +473,56 @@
             <button type="button" class="btn-ghost" id="buy-limit-cancel-btn">Cancel</button>
           </div>
           <p class="action-feedback" id="buy-limit-feedback" hidden></p>
+        </article>
+
+        <article class="action-card" id="hard-floor-card">
+          <div class="action-card-head">
+            <h2>Loss floors</h2>
+            <span class="pill" id="hard-floor-status-pill">—</span>
+          </div>
+          <p class="action-card-desc">
+            Percent below the purchase price, not below today’s quote.
+            A stock bought at $100 with a 10% floor is stopped at $90.
+            If it is now $91 and you change the floor to 15%, the new stop is $85.
+            Saving cancels the resting floor and replaces it. Trails are left alone.
+          </p>
+          <div class="setup-fields">
+            <label class="action-field">
+              <span class="action-field-label">
+                <span class="action-field-title">
+                  <span class="action-field-name">On watchlist %</span>
+                  <span class="info-tip" tabindex="0" aria-label="Whole number from 1 to 99. The stop sits this percent below what you paid while the name still passes the filter.">
+                    <span class="info-tip-mark" aria-hidden="true">i</span>
+                    <span class="info-tip-text">Whole number from 1 to 99. The stop sits this percent below what you paid while the name still passes the filter.</span>
+                  </span>
+                </span>
+              </span>
+              <span class="setup-input-wrap" id="hard-floor-on-wrap">
+                <input type="number" id="hard-floor-on-pct" min="1" max="99" step="1" />
+              </span>
+              <span class="field-hint">Below purchase cost</span>
+            </label>
+            <label class="action-field">
+              <span class="action-field-label">
+                <span class="action-field-title">
+                  <span class="action-field-name">Off watchlist %</span>
+                  <span class="info-tip" tabindex="0" aria-label="Tighter floor once the name fails the filter. Must be the same or a smaller percent than the on-watchlist floor.">
+                    <span class="info-tip-mark" aria-hidden="true">i</span>
+                    <span class="info-tip-text">Tighter floor once the name fails the filter. Must be the same or a smaller percent than the on-watchlist floor.</span>
+                  </span>
+                </span>
+              </span>
+              <span class="setup-input-wrap" id="hard-floor-off-wrap">
+                <input type="number" id="hard-floor-off-pct" min="1" max="99" step="1" />
+              </span>
+              <span class="field-hint">Tighter, still below purchase cost</span>
+            </label>
+          </div>
+          <div class="action-row" id="hard-floor-actions" hidden>
+            <button type="button" class="btn-primary" id="hard-floor-save-btn">Save</button>
+            <button type="button" class="btn-ghost" id="hard-floor-cancel-btn">Cancel</button>
+          </div>
+          <p class="action-feedback" id="hard-floor-feedback" hidden></p>
         </article>
 
         <article class="action-card" id="algorithm-control-card">
