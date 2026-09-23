@@ -6585,23 +6585,14 @@ def save_hard_floor_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
             'hard_floors': get_hard_floor_settings(),
         }
     rebase = None  # type: Optional[Dict[str, Any]]
-    try:
-        rebase = rebase_working_hard_floors()
-    except Exception as e:
-        print('Warning: could not reprice hard floors: %s' % e)
-        rebase = {
-            'replaced': 0,
-            'unchanged': 0,
-            'failed': 0,
-            'skipped': 0,
-            'sold': 0,
-            'deferred': 0,
-            'error': str(e) or 'reprice failed',
-        }
+    # Do not replace every Schwab stop inside the web request. Cloudflare
+    # returns 524 after about 100s, which looks like a failed save even
+    # after the settings are already stored.
+    _start_hard_floor_rebase(_uid())
     return {
         'ok': True,
         'hard_floors': get_hard_floor_settings(),
-        'rebase': rebase,
+        'rebase': {'started': True},
     }
 
 
@@ -9675,6 +9666,57 @@ def cancel_position_broker_stop(ticker: str) -> bool:
         return False
     clear_position_stop_order(ticker)
     return ok
+
+
+_hard_floor_rebase_guard = threading.Lock()
+_hard_floor_rebase_users = set()  # type: set
+
+
+def _start_hard_floor_rebase(user_id: int) -> None:
+    """Reprice resting floors on a background thread so the web save can return."""
+    uid = int(user_id)
+
+    def _run():
+        try:
+            with uc.use_user(uid):
+                try:
+                    maybe_reinit_schwab_client()
+                except Exception as e:
+                    print('Warning: Schwab init before floor rebase: %s' % e)
+                result = rebase_working_hard_floors()
+                log_event(
+                    'task',
+                    'Loss floors repriced vs purchase cost: replaced=%s unchanged=%s '
+                    'sold=%s failed=%s deferred=%s'
+                    % (
+                        result.get('replaced'),
+                        result.get('unchanged'),
+                        result.get('sold'),
+                        result.get('failed'),
+                        result.get('deferred'),
+                    ),
+                    detail=result,
+                )
+        except Exception as e:
+            print('Warning: hard floor rebase failed: %s' % e)
+            try:
+                with uc.use_user(uid):
+                    log_event(
+                        'task',
+                        'Loss floor reprice failed: %s' % e,
+                        level='error',
+                    )
+            except Exception:
+                pass
+        finally:
+            with _hard_floor_rebase_guard:
+                _hard_floor_rebase_users.discard(uid)
+
+    with _hard_floor_rebase_guard:
+        if uid in _hard_floor_rebase_users:
+            return
+        _hard_floor_rebase_users.add(uid)
+    threading.Thread(target=_run, name='hard-floor-rebase', daemon=True).start()
 
 
 def rebase_working_hard_floors() -> Dict[str, Any]:

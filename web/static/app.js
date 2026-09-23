@@ -1717,6 +1717,9 @@
           var floors = res.hard_floors || {};
           var msg = 'Loss floors saved — ' + floors.on_pct + '% on watchlist, '
             + floors.off_pct + '% off watchlist, both below purchase cost.';
+          if (rebase.started) {
+            msg += ' Resting stops are being replaced at Schwab from the purchase price. Refresh the log in a minute for the counts.';
+          }
           if (nRep > 0) {
             msg += rebase.dry_run
               ? (' Dry-run: would replace ' + nRep + ' floor' + (nRep === 1 ? '' : 's') + '.')
