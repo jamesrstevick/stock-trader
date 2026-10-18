@@ -114,6 +114,38 @@
           rebase: { replaced: 0, unchanged: 0, failed: 0, skipped: 0, sold: 0, deferred: 0, dry_run: true, orders: [] },
         };
       }
+      if (path.indexOf('/api/account-audit') === 0) {
+        return {
+          ok: false,
+          report: {
+            ok: false,
+            status: 'fail',
+            ts: '2026-10-18T09:00:00',
+            counts: { fail: 1, warn: 1, info: 0, ok: 6 },
+            owned_count: 12,
+            findings: [
+              {
+                id: 'untagged_holdings',
+                severity: 'fail',
+                title: 'Holdings are not enrolled (sell rules skip them)',
+                detail: 'Manual buys/transfers stay untagged until enrolled.',
+                tickers: ['TTWO'],
+              },
+              {
+                id: 'hard_floors_default',
+                severity: 'warn',
+                title: 'Loss floors are using config defaults (not saved on Actions)',
+                detail: 'on=10% off=5%',
+              },
+              {
+                id: 'setup_complete',
+                severity: 'ok',
+                title: 'Account setup is marked complete',
+              },
+            ],
+          },
+        };
+      }
       return {
         ok: true,
         message: 'Mock: would submit Schwab callback (no live exchange)',
@@ -747,6 +779,7 @@
         renderBuyLimitCard(data.buy_limit);
         renderHardFloorCard(data.hard_floors);
         renderAlgorithmControl(data.algorithm_control, stage);
+        renderAccountAuditCard(data.account_audit);
       }
       return schwab;
     } catch (e) {
@@ -1346,6 +1379,99 @@
 
   function escapeAttr(s) {
     return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  }
+
+  function auditIssueFindings(report) {
+    var out = [];
+    ((report && report.findings) || []).forEach(function (f) {
+      if (!f) return;
+      if (f.severity === 'fail' || f.severity === 'warn') out.push(f);
+    });
+    return out;
+  }
+
+  function renderAccountAuditCard(report) {
+    var card = document.getElementById('account-audit-card');
+    var pill = document.getElementById('account-audit-pill');
+    var desc = document.getElementById('account-audit-desc');
+    var summary = document.getElementById('account-audit-summary');
+    var details = document.getElementById('account-audit-findings');
+    var detailsSum = document.getElementById('account-audit-findings-summary');
+    var list = document.getElementById('account-audit-findings-list');
+    var runBtn = document.getElementById('account-audit-run-btn');
+    if (!card || !pill) return;
+    if (runBtn) runBtn.disabled = isReadOnly();
+
+    if (!report) {
+      pill.textContent = 'Not run yet';
+      pill.className = 'pill warn';
+      if (summary) {
+        summary.hidden = true;
+        summary.textContent = '';
+      }
+      if (details) details.hidden = true;
+      if (list) list.innerHTML = '';
+      if (desc) {
+        desc.textContent =
+          'Weekly check of settings and holdings (books, stops, history). ' +
+          'Also runs on a schedule; use Run now anytime. A one-line summary goes to Events → Tasks.';
+      }
+      return;
+    }
+
+    var status = String(report.status || (report.ok ? 'pass' : 'fail'));
+    pill.className = 'pill';
+    if (status === 'pass') {
+      pill.textContent = 'Pass';
+      pill.classList.add('ok');
+    } else if (status === 'warn') {
+      pill.textContent = 'Warn';
+      pill.classList.add('warn');
+    } else {
+      pill.textContent = 'Fail';
+      pill.classList.add('bad');
+    }
+
+    var counts = report.counts || {};
+    var when = report.ts ? String(report.ts).replace('T', ' ').slice(0, 19) : '—';
+    if (summary) {
+      summary.hidden = false;
+      summary.textContent =
+        'Last run ' + when +
+        ' · fail ' + (counts.fail != null ? counts.fail : 0) +
+        ' · warn ' + (counts.warn != null ? counts.warn : 0) +
+        ' · ok ' + (counts.ok != null ? counts.ok : 0) +
+        (report.owned_count != null ? (' · ' + report.owned_count + ' holdings') : '');
+    }
+
+    var issues = auditIssueFindings(report);
+    if (details && list && detailsSum) {
+      if (!issues.length) {
+        details.hidden = true;
+        list.innerHTML = '';
+      } else {
+        details.hidden = false;
+        details.open = status === 'fail' || status === 'warn';
+        detailsSum.textContent =
+          issues.length + ' issue' + (issues.length === 1 ? '' : 's') +
+          ' (fail / warn)';
+        list.innerHTML = issues.map(function (f) {
+          var tick = (f.tickers || []).slice(0, 12).join(', ');
+          if (f.tickers && f.tickers.length > 12) {
+            tick += '… +' + (f.tickers.length - 12);
+          }
+          var extra = f.detail
+            ? '<span class="audit-finding-detail">' + escapeHtml(f.detail) +
+              (tick ? (' · ' + escapeHtml(tick)) : '') + '</span>'
+            : (tick
+              ? '<span class="audit-finding-detail">' + escapeHtml(tick) + '</span>'
+              : '');
+          return '<li><span class="audit-sev ' + escapeHtml(f.severity) + '">' +
+            escapeHtml(f.severity) + '</span>' +
+            escapeHtml(f.title || f.id || 'Finding') + extra + '</li>';
+        }).join('');
+      }
+    }
   }
 
   async function loadActions() {
@@ -1985,6 +2111,39 @@
       });
     }
 
+    var auditRun = document.getElementById('account-audit-run-btn');
+    if (auditRun) {
+      auditRun.addEventListener('click', async function () {
+        if (isReadOnly()) return;
+        setActionFeedback('account-audit-feedback', 'Running audit…', true);
+        auditRun.disabled = true;
+        try {
+          var res = await postJson('/api/account-audit', {});
+          var report = (res && res.report) || res;
+          renderAccountAuditCard(report);
+          var st = String((report && report.status) || '');
+          var counts = (report && report.counts) || {};
+          setActionFeedback(
+            'account-audit-feedback',
+            'Audit ' + (st || 'done') +
+              ' — fail ' + (counts.fail != null ? counts.fail : 0) +
+              ', warn ' + (counts.warn != null ? counts.warn : 0) +
+              '. Summary written to Events → Tasks.',
+            st === 'pass' || st === 'warn'
+          );
+          await refreshSchwabUi();
+        } catch (e) {
+          setActionFeedback(
+            'account-audit-feedback',
+            e.message || 'Audit failed',
+            false
+          );
+        } finally {
+          auditRun.disabled = isReadOnly();
+        }
+      });
+    }
+
     if (filterAdd) {
       filterAdd.addEventListener('click', function () {
         if (filterBuilderState.criteria.length >= 15) {
@@ -2430,6 +2589,35 @@
     });
   }
 
+  function positionLockedPl(p) {
+    if (!p || p.status !== 'trail') return null;
+    if (p.locked_pl != null && p.locked_pl !== '') {
+      var fromApi = Number(p.locked_pl);
+      if (!isNaN(fromApi)) return fromApi;
+    }
+    var shares = Number(p.shares_owned);
+    var cost = Number(p.cost_basis);
+    if (!(shares > 0) || isNaN(cost)) return null;
+    var limit = Number(p.stop_limit_price);
+    if (!(limit > 0)) {
+      var stop = Number(p.stop_display_price != null ? p.stop_display_price : p.stop_order_price);
+      if (!(stop > 0)) return null;
+      // Match STOP_LIMIT_SLIPPAGE_PCT default (0.5%) when broker limit is missing
+      limit = Math.min(stop * 0.995, stop - 0.01);
+      if (!(limit > 0)) return null;
+    }
+    return (limit * shares) - cost;
+  }
+
+  function formatPositionTicker(p) {
+    var t = escapeHtml(p.ticker || '');
+    var locked = positionLockedPl(p);
+    if (locked == null || isNaN(locked)) return t;
+    return '<span class="pos-ticker-cell">' + t +
+      ' <span class="pill ok pos-locked-pill" title="Locked-in P/L if the resting stop-limit fills at its limit (limit × shares − cost)">' +
+      escapeHtml(moneyPl(locked)) + '</span></span>';
+  }
+
   function renderPositionsTable() {
     var tbody = document.querySelector('#positions-table tbody');
     if (!tbody) return;
@@ -2455,7 +2643,7 @@
       var daysText = (days === null || days === undefined || days === '') ? '—' : String(days);
       var tr = document.createElement('tr');
       tr.innerHTML =
-        '<td>' + escapeHtml(p.ticker || '') + '</td>' +
+        '<td>' + formatPositionTicker(p) + '</td>' +
         '<td class="num">' + escapeHtml(daysText) + '</td>' +
         '<td class="num">' + (p.shares_owned != null ? p.shares_owned : '—') + '</td>' +
         '<td class="num">' + money(p.market_value) + '</td>' +
@@ -3014,18 +3202,18 @@
     }
   }
 
-  // Viewer tags. Activity (Buy/Sell/Watchlist) is the default view; Tasks is ops noise.
+  // Viewer tags. Buy/Sell is the default view; Watchlist + Tasks are opt-in.
   // Resting STOP_LIMIT sells show under Sell as "STOP-LIMIT SELL"; LIMIT buys under Buy as "LIMIT BUY".
   var LOG_CATEGORIES = [
     { id: 'buy', label: 'Buy', meaning: 'Market fills (BUY) and resting buy limits (LIMIT BUY).' },
     { id: 'sell', label: 'Sell', meaning: 'Market fills (SELL) and protective stop-limits (STOP-LIMIT SELL).' },
     { id: 'watchlist', label: 'Watchlist', meaning: 'Watchlist refresh from the filter (adds/removes).' },
-    { id: 'task', label: 'Tasks', meaning: 'Scheduler noise: task start/finish, Yahoo batches, Schwab sync, account snapshots.' }
+    { id: 'task', label: 'Tasks', meaning: 'Scheduler jobs, Schwab sync, Yahoo batches, and weekly account audits.' }
   ];
 
   var LOG_PAGE_SIZE = 50;
-  // Default: activity only (not Tasks)
-  var logFilterSelected = { buy: true, sell: true, watchlist: true };
+  // Default: buys and sells only (turn on Watchlist / Tasks for the rest)
+  var logFilterSelected = { buy: true, sell: true };
   var logEventsCache = [];
   var logHasMore = false;
   var logLoadingMore = false;
@@ -3090,6 +3278,11 @@
       }
       if (m.indexOf('BOUGHT') >= 0 || m.indexOf('BUY') >= 0) return 'BUY';
       return 'BUY';
+    }
+    if (cat === 'task') {
+      if ((d && d.kind === 'account_audit') || m.indexOf('ACCOUNT AUDIT') >= 0) {
+        return 'AUDIT';
+      }
     }
     return logCategoryLabel(cat);
   }
@@ -3188,11 +3381,39 @@
     if (why) {
       whyHtml = ' <span class="log-why">— ' + escapeHtml(why) + '</span>';
     }
+    var body;
     var m = msg.match(/^(.*?)(\s*)(\([+\-] \$[0-9,]+\.\d{2}(?: \| [0-9.]+%)?\))$/);
-    if (!m) return escapeHtml(msg) + whyHtml + movesHtml;
-    var tone = m[3].indexOf('(-') === 0 ? 'neg' : 'pos';
-    // Keep a space between price and the P/L parenthetical
-    return escapeHtml(m[1]) + ' <span class="pl ' + tone + '">' + escapeHtml(m[3]) + '</span>' + whyHtml + movesHtml;
+    if (!m) {
+      body = escapeHtml(msg) + whyHtml + movesHtml;
+    } else {
+      var tone = m[3].indexOf('(-') === 0 ? 'neg' : 'pos';
+      // Keep a space between price and the P/L parenthetical
+      body = escapeHtml(m[1]) + ' <span class="pl ' + tone + '">' +
+        escapeHtml(m[3]) + '</span>' + whyHtml + movesHtml;
+    }
+    var d = (ev && ev.detail) || {};
+    var brief = d.findings_brief;
+    if (
+      (d.kind === 'account_audit' || String(msg).toUpperCase().indexOf('ACCOUNT AUDIT') >= 0) &&
+      Array.isArray(brief) && brief.length
+    ) {
+      var items = brief.map(function (f) {
+        var tick = (f.tickers || []).join(', ');
+        if (f.tickers_more) tick += (tick ? '… +' : '+') + f.tickers_more;
+        return '<li><span class="audit-sev ' + escapeHtml(f.severity || '') + '">' +
+          escapeHtml(f.severity || '') + '</span>' +
+          escapeHtml(f.title || '') +
+          (tick ? (' <span class="log-why">(' + escapeHtml(tick) + ')</span>') : '') +
+          '</li>';
+      }).join('');
+      body +=
+        '<details class="event-audit-details">' +
+          '<summary>Show ' + brief.length + ' issue' +
+            (brief.length === 1 ? '' : 's') + '</summary>' +
+          '<ul>' + items + '</ul>' +
+        '</details>';
+    }
+    return body;
   }
 
   function stopEventMeta(ev) {

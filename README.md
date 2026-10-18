@@ -12,6 +12,8 @@ On your home machine (or Pi), `python main.py --loop` wakes on a schedule:
 
 A separate FastAPI dashboard (`python web_app.py`) uses **in-app login** (username/password, ~30-day session). Each user has their own Schwab link, filter, watchlist, positions, and log. Yahoo fundamentals are shared. Live data comes from the local API, or mock fixtures with `?mock=1`.
 
+Once a week (also on demand via `python main.py --account-audit`), each account gets an **integrity audit**: settings completeness (Schwab, floors, buy size, filter, dry-run/live) plus holdings vs book tags / trade history / missing stops. Report-only — it does not auto-enroll or place orders.
+
 ## Trading rules (high level)
 
 1. **Dry-run by default** — `TRADE_DRY_RUN = True` logs what would happen; no Schwab orders until you flip it.

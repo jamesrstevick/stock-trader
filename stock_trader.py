@@ -3836,6 +3836,7 @@ JOB_REFRESH_MARKET_DATA = 'refresh_market_data'
 JOB_WATCHLIST_AND_BUYS = 'watchlist_and_buys'
 JOB_SELL_CHECK = 'sell_check'
 JOB_SCHWAB_SYNC = 'schwab_sync'
+JOB_ACCOUNT_AUDIT = 'account_audit'
 
 # Short console / Next Tasks labels
 _JOB_DISPLAY_NAMES = {
@@ -3843,6 +3844,7 @@ _JOB_DISPLAY_NAMES = {
     'schwab_sync': 'Schwab sync',
     'watchlist_and_buys': 'Watchlist & buys',
     'sell_check': 'Sell check',
+    'account_audit': 'Account audit',
 }
 
 # Relative-quiet status lines (what the loop is doing)
@@ -3851,6 +3853,7 @@ _JOB_STATUS_PHRASES = {
     'schwab_sync': 'Updating Schwab',
     'watchlist_and_buys': 'Updating watchlist & buys',
     'sell_check': 'Running sell check',
+    'account_audit': 'Running account audit',
 }
 
 # Only these jobs require the US cash equity regular session.
@@ -3873,6 +3876,7 @@ JOB_RETRY_BACKOFF_SECONDS = {
     JOB_SCHWAB_SYNC: 45,
     JOB_SELL_CHECK: 150,
     JOB_WATCHLIST_AND_BUYS: 210,
+    JOB_ACCOUNT_AUDIT: 300,
 }
 
 # Rank matches by analyst upside; missing prices sort last under DESC.
@@ -4182,7 +4186,8 @@ def defer_failed_job(job_name: str, interval_days: float) -> float:
     # Prefer unscoped name for lookup
     bare = base
     for known in (
-        JOB_SCHWAB_SYNC, JOB_SELL_CHECK, JOB_WATCHLIST_AND_BUYS, JOB_REFRESH_MARKET_DATA,
+        JOB_SCHWAB_SYNC, JOB_SELL_CHECK, JOB_WATCHLIST_AND_BUYS,
+        JOB_ACCOUNT_AUDIT, JOB_REFRESH_MARKET_DATA,
     ):
         if job_name.endswith(known) or job_name == known:
             bare = known
@@ -4345,6 +4350,12 @@ def _watchlist_job_interval_days() -> float:
     return float(getattr(config, 'WATCHLIST_JOB_INTERVAL_DAYS', 1))
 
 
+def _account_audit_interval_days() -> float:
+    """Weekly account integrity + settings audit cadence."""
+    days = float(getattr(config, 'ACCOUNT_AUDIT_INTERVAL_DAYS', 7))
+    return max(days, 1.0 / 24.0)
+
+
 def get_scheduled_jobs() -> List[Tuple[str, Any, float]]:
     """
     Ordered job list for run_trader / dry_run_system.
@@ -4357,6 +4368,7 @@ def get_scheduled_jobs() -> List[Tuple[str, Any, float]]:
         (JOB_WATCHLIST_AND_BUYS, run_watchlist_and_buys_job,
          _watchlist_job_interval_days()),
         (JOB_SELL_CHECK, run_sell_check_job, _sell_check_interval_days()),
+        (JOB_ACCOUNT_AUDIT, run_account_audit_job, _account_audit_interval_days()),
     ]
 
 
@@ -13548,6 +13560,649 @@ def _retract_false_sold_events_for_ticker(ticker: str) -> int:
     return apply_event_reality_repairs(sold)
 
 
+def _audit_finding(
+    finding_id: str,
+    severity: str,
+    title: str,
+    detail: str = '',
+    tickers: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    row = {
+        'id': finding_id,
+        'severity': severity,
+        'title': title,
+        'detail': detail or '',
+    }  # type: Dict[str, Any]
+    if tickers:
+        row['tickers'] = list(tickers)
+    return row
+
+
+def _audit_overall_status(findings: List[Dict[str, Any]]) -> str:
+    sevs = {str(f.get('severity') or '') for f in findings}
+    if 'fail' in sevs:
+        return 'fail'
+    if 'warn' in sevs:
+        return 'warn'
+    return 'pass'
+
+
+def run_account_integrity_audit(
+    sync_positions: bool = True,
+) -> Dict[str, Any]:
+    """
+    Weekly-style account audit: settings completeness + books/history integrity.
+
+    Report-only (no auto-enroll / no order placement). Schwab sync is optional
+    so holdings match the broker before checks.
+    """
+    init_database()
+    ts = datetime.now().isoformat(timespec='seconds')
+    uid = _uid()
+    uname = None  # type: Optional[str]
+    try:
+        user = uc.get_user_by_id(uid) or {}
+        uname = user.get('username')
+    except Exception:
+        uname = None
+    findings = []  # type: List[Dict[str, Any]]
+
+    # --- Optional position sync (broker truth for holdings) ---
+    sync_info = {'attempted': False, 'ok': None, 'reason': None}  # type: Dict[str, Any]
+    if sync_positions:
+        sync_info['attempted'] = True
+        try:
+            maybe_reinit_schwab_client()
+        except Exception as e:
+            sync_info['ok'] = False
+            sync_info['reason'] = 'schwab_reinit: %s' % e
+        if sync_info.get('ok') is not False:
+            if not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
+                sync_info['ok'] = False
+                sync_info['reason'] = 'schwab_unavailable'
+                findings.append(_audit_finding(
+                    'schwab_sync_skipped',
+                    'warn',
+                    'Could not sync positions from Schwab',
+                    'Audit used local holdings only.',
+                ))
+            else:
+                try:
+                    sync = refresh_schwab_positions_if_needed(force=True)
+                    sync_info['ok'] = bool(sync.get('ok'))
+                    sync_info['reason'] = sync.get('reason')
+                    if not sync.get('ok'):
+                        findings.append(_audit_finding(
+                            'schwab_sync_failed',
+                            'warn',
+                            'Schwab position sync failed',
+                            str(sync.get('reason') or 'unknown'),
+                        ))
+                except Exception as e:
+                    sync_info['ok'] = False
+                    sync_info['reason'] = str(e)
+                    findings.append(_audit_finding(
+                        'schwab_sync_failed',
+                        'warn',
+                        'Schwab position sync failed',
+                        str(e),
+                    ))
+
+    # --- Settings / onboarding ---
+    try:
+        settings = uc.get_user_settings(uid)
+    except Exception as e:
+        settings = {}
+        findings.append(_audit_finding(
+            'settings_unreadable',
+            'fail',
+            'Could not read user settings',
+            str(e),
+        ))
+    try:
+        auth = get_schwab_auth_status()
+    except Exception as e:
+        auth = {}
+        findings.append(_audit_finding(
+            'schwab_auth_unreadable',
+            'warn',
+            'Could not read Schwab auth status',
+            str(e),
+        ))
+
+    schwab_state = auth.get('state')
+    if schwab_state in ('connected', 'expiring'):
+        if auth.get('warn') or schwab_state == 'expiring':
+            findings.append(_audit_finding(
+                'schwab_auth_expiring',
+                'warn',
+                'Schwab login is expiring soon',
+                'Reconnect under Actions before the refresh token dies.',
+            ))
+        else:
+            findings.append(_audit_finding(
+                'schwab_linked',
+                'ok',
+                'Schwab is linked',
+                'state=%s' % schwab_state,
+            ))
+    else:
+        findings.append(_audit_finding(
+            'schwab_not_linked',
+            'fail',
+            'Schwab is not linked (or needs login)',
+            'state=%s' % (schwab_state or 'unknown'),
+        ))
+
+    setup_done = bool(settings.get('setup_complete')) or user_is_admin(uid)
+    if setup_done:
+        findings.append(_audit_finding(
+            'setup_complete', 'ok', 'Account setup is marked complete',
+        ))
+    else:
+        findings.append(_audit_finding(
+            'setup_incomplete',
+            'fail',
+            'Account setup is incomplete',
+            'Finish Actions → Account setup (floors + buy size).',
+        ))
+
+    for key, label in (
+        ('minimum_cash', 'Cash floor'),
+        ('minimum_liquidation_value', 'Account-value floor'),
+        ('order_amount_dollars', 'Buy size'),
+    ):
+        if settings.get(key) is None:
+            findings.append(_audit_finding(
+                'missing_%s' % key,
+                'fail',
+                '%s is not set' % label,
+                'Set it under Actions → Account setup.',
+            ))
+        else:
+            findings.append(_audit_finding(
+                'has_%s' % key,
+                'ok',
+                '%s is set' % label,
+                str(settings.get(key)),
+            ))
+
+    floors = get_hard_floor_settings()
+    if floors.get('on_saved') is None or floors.get('off_saved') is None:
+        findings.append(_audit_finding(
+            'hard_floors_default',
+            'warn',
+            'Loss floors are using config defaults (not saved on Actions)',
+            'on=%s%% off=%s%%' % (floors.get('on_pct'), floors.get('off_pct')),
+        ))
+    else:
+        on_s = floors.get('on_saved')
+        off_s = floors.get('off_saved')
+        if (
+            isinstance(on_s, int) and isinstance(off_s, int)
+            and 1 <= on_s <= 99 and 1 <= off_s <= 99 and off_s <= on_s
+        ):
+            findings.append(_audit_finding(
+                'hard_floors_ok',
+                'ok',
+                'Loss floors are saved',
+                'on=%s%% off=%s%%' % (on_s, off_s),
+            ))
+        else:
+            findings.append(_audit_finding(
+                'hard_floors_invalid',
+                'fail',
+                'Saved loss floors look invalid',
+                'on=%s off=%s' % (on_s, off_s),
+            ))
+
+    buy_limit = get_buy_limit_settings()
+    if buy_limit.get('enabled'):
+        pct = buy_limit.get('pct')
+        if pct is None or int(pct) < 1 or int(pct) > 99:
+            findings.append(_audit_finding(
+                'buy_limit_invalid',
+                'fail',
+                'Buy-limit orders are on but percent is invalid',
+                str(pct),
+            ))
+        else:
+            findings.append(_audit_finding(
+                'buy_limit_ok',
+                'ok',
+                'Buy-limit orders enabled',
+                '%s%% below market' % pct,
+            ))
+
+    algo_start = get_algorithm_start()
+    if algo_start:
+        findings.append(_audit_finding(
+            'algorithm_started',
+            'ok',
+            'Algorithm start is set',
+            str(algo_start),
+        ))
+    else:
+        findings.append(_audit_finding(
+            'algorithm_not_started',
+            'fail',
+            'Algorithm has not been started',
+            'Use Actions → Run (or python main.py --mark-algorithm-start).',
+        ))
+
+    if trade_dry_run_enabled():
+        findings.append(_audit_finding(
+            'dry_run',
+            'warn' if algo_start else 'info',
+            'Account is in dry run (no live Schwab orders)',
+            'Go live under Actions when ready.',
+        ))
+    else:
+        findings.append(_audit_finding(
+            'live_trading',
+            'ok',
+            'Live trading is enabled',
+        ))
+
+    if buys_paused():
+        findings.append(_audit_finding(
+            'buys_paused',
+            'warn',
+            'Buys are paused',
+            'Runtime flag buys_paused is set.',
+        ))
+
+    active_filter = (settings.get('active_filter') or 'safe').strip()
+    try:
+        import filter_builder as fb
+        fb.init_filter_tables()
+        known = {'safe', 'risky'}
+        custom = fb.get_user_custom_filter(uid)
+        if custom and custom.get('name'):
+            known.add(str(custom['name']))
+        if active_filter in known:
+            findings.append(_audit_finding(
+                'filter_ok',
+                'ok',
+                'Active watchlist filter is valid',
+                active_filter,
+            ))
+        else:
+            findings.append(_audit_finding(
+                'filter_unknown',
+                'fail',
+                'Active watchlist filter is unknown',
+                active_filter,
+            ))
+    except Exception as e:
+        findings.append(_audit_finding(
+            'filter_check_failed',
+            'warn',
+            'Could not validate active filter',
+            str(e),
+        ))
+
+    # Live bounds check when Schwab + floors present
+    if (
+        schwab_state in ('connected', 'expiring')
+        and settings.get('minimum_cash') is not None
+        and settings.get('minimum_liquidation_value') is not None
+        and settings.get('order_amount_dollars') is not None
+    ):
+        try:
+            account = fetch_setup_account_snapshot()
+            if account:
+                err = validate_setup_values(
+                    float(settings['minimum_cash']),
+                    float(settings['minimum_liquidation_value']),
+                    float(settings['order_amount_dollars']),
+                    account,
+                )
+                if err:
+                    findings.append(_audit_finding(
+                        'setup_bounds',
+                        'warn',
+                        'Floors / buy size sit outside current account bounds',
+                        str(err),
+                    ))
+                else:
+                    findings.append(_audit_finding(
+                        'setup_bounds_ok',
+                        'ok',
+                        'Floors / buy size fit current account balances',
+                    ))
+        except Exception as e:
+            findings.append(_audit_finding(
+                'setup_bounds_check_failed',
+                'info',
+                'Skipped live bounds check',
+                str(e),
+            ))
+
+    # --- Holdings / books / history ---
+    books = list_position_books()
+    owned = sorted(get_owned_tickers())
+    untagged = list(books.get('untagged') or [])
+    if untagged:
+        findings.append(_audit_finding(
+            'untagged_holdings',
+            'fail',
+            'Holdings are not enrolled (sell rules skip them)',
+            'Manual buys/transfers stay untagged until enroll_to_algorithm.',
+            tickers=untagged,
+        ))
+    elif owned and algo_start:
+        findings.append(_audit_finding(
+            'all_holdings_tagged',
+            'ok',
+            'Every held name has a book tag',
+            '%d holding(s)' % len(owned),
+        ))
+
+    legacy = list(books.get('legacy') or [])
+    if legacy:
+        findings.append(_audit_finding(
+            'legacy_holdouts',
+            'info',
+            'Legacy carve-outs are still sell-skipped',
+            tickers=legacy,
+        ))
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            '''
+            SELECT ticker, shares_owned, average_price, stop_order_id, stop_order_price,
+                   trail_active, date_purchased, purchased_at
+            FROM positions WHERE shares_owned > 0
+            '''
+        )
+        pos_rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        pos_rows = []
+    try:
+        cursor.execute('SELECT ticker, book, origin FROM position_book')
+        book_rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        book_rows = []
+    try:
+        cursor.execute(
+            '''
+            SELECT DISTINCT ticker FROM trade_history
+            WHERE side = 'buy' AND IFNULL(mode, '') != 'simulation'
+            '''
+        )
+        buy_ledger = {str(r[0]).upper() for r in cursor.fetchall() if r[0]}
+    except sqlite3.OperationalError:
+        buy_ledger = set()
+    conn.close()
+
+    owned_set = {str(t).upper() for t in owned}
+    orphan_books = []  # type: List[str]
+    for tkr, book, origin in book_rows:
+        t = str(tkr or '').upper()
+        if not t or t in owned_set:
+            continue
+        if book in ('algorithm', 'legacy'):
+            orphan_books.append(t)
+    if orphan_books:
+        findings.append(_audit_finding(
+            'orphan_book_tags',
+            'info',
+            'Book tags exist for tickers no longer held',
+            'Harmless leftovers from sold names.',
+            tickers=sorted(orphan_books),
+        ))
+
+    missing_avg = []  # type: List[str]
+    missing_stop = []  # type: List[str]
+    algo_without_buy = []  # type: List[str]
+    for row in pos_rows:
+        ticker = str(row[0] or '').upper()
+        shares = int(row[1] or 0)
+        avg = row[2]
+        stop_id = row[3]
+        stop_px = row[4]
+        if shares <= 0 or not ticker:
+            continue
+        if avg is None or float(avg) <= 0:
+            missing_avg.append(ticker)
+        book = get_position_book(ticker)
+        origin = get_position_origin(ticker)
+        if book == 'algorithm' and origin == 'algo_buy' and ticker not in buy_ledger:
+            algo_without_buy.append(ticker)
+        if algo_start and book == 'algorithm':
+            hold_ok, _reason = is_min_hold_met(ticker)
+            if hold_ok and stop_id is None and stop_px is None:
+                missing_stop.append(ticker)
+
+    if missing_avg:
+        findings.append(_audit_finding(
+            'missing_average_price',
+            'fail',
+            'Held names are missing average price',
+            tickers=sorted(missing_avg),
+        ))
+    if algo_without_buy:
+        findings.append(_audit_finding(
+            'algo_buy_without_ledger',
+            'warn',
+            'Marked algo_buy but no real buy in trade history',
+            tickers=sorted(algo_without_buy),
+        ))
+    if missing_stop:
+        findings.append(_audit_finding(
+            'algorithm_missing_stop',
+            'warn',
+            'Algorithm holdings past min-hold have no resting stop on file',
+            'Sell check should place one next RTH; catch-up can repair sooner.',
+            tickers=sorted(missing_stop),
+        ))
+    elif owned and algo_start:
+        algo_held = [
+            t for t in owned
+            if get_position_book(t) == 'algorithm'
+        ]
+        if algo_held:
+            findings.append(_audit_finding(
+                'algorithm_stops_present',
+                'ok',
+                'Algorithm holdings past min-hold have stop levels on file',
+            ))
+
+    # Extra duplicate working buys (Schwab)
+    if SCHWAB_AVAILABLE and SCHWAB_CLIENT is not None:
+        try:
+            extras = preview_extra_working_buys()
+            if extras:
+                tickers = sorted({
+                    str(e.get('ticker') or '').upper()
+                    for e in extras if e.get('ticker')
+                })
+                findings.append(_audit_finding(
+                    'extra_working_buys',
+                    'warn',
+                    'Duplicate working buy orders at Schwab',
+                    '%d extra order(s); catch-up --live can cancel them.' % len(extras),
+                    tickers=tickers,
+                ))
+        except Exception as e:
+            findings.append(_audit_finding(
+                'extra_buys_check_failed',
+                'info',
+                'Skipped duplicate-buy check',
+                str(e),
+            ))
+
+    status = _audit_overall_status(findings)
+    counts = {
+        'fail': sum(1 for f in findings if f.get('severity') == 'fail'),
+        'warn': sum(1 for f in findings if f.get('severity') == 'warn'),
+        'info': sum(1 for f in findings if f.get('severity') == 'info'),
+        'ok': sum(1 for f in findings if f.get('severity') == 'ok'),
+    }  # type: Dict[str, int]
+    report = {
+        'ok': status != 'fail',
+        'status': status,
+        'ts': ts,
+        'user_id': uid,
+        'username': uname,
+        'counts': counts,
+        'findings': findings,
+        'sync': sync_info,
+        'owned_count': len(owned),
+        'books': {
+            'algorithm': list(books.get('algorithm') or []),
+            'legacy': legacy,
+            'untagged': untagged,
+            'algo_buys': list(books.get('algo_buys') or []),
+            'enrolled': list(books.get('enrolled') or []),
+        },
+    }  # type: Dict[str, Any]
+
+    try:
+        set_runtime_flag('account_audit_last', json.dumps(report, default=str))
+    except Exception as e:
+        print('Warning: could not persist account audit: %s' % e)
+
+    summary = (
+        'Account audit %s: %s (fail=%s warn=%s ok=%s)'
+        % (status, uname or ('user %s' % uid), counts['fail'], counts['warn'], counts['ok'])
+    )
+    print(summary)
+    for f in findings:
+        if f.get('severity') in ('fail', 'warn'):
+            tick = f.get('tickers') or []
+            extra = (' — %s' % ', '.join(tick[:12])) if tick else ''
+            if tick and len(tick) > 12:
+                extra += '…'
+            print('  [%s] %s%s' % (f.get('severity'), f.get('title'), extra))
+            if f.get('detail'):
+                print('      %s' % f.get('detail'))
+    findings_brief = []  # type: List[Dict[str, Any]]
+    for f in findings:
+        if f.get('severity') not in ('fail', 'warn'):
+            continue
+        tickers = list(f.get('tickers') or [])
+        brief = {
+            'severity': f.get('severity'),
+            'title': f.get('title'),
+            'detail': f.get('detail') or '',
+        }  # type: Dict[str, Any]
+        if tickers:
+            brief['tickers'] = tickers[:12]
+            if len(tickers) > 12:
+                brief['tickers_more'] = len(tickers) - 12
+        findings_brief.append(brief)
+    try:
+        log_event(
+            'task',
+            summary,
+            level='error' if status == 'fail' else (
+                'warning' if status == 'warn' else 'info'
+            ),
+            detail={
+                'kind': 'account_audit',
+                'status': status,
+                'counts': counts,
+                'findings_brief': findings_brief,
+                'fail_ids': [
+                    f.get('id') for f in findings if f.get('severity') == 'fail'
+                ],
+                'warn_ids': [
+                    f.get('id') for f in findings if f.get('severity') == 'warn'
+                ],
+            },
+        )
+    except Exception:
+        pass
+    try:
+        bump_dashboard_rev()
+    except Exception:
+        pass
+    return report
+
+
+def get_last_account_audit() -> Optional[Dict[str, Any]]:
+    """Last persisted account audit report for the current user, or None."""
+    raw = get_runtime_flag('account_audit_last')
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def run_account_audit_job() -> bool:
+    """Scheduled weekly job: settings + holdings integrity audit (report only)."""
+    init_database()
+    interval = _account_audit_interval_days()
+    mark_job_started(JOB_ACCOUNT_AUDIT, interval)
+    try:
+        report = run_account_integrity_audit(sync_positions=True)
+        mark_job_completed(JOB_ACCOUNT_AUDIT)
+        note = 'status=%s fail=%s warn=%s' % (
+            report.get('status'),
+            (report.get('counts') or {}).get('fail'),
+            (report.get('counts') or {}).get('warn'),
+        )
+        try:
+            job_name = uc.scoped_job_name(JOB_ACCOUNT_AUDIT)
+            conn = get_connection()
+            conn.execute(
+                "UPDATE job_runs SET progress_note = ? WHERE job_name = ?",
+                (note, job_name),
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        mark_job_failed(JOB_ACCOUNT_AUDIT, str(e)[:200])
+        log_event('task', 'Account audit failed: %s' % e, level='error')
+        print('Job %s failed: %s' % (JOB_ACCOUNT_AUDIT, e))
+        return False
+
+
+def run_account_audit(
+    usernames: Optional[List[str]] = None,
+    sync_positions: bool = True,
+) -> Dict[str, Any]:
+    """Run the account audit for each active user (or named users)."""
+    init_database()
+    want = None  # type: Optional[set]
+    if usernames:
+        want = {str(n).strip().lower() for n in usernames if str(n).strip()}
+    users = uc.list_active_users()
+    if want:
+        users = [
+            u for u in users
+            if str(u.get('username') or '').strip().lower() in want
+        ]
+        missing = want - {
+            str(u.get('username') or '').strip().lower() for u in users
+        }
+        for name in sorted(missing):
+            print('No active user named %s' % name)
+    reports = []  # type: List[Dict[str, Any]]
+    for user in users:
+        uid = int(user['id'])
+        with uc.use_user(uid):
+            _sync_schwab_globals(uid)
+            maybe_reinit_schwab_client(uid)
+            reports.append(run_account_integrity_audit(sync_positions=sync_positions))
+    return {
+        'ok': all(bool(r.get('ok')) for r in reports) if reports else True,
+        'users': reports,
+    }
+
+
 def run_catch_up_for_current_user(live: bool = False) -> Dict[str, Any]:
     """
     Bring this user up to speed with what the algorithm was doing.
@@ -16443,9 +17098,11 @@ def get_dashboard_status() -> Dict[str, Any]:
         stage = get_onboarding_stage()
     except Exception:
         stage = 'done'
+    last_audit = get_last_account_audit()
     needs_attention = (
         stage != 'done'
         or bool(schwab.get('warn'))
+        or bool(last_audit and last_audit.get('status') == 'fail')
     )
     return {
         'ts': datetime.now().isoformat(timespec='seconds'),
@@ -16467,6 +17124,7 @@ def get_dashboard_status() -> Dict[str, Any]:
         'algorithm_control': algo_ctl,
         'buy_limit': get_buy_limit_settings(),
         'hard_floors': get_hard_floor_settings(),
+        'account_audit': last_audit,
         'onboarding_stage': stage,
         'actions_attention': needs_attention,
         'user': {
@@ -16499,6 +17157,45 @@ def _dashboard_stop_display_price(
         except (TypeError, ValueError):
             pass
     return None
+
+
+def _dashboard_locked_pl(
+    status: Optional[str],
+    shares: Any,
+    cost_basis: Optional[float],
+    stop_limit_price: Optional[float],
+    stop_display_price: Optional[float],
+) -> Optional[float]:
+    """
+    Dollars locked in if the resting STOP_LIMIT fills at its limit:
+    (limit × shares) − cost basis. Only for trail-armed rows.
+    """
+    if (status or '') != 'trail':
+        return None
+    try:
+        shares_f = float(shares or 0)
+    except (TypeError, ValueError):
+        return None
+    if shares_f <= 0 or cost_basis is None:
+        return None
+    try:
+        cost_f = float(cost_basis)
+    except (TypeError, ValueError):
+        return None
+    limit = None  # type: Optional[float]
+    if stop_limit_price is not None:
+        try:
+            limit = float(stop_limit_price)
+        except (TypeError, ValueError):
+            limit = None
+    if (limit is None or limit <= 0) and stop_display_price is not None:
+        try:
+            limit = stop_limit_price_from_stop(float(stop_display_price))
+        except (TypeError, ValueError):
+            limit = None
+    if limit is None or limit <= 0:
+        return None
+    return round((limit * shares_f) - cost_f, 2)
 
 
 def _dashboard_days_held(
@@ -16906,6 +17603,14 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
         status_info = _dashboard_position_status(
             ticker, book, stop_display, trail_active=trail_on,
         )
+        stop_limit_px = d.get('stop_limit_price') if have_broker_stop else None
+        locked_pl = _dashboard_locked_pl(
+            status_info.get('status'),
+            shares,
+            cost,
+            stop_limit_px,
+            stop_display,
+        )
         purchased_at = d.get('purchased_at') if have_purchased_at else None
         days_held = _dashboard_days_held(
             date_purchased if isinstance(date_purchased, str) else None,
@@ -16930,9 +17635,10 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
             'book': book,
             'stop_order_id': d.get('stop_order_id') if have_broker_stop else None,
             'stop_order_price': stop_order_price,
-            'stop_limit_price': d.get('stop_limit_price') if have_broker_stop else None,
+            'stop_limit_price': stop_limit_px,
             'stop_order_qty': d.get('stop_order_qty') if have_broker_stop else None,
             'stop_display_price': stop_display,
+            'locked_pl': locked_pl,
             'status': status_info['status'],
             'status_label': status_info['status_label'],
             'min_hold_met': status_info['min_hold_met'],

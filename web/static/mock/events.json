@@ -1,6 +1,29 @@
 {
   "events": [
     {
+      "id": 9,
+      "ts": "2026-10-18T09:00:00",
+      "level": "error",
+      "category": "task",
+      "message": "Account audit fail: jame (fail=1 warn=1 ok=6)",
+      "detail": {
+        "kind": "account_audit",
+        "status": "fail",
+        "counts": { "fail": 1, "warn": 1, "info": 0, "ok": 6 },
+        "findings_brief": [
+          {
+            "severity": "fail",
+            "title": "Holdings are not enrolled (sell rules skip them)",
+            "tickers": ["TTWO"]
+          },
+          {
+            "severity": "warn",
+            "title": "Loss floors are using config defaults (not saved on Actions)"
+          }
+        ]
+      }
+    },
+    {
       "id": 8,
       "ts": "2026-08-03T17:55:00",
       "level": "info",

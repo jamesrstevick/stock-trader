@@ -30,6 +30,7 @@
       "stop_limit_price": 124.10,
       "stop_order_qty": 8,
       "stop_display_price": 124.72,
+      "locked_pl": 28.8,
       "status": "trail",
       "status_label": "trail $124.72",
       "min_hold_met": true,

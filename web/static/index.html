@@ -297,7 +297,7 @@
         <div class="toolbar">
           <div>
             <h1>Events</h1>
-            <p class="lead" style="margin-bottom:0">Buys, sells, stops, and watchlist changes as they happen.</p>
+            <p class="lead" style="margin-bottom:0">Buys and sells by default — turn on Watchlist or Tasks for the rest (including weekly account audits).</p>
           </div>
           <button type="button" class="btn-ghost" id="btn-refresh-log">Refresh</button>
         </div>
@@ -576,6 +576,26 @@
             <button type="button" class="btn-ghost" id="algo-live-btn">Go live</button>
           </div>
           <p class="action-feedback" id="algo-feedback" hidden></p>
+        </article>
+
+        <article class="action-card" id="account-audit-card">
+          <div class="action-card-head">
+            <h2>Account audit</h2>
+            <span class="pill" id="account-audit-pill">—</span>
+          </div>
+          <p class="action-card-desc" id="account-audit-desc">
+            Weekly check of settings and holdings (books, stops, history). Also runs on a schedule;
+            use Run now anytime. A one-line summary is written to Events → Tasks.
+          </p>
+          <div class="action-row">
+            <button type="button" class="btn-primary" id="account-audit-run-btn">Run now</button>
+          </div>
+          <p class="action-feedback" id="account-audit-feedback" hidden></p>
+          <div id="account-audit-summary" class="audit-summary" hidden></div>
+          <details class="audit-findings" id="account-audit-findings" hidden>
+            <summary id="account-audit-findings-summary">Issues</summary>
+            <ul id="account-audit-findings-list"></ul>
+          </details>
         </article>
 
         <article class="action-card" id="host-deploy-card" hidden>

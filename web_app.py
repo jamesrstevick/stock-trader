@@ -333,6 +333,31 @@ def api_status(request: Request):
         return _overlay_session_user(st.get_dashboard_status(), request)
 
 
+@app.get('/api/account-audit')
+def api_account_audit_get(request: Request):
+    with uc.use_user(int(request.state.user['id'])):
+        report = st.get_last_account_audit()
+        return {
+            'ok': True,
+            'report': report,
+            'interval_days': float(
+                getattr(config, 'ACCOUNT_AUDIT_INTERVAL_DAYS', 7)
+            ),
+        }
+
+
+@app.post('/api/account-audit')
+def api_account_audit_post(request: Request):
+    """Run the integrity audit now for the logged-in user (report only)."""
+    with uc.use_user(int(request.state.user['id'])):
+        report = st.run_account_integrity_audit(sync_positions=True)
+    # Always 200: fail/warn is the audit outcome, not an API error.
+    return {
+        'ok': bool(report.get('ok')),
+        'report': report,
+    }
+
+
 @app.get('/api/account/setup')
 def api_account_setup_get(request: Request):
     with uc.use_user(int(request.state.user['id'])):

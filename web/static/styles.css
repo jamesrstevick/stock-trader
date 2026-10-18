@@ -190,13 +190,15 @@ button.pill-filter.active {
 table.data tbody tr.watchlist-owned td {
   background: var(--accent-soft);
 }
-.wl-ticker-cell {
+.wl-ticker-cell,
+.pos-ticker-cell {
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
   flex-wrap: wrap;
 }
-.wl-off-pill {
+.wl-off-pill,
+.pos-locked-pill {
   font-size: 0.68rem;
   padding: 0.1rem 0.42rem;
   font-weight: 600;
@@ -1166,6 +1168,63 @@ table.data .pos-status-muted { color: var(--muted); }
 }
 .action-feedback.ok { color: var(--good); }
 .action-feedback.bad { color: var(--bad); }
+
+.audit-summary {
+  margin-top: 0.75rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.audit-findings {
+  margin-top: 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.45rem 0.7rem;
+  background: #fafafa;
+}
+.audit-findings summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+.audit-findings ul {
+  margin: 0.5rem 0 0.15rem;
+  padding-left: 1.1rem;
+}
+.audit-findings li {
+  margin: 0.35rem 0;
+  font-size: 0.84rem;
+  line-height: 1.35;
+}
+.audit-sev {
+  display: inline-block;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  margin-right: 0.35rem;
+}
+.audit-sev.fail { color: var(--bad); }
+.audit-sev.warn { color: var(--warn); }
+.audit-finding-detail {
+  display: block;
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin-top: 0.1rem;
+}
+.event-audit-details {
+  margin-top: 0.35rem;
+  font-size: 0.82rem;
+}
+.event-audit-details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 600;
+}
+.event-audit-details ul {
+  margin: 0.35rem 0 0;
+  padding-left: 1.05rem;
+}
+.event-audit-details li { margin: 0.2rem 0; }
 
 .scroll-x { overflow-x: auto; }
 

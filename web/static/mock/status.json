@@ -335,5 +335,32 @@
     "default_pct": 10,
     "min_pct_exclusive": 0,
     "max_pct_exclusive": 100
+  },
+  "account_audit": {
+    "ok": false,
+    "status": "fail",
+    "ts": "2026-10-18T09:00:00",
+    "counts": { "fail": 1, "warn": 1, "info": 0, "ok": 6 },
+    "owned_count": 12,
+    "findings": [
+      {
+        "id": "untagged_holdings",
+        "severity": "fail",
+        "title": "Holdings are not enrolled (sell rules skip them)",
+        "detail": "Manual buys/transfers stay untagged until enrolled.",
+        "tickers": ["TTWO"]
+      },
+      {
+        "id": "hard_floors_default",
+        "severity": "warn",
+        "title": "Loss floors are using config defaults (not saved on Actions)",
+        "detail": "on=10% off=5%"
+      },
+      {
+        "id": "setup_complete",
+        "severity": "ok",
+        "title": "Account setup is marked complete"
+      }
+    ]
   }
 }

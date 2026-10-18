@@ -66,6 +66,8 @@ BUY_LIMIT_DEFAULT_PCT = 10
 MINIMUM_HOLD_HOURS = 16
 SELL_CHECK_INTERVAL_MINUTES = 15
 SCHWAB_SYNC_INTERVAL_MINUTES = 5
+# Weekly per-account integrity + settings audit (does not require RTH).
+ACCOUNT_AUDIT_INTERVAL_DAYS = 7
 # If a job stays status=running longer than this, reclaim it so the loop can retry.
 STALE_JOB_RUNNING_MINUTES = 5
 POST_ORDER_SYNC_DELAY_SECONDS = 3
