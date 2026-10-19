@@ -7161,9 +7161,12 @@ def _apply_schwab_positions_to_db(
     if missing_rows:
         open_orders = get_open_orders(account_hash)
         refetch_seen = set()  # type: set
+        refetch_ok = False
         try:
-            raw = get_schwab_positions_raw(account_hash) or []
-            for p in raw:
+            raw = get_schwab_positions_raw(account_hash)
+            if raw is not None:
+                refetch_ok = True
+            for p in raw or []:
                 instrument = (p or {}).get('instrument', {}) or {}
                 tkr = instrument.get('symbol')
                 if not tkr:
@@ -7174,6 +7177,7 @@ def _apply_schwab_positions_to_db(
                     refetch_seen.add(tkr)
         except Exception as e:
             print('Warning: confirmatory positions refetch failed: %s' % e)
+            refetch_ok = False
         for ex in missing_rows:
             tkr = ex.get('ticker')
             if not tkr:
@@ -7183,6 +7187,17 @@ def _apply_schwab_positions_to_db(
                     '  Keeping %s — missing from first snapshot, present on refetch'
                     % tkr
                 )
+                continue
+            # Manual / untagged names are not sell-managed. If Schwab no longer
+            # holds them, drop the local row. Enrolled and legacy names still
+            # need a confirmed fill so a glitchy snapshot cannot fake a sale.
+            book = get_position_book(str(tkr))
+            if book not in ('algorithm', 'legacy') and refetch_ok:
+                print(
+                    '  Dropping %s — not enrolled and no longer at Schwab' % tkr
+                )
+                ex['close_reason'] = 'unenrolled_absent'
+                closed.append(ex)
                 continue
             confirmed, reason = _confirm_schwab_close(
                 str(tkr),
@@ -7237,6 +7252,21 @@ def _apply_schwab_positions_to_db(
         retries=2,
     )
     for ex in closed:
+        if ex.get('close_reason') == 'unenrolled_absent':
+            tkr = ex.get('ticker')
+            try:
+                log_event(
+                    'task',
+                    'Removed %s — not enrolled and no longer held at Schwab' % tkr,
+                    detail={
+                        'kind': 'unenrolled_absent',
+                        'ticker': tkr,
+                        'shares_owned': ex.get('shares_owned'),
+                    },
+                )
+            except Exception as e:
+                print('Warning: unenrolled-drop log for %s failed: %s' % (tkr, e))
+            continue
         _log_position_closed_on_sync(ex)
     try:
         bump_dashboard_rev()
