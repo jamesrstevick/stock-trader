@@ -346,6 +346,14 @@ def api_account_audit_get(request: Request):
         }
 
 
+@app.post('/api/dividends/sync')
+def api_dividends_sync(request: Request):
+    """One-time Schwab dividend history for the logged-in account only."""
+    with uc.use_user(int(request.state.user['id'])):
+        result = st.sync_dividends_for_current_user()
+    return result
+
+
 @app.post('/api/account-audit')
 def api_account_audit_post(request: Request):
     """Run the integrity audit now for the logged-in user (report only)."""

@@ -1183,6 +1183,24 @@ def _init_database_unlocked(
     )
     _ensure_column(cursor, 'trade_history', 'scorecard', 'TEXT')
 
+    # Cash dividends credited by Schwab (transaction history), per user.
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS dividend_credits (
+            user_id INTEGER NOT NULL,
+            activity_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            net_amount REAL NOT NULL,
+            description TEXT,
+            synced_at TEXT,
+            PRIMARY KEY (user_id, activity_id)
+        )
+    ''')
+    cursor.execute(
+        'CREATE INDEX IF NOT EXISTS idx_dividend_credits_ticker_ts '
+        'ON dividend_credits(user_id, ticker, ts)'
+    )
+
     # Position book: book = sell-management; origin = scorecard eligibility
     # origin: legacy | algo_buy | enrolled
     cursor.execute('''
@@ -8443,6 +8461,191 @@ def _confirm_schwab_close(
     return False, 'unconfirmed'
 
 
+def _schwab_held_symbols(
+    account_hash: Optional[str] = None,
+) -> Optional[set]:
+    """Symbols with qty > 0 at Schwab, or None if the fetch failed."""
+    raw = get_schwab_positions_raw(account_hash)
+    if raw is None:
+        return None
+    held = set()  # type: set
+    for p in raw or []:
+        if not isinstance(p, dict):
+            continue
+        instrument = p.get('instrument', {}) or {}
+        tkr = instrument.get('symbol')
+        if not tkr:
+            continue
+        long_qty = p.get('longQuantity', 0) or 0
+        short_qty = p.get('shortQuantity', 0) or 0
+        if (long_qty - short_qty) > 0:
+            held.add(str(tkr).strip().upper())
+    return held
+
+
+def repair_ghost_holdings_from_schwab(
+    account_hash: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Drop local holdings Schwab no longer shows (transfers / external closes).
+
+    Normal position sync only deletes rows when a Schwab sell fill is confirmed.
+    Transfers leave reason=unconfirmed and the local row sticks. Account audit
+    calls this after a successful sync: double-fetch absence + no working sell
+    → remove the ghost. Does not place orders.
+    """
+    init_database()
+    result = {
+        'ok': False,
+        'removed': [],
+        'skipped': [],
+        'reason': None,
+    }  # type: Dict[str, Any]
+    if not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
+        result['reason'] = 'schwab_unavailable'
+        return result
+    ah = account_hash or _get_account_hash()
+    held = _schwab_held_symbols(ah)
+    if held is None:
+        result['reason'] = 'positions_fetch_failed'
+        return result
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            '''
+            SELECT ticker, stop_order_id, trail_active, stop_order_price,
+                   stop_limit_price, shares_owned, average_price, market_value
+            FROM positions WHERE shares_owned > 0
+            '''
+        )
+        local_rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        result['reason'] = 'positions_query_failed'
+        return result
+    conn.close()
+
+    candidates = []  # type: List[Dict[str, Any]]
+    for row in local_rows:
+        tkr = str(row[0] or '').strip().upper()
+        if not tkr or tkr in held:
+            continue
+        candidates.append({
+            'ticker': tkr,
+            'stop_order_id': row[1],
+            'trail_active': bool(row[2]),
+            'stop_order_price': row[3],
+            'stop_limit_price': row[4],
+            'shares_owned': row[5],
+            'average_price': row[6],
+            'market_value': row[7],
+        })
+    if not candidates:
+        result['ok'] = True
+        result['reason'] = 'none'
+        return result
+
+    # Second fetch — same caution as normal sync against a glitchy snapshot
+    held2 = _schwab_held_symbols(ah)
+    if held2 is None:
+        result['reason'] = 'positions_refetch_failed'
+        return result
+
+    try:
+        open_orders = get_open_orders(ah) or []
+    except Exception as e:
+        print('Warning: open orders for ghost repair failed: %s' % e)
+        open_orders = []
+
+    to_remove = []  # type: List[Dict[str, Any]]
+    for ex in candidates:
+        tkr = str(ex.get('ticker') or '')
+        if tkr in held2:
+            result['skipped'].append({
+                'ticker': tkr,
+                'reason': 'present_on_refetch',
+            })
+            continue
+        confirmed, reason = _confirm_schwab_close(
+            tkr, ex.get('stop_order_id'), ah, open_orders,
+        )
+        if confirmed:
+            ex = dict(ex)
+            ex['close_reason'] = reason
+            to_remove.append(ex)
+            continue
+        if reason in (
+            'working_stop', 'working_sell', 'stop_still_open', 'market_sell_open',
+        ):
+            result['skipped'].append({'ticker': tkr, 'reason': reason})
+            continue
+        # unconfirmed (typical transfer): absent twice + no working sell → drop
+        ex = dict(ex)
+        ex['close_reason'] = 'external_close'
+        to_remove.append(ex)
+
+    if not to_remove:
+        result['ok'] = True
+        result['reason'] = 'none_confirmed'
+        return result
+
+    conn = get_connection(timeout=10.0, busy_timeout_ms=8000)
+    try:
+        cursor = conn.cursor()
+        for ex in to_remove:
+            cursor.execute(
+                'DELETE FROM positions WHERE ticker = ?',
+                (ex.get('ticker'),),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    for ex in to_remove:
+        tkr = str(ex.get('ticker') or '')
+        reason = str(ex.get('close_reason') or 'external_close')
+        try:
+            if position_counts_for_algo_scorecard(tkr, side='sell'):
+                _log_position_closed_on_sync(ex)
+            else:
+                qty = ex.get('shares_owned')
+                try:
+                    qty_i = int(qty) if qty is not None else None
+                except (TypeError, ValueError):
+                    qty_i = None
+                log_event(
+                    'task',
+                    'Audit repair: removed %s (not held at Schwab)%s'
+                    % (
+                        tkr,
+                        (' · was %s sh' % qty_i) if qty_i else '',
+                    ),
+                    detail={
+                        'kind': 'audit_ghost_repair',
+                        'ticker': tkr,
+                        'quantity': qty_i,
+                        'reason': reason,
+                    },
+                )
+        except Exception as e:
+            print('Warning: ghost-holding log for %s failed: %s' % (tkr, e))
+        result['removed'].append({'ticker': tkr, 'reason': reason})
+        print(
+            '  Audit repair: removed ghost holding %s (%s)'
+            % (tkr, reason)
+        )
+
+    try:
+        bump_dashboard_rev()
+    except Exception:
+        pass
+    result['ok'] = True
+    result['reason'] = 'repaired'
+    return result
+
+
 def build_stop_limit_sell_order(
     ticker: str,
     quantity: int,
@@ -12233,12 +12436,19 @@ def sync_schwab_account(force_positions: bool = True) -> Dict[str, Any]:
     except Exception as e:
         print(f"Warning: buy-limit rebase/cancel failed: {e}")
     pos = refresh_schwab_positions_if_needed(force=bool(force_positions))
+    dividends = {}  # type: Dict[str, Any]
+    try:
+        dividends = sync_schwab_dividends(force=False)
+    except Exception as e:
+        print(f"Warning: dividend sync failed: {e}")
+        dividends = {'ok': False, 'reason': str(e)}
     return {
         'pending_cleared': cleared,
         'pending_off_watchlist_cancelled': off_wl,
         'buy_limits_rebased': rebased,
         'buy_limits_cancelled': cancelled_limits,
         'positions': pos,
+        'dividends': dividends,
     }
 
 
@@ -13589,12 +13799,15 @@ def _audit_overall_status(findings: List[Dict[str, Any]]) -> str:
 
 def run_account_integrity_audit(
     sync_positions: bool = True,
+    repair_ghosts: bool = True,
 ) -> Dict[str, Any]:
     """
     Weekly-style account audit: settings completeness + books/history integrity.
 
-    Report-only (no auto-enroll / no order placement). Schwab sync is optional
-    so holdings match the broker before checks.
+    Syncs Schwab positions when possible (any time of day). After a successful
+    sync, optionally removes ghost local holdings Schwab no longer shows
+    (transfers / external closes that normal sync leaves unconfirmed). Does not
+    auto-enroll or place orders.
     """
     init_database()
     ts = datetime.now().isoformat(timespec='seconds')
@@ -13606,6 +13819,10 @@ def run_account_integrity_audit(
     except Exception:
         uname = None
     findings = []  # type: List[Dict[str, Any]]
+    repairs = {
+        'ghost_holdings': [],
+        'ghost_skipped': [],
+    }  # type: Dict[str, Any]
 
     # --- Optional position sync (broker truth for holdings) ---
     sync_info = {'attempted': False, 'ok': None, 'reason': None}  # type: Dict[str, Any]
@@ -13647,6 +13864,47 @@ def run_account_integrity_audit(
                         'Schwab position sync failed',
                         str(e),
                     ))
+
+    # After a good sync: drop locals Schwab no longer holds (e.g. transfers)
+    if repair_ghosts and sync_info.get('ok') is True:
+        try:
+            ghost = repair_ghost_holdings_from_schwab()
+            removed = list(ghost.get('removed') or [])
+            skipped = list(ghost.get('skipped') or [])
+            repairs['ghost_holdings'] = removed
+            repairs['ghost_skipped'] = skipped
+            if removed:
+                tickers = [str(r.get('ticker')) for r in removed if r.get('ticker')]
+                findings.append(_audit_finding(
+                    'ghost_holdings_removed',
+                    'ok',
+                    'Removed holdings no longer at Schwab',
+                    'Transfer or external close; dashboard will drop them.',
+                    tickers=tickers,
+                ))
+            elif ghost.get('reason') not in (None, 'none', 'none_confirmed', 'repaired'):
+                findings.append(_audit_finding(
+                    'ghost_repair_skipped',
+                    'info',
+                    'Ghost-holding repair did not run',
+                    str(ghost.get('reason') or 'unknown'),
+                ))
+            if skipped:
+                findings.append(_audit_finding(
+                    'ghost_holdings_kept',
+                    'warn',
+                    'Some locals missing from Schwab were kept (working sell or refetch)',
+                    tickers=[
+                        str(s.get('ticker')) for s in skipped if s.get('ticker')
+                    ],
+                ))
+        except Exception as e:
+            findings.append(_audit_finding(
+                'ghost_repair_failed',
+                'warn',
+                'Ghost-holding repair failed',
+                str(e),
+            ))
 
     # --- Settings / onboarding ---
     try:
@@ -14051,6 +14309,7 @@ def run_account_integrity_audit(
         'counts': counts,
         'findings': findings,
         'sync': sync_info,
+        'repairs': repairs,
         'owned_count': len(owned),
         'books': {
             'algorithm': list(books.get('algorithm') or []),
@@ -14107,6 +14366,13 @@ def run_account_integrity_audit(
                 'status': status,
                 'counts': counts,
                 'findings_brief': findings_brief,
+                'repairs': {
+                    'ghost_removed': [
+                        r.get('ticker')
+                        for r in (repairs.get('ghost_holdings') or [])
+                        if r.get('ticker')
+                    ],
+                },
                 'fail_ids': [
                     f.get('id') for f in findings if f.get('severity') == 'fail'
                 ],
@@ -14902,6 +15168,706 @@ def get_algorithm_start_snapshot() -> Optional[Dict[str, Any]]:
     }
 
 
+_DIVIDEND_SYNC_MIN_SECONDS = 3600
+_DIVIDEND_RANGE_DAYS = 360
+_dividend_sync_guard = threading.Lock()
+_dividend_sync_running = set()  # type: set
+
+
+def dividend_description_is_interest(description: Optional[str]) -> bool:
+    """True for cash/margin interest sitting in the same Schwab transaction type."""
+    text = (description or '').upper()
+    if 'DIVIDEND' in text:
+        return False
+    return 'INTEREST' in text or 'MARGIN' in text
+
+
+def _dividend_equity_symbols(txn: Dict[str, Any]) -> List[str]:
+    symbols = []  # type: List[str]
+    for item in txn.get('transferItems') or []:
+        if not isinstance(item, dict):
+            continue
+        inst = item.get('instrument') or {}
+        if not isinstance(inst, dict):
+            continue
+        if str(inst.get('assetType') or '').upper() != 'EQUITY':
+            continue
+        sym = str(inst.get('symbol') or '').strip().upper()
+        if sym and sym not in symbols:
+            symbols.append(sym)
+    return symbols
+
+
+def _dividend_net_amount(txn: Dict[str, Any]) -> Optional[float]:
+    if txn.get('netAmount') is not None:
+        try:
+            return float(txn['netAmount'])
+        except (TypeError, ValueError):
+            return None
+    total = None  # type: Optional[float]
+    for item in txn.get('transferItems') or []:
+        if not isinstance(item, dict):
+            continue
+        inst = item.get('instrument') or {}
+        if not isinstance(inst, dict):
+            continue
+        if str(inst.get('assetType') or '').upper() != 'CURRENCY':
+            continue
+        if item.get('amount') is None:
+            continue
+        try:
+            amt = float(item['amount'])
+        except (TypeError, ValueError):
+            continue
+        total = amt if total is None else total + amt
+    return total
+
+
+def parse_schwab_dividend_transactions(
+    payload: Any,
+    ticker: str,
+) -> List[Dict[str, Any]]:
+    """
+    Cash dividend rows for one symbol from a Schwab transactions response.
+
+    Schwab often omits the equity leg and puts the company name in description.
+    Callers pass the symbol they queried so those rows still attribute.
+    """
+    rows_in = payload
+    if isinstance(payload, dict):
+        rows_in = (
+            payload.get('transactions')
+            or payload.get('items')
+            or []
+        )
+    if not isinstance(rows_in, list):
+        return []
+    want = str(ticker or '').strip().upper()
+    if not want:
+        return []
+    parsed = []  # type: List[Dict[str, Any]]
+    for txn in rows_in:
+        if not isinstance(txn, dict):
+            continue
+        if str(txn.get('type') or '').upper() != 'DIVIDEND_OR_INTEREST':
+            continue
+        description = str(txn.get('description') or '')
+        if dividend_description_is_interest(description):
+            continue
+        symbols = _dividend_equity_symbols(txn)
+        if symbols and want not in symbols:
+            continue
+        activity_id = txn.get('activityId')
+        if activity_id is None:
+            continue
+        net = _dividend_net_amount(txn)
+        if net is None:
+            continue
+        ts = str(txn.get('time') or txn.get('tradeDate') or '').strip()
+        if len(ts) < 10:
+            continue
+        parsed.append({
+            'activity_id': str(activity_id),
+            'ticker': want,
+            'ts': ts,
+            'net_amount': net,
+            'description': description or None,
+        })
+    return parsed
+
+
+def _dividend_count_start(
+    date_purchased: Optional[str],
+    purchased_at: Optional[str],
+    algorithm_start: Optional[str],
+) -> str:
+    """Later of purchase day and algorithm start (YYYY-MM-DD)."""
+    purchase = None  # type: Optional[str]
+    for raw in (purchased_at, date_purchased):
+        text = str(raw or '').strip()
+        if len(text) >= 10:
+            purchase = text[:10]
+            break
+    start = str(algorithm_start or '').strip()[:10]
+    if purchase and start:
+        return purchase if purchase > start else start
+    return purchase or start or '1970-01-01'
+
+
+def _algo_dividend_windows(
+    cursor: sqlite3.Cursor,
+    algorithm_start: Optional[str],
+) -> Dict[str, str]:
+    """
+    Ticker -> first day to count dividends.
+
+    Includes names already sold. Cash credited after the sale still counts:
+    the pay date often lands after the shares are gone.
+    """
+    windows = {}  # type: Dict[str, str]
+
+    def _keep_earlier(symbol: str, start_day: str) -> None:
+        prev = windows.get(symbol)
+        if prev is None or start_day < prev:
+            windows[symbol] = start_day
+
+    try:
+        cursor.execute(
+            '''
+            SELECT ticker, MIN(ts)
+            FROM trade_history
+            WHERE side = 'buy'
+              AND scorecard = 'algorithm'
+              AND IFNULL(mode, '') != 'simulation'
+            GROUP BY ticker
+            '''
+        )
+        for ticker, ts in cursor.fetchall():
+            symbol = str(ticker or '').strip().upper()
+            if not symbol:
+                continue
+            _keep_earlier(
+                symbol,
+                _dividend_count_start(None, ts if isinstance(ts, str) else None, algorithm_start),
+            )
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute(
+            '''
+            SELECT p.ticker, p.date_purchased, p.purchased_at
+            FROM positions p
+            INNER JOIN position_book b ON b.ticker = p.ticker
+            WHERE p.shares_owned > 0 AND b.origin = 'algo_buy'
+            '''
+        )
+        for ticker, date_purchased, purchased_at in cursor.fetchall():
+            symbol = str(ticker or '').strip().upper()
+            if not symbol:
+                continue
+            _keep_earlier(
+                symbol,
+                _dividend_count_start(
+                    date_purchased if isinstance(date_purchased, str) else None,
+                    purchased_at if isinstance(purchased_at, str) else None,
+                    algorithm_start,
+                ),
+            )
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute(
+            '''
+            SELECT ticker FROM position_book WHERE origin = 'algo_buy'
+            '''
+        )
+        for (ticker,) in cursor.fetchall():
+            symbol = str(ticker or '').strip().upper()
+            if symbol and symbol not in windows:
+                windows[symbol] = _dividend_count_start(None, None, algorithm_start)
+    except sqlite3.OperationalError:
+        pass
+    return windows
+
+
+def _dividend_fetch_windows(
+    start_day: str,
+    end: datetime,
+) -> List[Tuple[datetime, datetime]]:
+    """Schwab rejects a transaction window longer than one year."""
+    try:
+        start = datetime.strptime(start_day[:10], '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    except ValueError:
+        start = end - timedelta(days=_DIVIDEND_RANGE_DAYS)
+    if start >= end:
+        start = end - timedelta(days=1)
+    windows = []  # type: List[Tuple[datetime, datetime]]
+    cursor = start
+    while cursor < end:
+        nxt = cursor + timedelta(days=_DIVIDEND_RANGE_DAYS)
+        if nxt > end:
+            nxt = end
+        windows.append((cursor, nxt))
+        if nxt <= cursor:
+            break
+        cursor = nxt
+    return windows
+
+
+def _normalize_dividend_text(text: Optional[str]) -> str:
+    """Uppercase company/description text with punctuation collapsed."""
+    raw = re.sub(r'[^A-Z0-9]+', ' ', str(text or '').upper())
+    return ' '.join(raw.split())
+
+
+def _dividend_company_names(
+    cursor: sqlite3.Cursor,
+    tickers: List[str],
+) -> Dict[str, str]:
+    """
+    Normalized company name -> ticker.
+
+    Watchlist quotes first. Missing names get one Schwab quote so a dividend
+    row that only says "THE COCA-COLA CO" can still be tied to KO.
+    """
+    names = {}  # type: Dict[str, str]
+    if not tickers:
+        return names
+    found = set()  # type: set
+    try:
+        marks = ','.join(['?'] * len(tickers))
+        cursor.execute(
+            'SELECT ticker, schwab_description FROM watchlist WHERE ticker IN (%s)'
+            % marks,
+            list(tickers),
+        )
+        for ticker, description in cursor.fetchall():
+            symbol = str(ticker or '').strip().upper()
+            key = _normalize_dividend_text(description)
+            if symbol and len(key) >= 8:
+                names[key] = symbol
+                found.add(symbol)
+    except sqlite3.OperationalError:
+        pass
+    if not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
+        return names
+    for symbol in tickers:
+        if symbol in found:
+            continue
+        try:
+            quote = get_streaming_data(symbol) or {}
+        except Exception:
+            quote = {}
+        key = _normalize_dividend_text(quote.get('description'))
+        if len(key) >= 8:
+            names[key] = symbol
+    return names
+
+
+def _ticker_token_in_text(text: str, tickers: List[str]) -> Optional[str]:
+    """A single algo ticker written as its own word inside a description."""
+    found = []  # type: List[str]
+    for symbol in tickers:
+        if len(symbol) < 2:
+            continue
+        if re.search(
+            r'(^|[^A-Z0-9])%s([^A-Z0-9]|$)' % re.escape(symbol),
+            text,
+        ):
+            found.append(symbol)
+    if len(found) == 1:
+        return found[0]
+    return None
+
+
+def _company_name_ticker(description: str, names: Dict[str, str]) -> Optional[str]:
+    """Match a dividend description to a known company name."""
+    key = _normalize_dividend_text(description)
+    for noise in (
+        'QUALIFIED DIVIDEND',
+        'NON QUALIFIED DIVIDEND',
+        'NONQUALIFIED DIVIDEND',
+        'ORDINARY DIVIDEND',
+        'CASH DIVIDEND',
+        'SPECIAL DIVIDEND',
+        'DIVIDEND',
+    ):
+        key = key.replace(noise, ' ')
+    key = ' '.join(key.split())
+    if not key:
+        return None
+    if key in names:
+        return names[key]
+    best = None  # type: Optional[str]
+    best_len = 0
+    for name, symbol in names.items():
+        if len(name) < 8:
+            continue
+        if name in key or key in name:
+            if len(name) > best_len:
+                best = symbol
+                best_len = len(name)
+    return best
+
+
+def attribute_schwab_dividend(
+    txn: Dict[str, Any],
+    windows: Dict[str, str],
+    names: Dict[str, str],
+) -> Optional[Dict[str, Any]]:
+    """
+    One scorecard dividend, or None.
+
+    Account history often has no equity symbol — only a company name — so
+    attribution uses the symbol when Schwab sent one, then the description.
+    """
+    if not isinstance(txn, dict):
+        return None
+    if str(txn.get('type') or '').upper() != 'DIVIDEND_OR_INTEREST':
+        return None
+    description = str(txn.get('description') or '')
+    if dividend_description_is_interest(description):
+        return None
+    activity_id = txn.get('activityId')
+    if activity_id is None:
+        return None
+    net = _dividend_net_amount(txn)
+    if net is None:
+        return None
+    ts = str(txn.get('time') or txn.get('tradeDate') or '').strip()
+    if len(ts) < 10:
+        return None
+    tickers = list(windows.keys())
+    symbol = None  # type: Optional[str]
+    equity = [s for s in _dividend_equity_symbols(txn) if s in windows]
+    if len(equity) == 1:
+        symbol = equity[0]
+    if symbol is None:
+        symbol = _ticker_token_in_text(description.upper(), tickers)
+    if symbol is None:
+        symbol = _company_name_ticker(description, names)
+    if not symbol or symbol not in windows:
+        return None
+    if ts[:10] < windows[symbol]:
+        return {'skip': 'before_start'}
+    return {
+        'activity_id': str(activity_id),
+        'ticker': symbol,
+        'ts': ts,
+        'net_amount': net,
+        'description': description or None,
+    }
+
+
+def _fetch_account_dividend_payload(
+    account_hash: str,
+    start: datetime,
+    end: datetime,
+) -> Any:
+    """All DIVIDEND_OR_INTEREST rows for the account. No symbol filter."""
+    fn = getattr(SCHWAB_CLIENT, 'transactions', None)
+    if fn is None:
+        raise RuntimeError('Schwab client has no transactions()')
+    try:
+        resp = fn(account_hash, start, end, 'DIVIDEND_OR_INTEREST')
+    except TypeError:
+        resp = fn(account_hash, start, end, 'DIVIDEND_OR_INTEREST', None)
+    status = getattr(resp, 'status_code', 200)
+    if status != 200:
+        body = ''
+        try:
+            body = (resp.text or '')[:240]
+        except Exception:
+            body = ''
+        raise RuntimeError(
+            'Schwab transactions %s (%s)' % (status, body)
+        )
+    return resp.json()
+
+
+def sync_schwab_dividends(force: bool = False) -> Dict[str, Any]:
+    """
+    Pull account DIVIDEND_OR_INTEREST history for algo buys, including names
+    already sold.
+
+    One request per year-sized chunk for the whole account (Schwab's max
+    window is one year). Symbol filters are not used: many dividend rows
+    only carry the company name. Throttled to about once an hour unless
+    force=True (the one-time backfill).
+    """
+    init_database()
+    try:
+        sync_uid = _uid()
+    except Exception:
+        sync_uid = 0
+    last = get_runtime_flag('dividends_synced_at')
+    with _dividend_sync_guard:
+        if sync_uid in _dividend_sync_running:
+            return {
+                'ok': True,
+                'skipped': True,
+                'reason': 'in_progress',
+                'synced_at': last,
+            }
+        _dividend_sync_running.add(sync_uid)
+    try:
+        return _sync_schwab_dividends_locked(force, last)
+    finally:
+        with _dividend_sync_guard:
+            _dividend_sync_running.discard(sync_uid)
+
+
+def _sync_schwab_dividends_locked(
+    force: bool,
+    last: Optional[str],
+) -> Dict[str, Any]:
+    if not force and last:
+        try:
+            age = (datetime.now() - datetime.fromisoformat(str(last))).total_seconds()
+        except ValueError:
+            age = None
+        if age is not None and age < _DIVIDEND_SYNC_MIN_SECONDS:
+            return {
+                'ok': True,
+                'skipped': True,
+                'reason': 'fresh',
+                'synced_at': last,
+            }
+    if not SCHWAB_AVAILABLE or SCHWAB_CLIENT is None:
+        return {
+            'ok': False,
+            'skipped': True,
+            'reason': 'schwab_unavailable',
+            'synced_at': last,
+        }
+    account_hash = _get_account_hash()
+    if not account_hash:
+        return {
+            'ok': False,
+            'skipped': True,
+            'reason': 'no_account',
+            'synced_at': last,
+        }
+
+    start_era = get_algorithm_start()
+    conn = get_connection(timeout=10.0, busy_timeout_ms=8000)
+    try:
+        cursor = conn.cursor()
+        windows = _algo_dividend_windows(cursor, start_era)
+    finally:
+        conn.close()
+
+    names = {}  # type: Dict[str, str]
+    nconn = get_connection(timeout=10.0, busy_timeout_ms=8000)
+    try:
+        names = _dividend_company_names(nconn.cursor(), list(windows.keys()))
+    finally:
+        nconn.close()
+
+    earliest = min(windows.values()) if windows else None
+    now = datetime.now(timezone.utc)
+    synced_at = datetime.now().isoformat(timespec='seconds')
+    written = 0
+    seen_ids = set()  # type: set
+    unattributed = []  # type: List[str]
+    errors = []  # type: List[str]
+    chunks = (
+        _dividend_fetch_windows(earliest, now) if earliest else []
+    )
+    for win_start, win_end in chunks:
+        try:
+            payload = _fetch_account_dividend_payload(
+                account_hash, win_start, win_end,
+            )
+        except Exception as e:
+            errors.append(str(e))
+            break
+        rows_in = payload
+        if isinstance(payload, dict):
+            rows_in = payload.get('transactions') or payload.get('items') or []
+        if not isinstance(rows_in, list):
+            rows_in = []
+        batch = []  # type: List[Dict[str, Any]]
+        for txn in rows_in:
+            if not isinstance(txn, dict):
+                continue
+            row = attribute_schwab_dividend(txn, windows, names)
+            if row is not None and row.get('skip'):
+                continue
+            if row is None:
+                description = str(txn.get('description') or '').strip()
+                if (
+                    str(txn.get('type') or '').upper() == 'DIVIDEND_OR_INTEREST'
+                    and description
+                    and not dividend_description_is_interest(description)
+                    and description not in unattributed
+                    and len(unattributed) < 8
+                ):
+                    unattributed.append(description)
+                continue
+            if row['activity_id'] in seen_ids:
+                continue
+            seen_ids.add(row['activity_id'])
+            batch.append(row)
+        if not batch:
+            continue
+        wconn = get_connection(timeout=10.0, busy_timeout_ms=8000)
+        try:
+            wcur = wconn.cursor()
+            for row in batch:
+                wcur.execute(
+                    '''
+                    INSERT OR REPLACE INTO dividend_credits (
+                        activity_id, ticker, ts, net_amount, description, synced_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        row['activity_id'],
+                        row['ticker'],
+                        row['ts'],
+                        row['net_amount'],
+                        row['description'],
+                        synced_at,
+                    ),
+                )
+                written += 1
+            wconn.commit()
+        finally:
+            wconn.close()
+    if errors and written == 0 and windows:
+        print('Warning: dividend sync failed: %s' % '; '.join(errors[:3]))
+        return {
+            'ok': False,
+            'skipped': False,
+            'reason': 'schwab_error',
+            'errors': errors,
+            'synced_at': last,
+            'unattributed': unattributed,
+        }
+    if errors:
+        print('Warning: dividend sync partial: %s' % '; '.join(errors[:3]))
+    set_runtime_flag('dividends_synced_at', synced_at)
+    return {
+        'ok': True,
+        'skipped': False,
+        'synced_at': synced_at,
+        'tickers': len(windows),
+        'rows': written,
+        'errors': errors,
+        'unattributed': unattributed,
+    }
+
+
+def sync_dividends_for_current_user() -> Dict[str, Any]:
+    """Backfill Schwab dividend history for the signed-in account only."""
+    init_database()
+    try:
+        maybe_reinit_schwab_client()
+    except Exception as e:
+        return {
+            'ok': False,
+            'reason': 'schwab_unavailable',
+            'message': 'Schwab is not connected on this account. Reconnect first.',
+            'error': str(e),
+        }
+    result = sync_schwab_dividends(force=True)
+    if result.get('skipped') and result.get('reason') == 'in_progress':
+        result['ok'] = True
+        result['message'] = 'A dividend sync is already running for this account.'
+        return result
+    rows = int(result.get('rows') or 0)
+    tickers = int(result.get('tickers') or 0)
+    if result.get('ok'):
+        if rows:
+            msg = (
+                'Saved %d dividend credit(s) across %d name(s) on this account.'
+                % (rows, tickers)
+            )
+        else:
+            msg = "No dividend credits found for this account's algorithm buys."
+        left = result.get('unattributed') or []
+        if left:
+            msg += ' Left off the scorecard: %s.' % '; '.join(left[:4])
+        try:
+            log_event('task', msg)
+        except Exception:
+            pass
+        result['message'] = msg
+        return result
+    reason = str(result.get('reason') or '')
+    if reason == 'schwab_unavailable':
+        msg = 'Schwab is not connected on this account. Reconnect first.'
+    elif reason == 'no_account':
+        msg = 'No linked Schwab account for this login.'
+    else:
+        errs = result.get('errors') or []
+        msg = 'Dividend sync failed.'
+        if errs:
+            msg = 'Dividend sync failed: %s' % errs[0]
+    result['ok'] = False
+    result['message'] = msg
+    return result
+
+
+def run_sync_dividends(
+    usernames: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """One-shot backfill of Schwab dividend history for each active user."""
+    init_database()
+    want = None  # type: Optional[set]
+    if usernames:
+        want = {str(n).strip().lower() for n in usernames if str(n).strip()}
+    users = uc.list_active_users()
+    if want:
+        users = [
+            u for u in users
+            if str(u.get('username') or '').strip().lower() in want
+        ]
+        missing = want - {
+            str(u.get('username') or '').strip().lower() for u in users
+        }
+        for name in sorted(missing):
+            print('No active user named %s' % name)
+    reports = []  # type: List[Dict[str, Any]]
+    for user in users:
+        uid = int(user['id'])
+        uname = str(user.get('username') or uid)
+        print('\n=== Dividend history: %s ===' % uname)
+        with uc.use_user(uid):
+            initialize_schwab_client(interactive=False, user_id=uid)
+            _sync_schwab_globals(uid)
+            report = sync_schwab_dividends(force=True)
+            report['username'] = uname
+            if report.get('skipped') and report.get('reason') == 'schwab_unavailable':
+                print('  Schwab not available — skip')
+            elif report.get('ok'):
+                print(
+                    '  %s credit(s) saved across %s algo name(s)'
+                    % (report.get('rows') or 0, report.get('tickers') or 0)
+                )
+                left = report.get('unattributed') or []
+                if left:
+                    print(
+                        '  Left off the scorecard (not an algo name): %s'
+                        % '; '.join(left)
+                    )
+            else:
+                print('  Failed: %s' % (report.get('reason') or report.get('errors')))
+            reports.append(report)
+    return {'users': reports}
+
+
+def _scorecard_dividends(
+    cursor: sqlite3.Cursor,
+    held: Dict[str, str],
+) -> Tuple[float, int]:
+    """Sum cached cash dividends for algo buys, including names already sold."""
+    total = 0.0
+    count = 0
+    if not held:
+        return total, count
+    try:
+        for ticker, start_day in held.items():
+            cursor.execute(
+                '''
+                SELECT COALESCE(SUM(net_amount), 0), COUNT(*)
+                FROM dividend_credits
+                WHERE ticker = ? AND substr(ts, 1, 10) >= ?
+                ''',
+                (ticker, start_day),
+            )
+            row = cursor.fetchone()
+            if not row:
+                continue
+            total += float(row[0] or 0)
+            count += int(row[1] or 0)
+    except sqlite3.OperationalError:
+        return 0.0, 0
+    return total, count
+
+
 def get_algorithm_performance() -> Dict[str, Any]:
     """
     Soft-reset performance since algorithm_start.
@@ -14909,6 +15875,7 @@ def get_algorithm_performance() -> Dict[str, Any]:
     Primary (algo-only scorecard):
       - Realized P/L on real (not dry-run) trades with scorecard='algorithm'
       - Unrealized P/L on open positions with origin='algo_buy'
+      - Cash dividends Schwab credited on algo buys since purchase, kept after sale
       - Legacy / enrolled names never count (even if later sold)
       - Broker STOP_LIMIT fills are ledgered (and backfilled from the event log)
 
@@ -15025,9 +15992,13 @@ def get_algorithm_performance() -> Dict[str, Any]:
                 algo_unrealized += float(open_pl)
             elif avg is not None and mv is not None:
                 algo_unrealized += mv_f - float(shares or 0) * float(avg)
+    algo_dividends, dividend_count = _scorecard_dividends(
+        cursor, _algo_dividend_windows(cursor, start),
+    )
     conn.close()
 
-    algo_total_pl = algo_realized + algo_unrealized
+    algo_total_pl = algo_realized + algo_unrealized + algo_dividends
+    dividends_synced_at = get_runtime_flag('dividends_synced_at')
     algo_closed.sort(
         key=lambda row: ((row.get('ts') or ''), row.get('id') or 0),
         reverse=True,
@@ -15047,6 +16018,9 @@ def get_algorithm_performance() -> Dict[str, Any]:
         'scorecard': {
             'realized_pl': algo_realized,
             'unrealized_pl': algo_unrealized,
+            'dividend_pl': algo_dividends,
+            'dividend_count': dividend_count,
+            'dividends_synced_at': dividends_synced_at,
             'total_pl': algo_total_pl,
             'buy_dollars': algo_buy_dollars,
             'sell_dollars': algo_sell_dollars,
@@ -15083,6 +16057,8 @@ def get_algorithm_performance() -> Dict[str, Any]:
             'Algo scorecard = origin=algo_buy only (live fills, not dry-run). '
             'STOP_LIMIT fills are recorded on the trade ledger. '
             'Legacy and enrolled sells are excluded even if the bot sells them. '
+            'dividend_pl is Schwab cash dividends on algo buys since purchase, '
+            'including names already sold. '
             'equity_delta_since_start is whole-account context (includes legacy MTM).'
         ),
     }
@@ -16266,7 +17242,8 @@ def dry_run_system() -> Dict[str, Any]:
             f"  ALGO SCORECARD (post-start buys only): "
             f"total P/L ${float(sc.get('total_pl') or 0):+,.2f} "
             f"(realized ${float(sc.get('realized_pl') or 0):+,.2f} + "
-            f"unrealized ${float(sc.get('unrealized_pl') or 0):+,.2f})"
+            f"unrealized ${float(sc.get('unrealized_pl') or 0):+,.2f} + "
+            f"dividends ${float(sc.get('dividend_pl') or 0):+,.2f})"
         )
         print(
             f"    Deployed buys ${float(sc.get('buy_dollars') or 0):,.2f} | "
@@ -17338,6 +18315,10 @@ def _schedule_dashboard_schwab_refresh() -> None:
                     refresh_schwab_positions_if_needed(force=False)
                 except Exception:
                     pass
+                try:
+                    sync_schwab_dividends(force=False)
+                except Exception:
+                    pass
                 # Refresh cash / equity snapshot when Schwab is reachable
                 try:
                     maybe_reinit_schwab_client()
@@ -17350,6 +18331,35 @@ def _schedule_dashboard_schwab_refresh() -> None:
 
     threading.Thread(
         target=_worker, daemon=True, name='dashboard-schwab-sync'
+    ).start()
+
+
+_dividend_refresh_started = {}  # type: Dict[int, float]
+
+
+def _schedule_dividend_sync() -> None:
+    """Refresh cached Schwab dividends without waiting on the position sync."""
+    uid = uc.current_user_id()
+    key = int(uid) if uid is not None else 0
+    now = time.time()
+    with _dashboard_refresh_lock:
+        last = float(_dividend_refresh_started.get(key) or 0.0)
+        if now - last < 60:
+            return
+        _dividend_refresh_started[key] = now
+
+    def _worker():
+        try:
+            ctx = uc.use_user(int(uid)) if uid is not None else _nullcontext()
+            with ctx:
+                if uid is not None:
+                    _sync_schwab_globals(int(uid))
+                sync_schwab_dividends(force=False)
+        except Exception as e:
+            print('dashboard dividend sync: %s' % e)
+
+    threading.Thread(
+        target=_worker, daemon=True, name='dashboard-dividend-sync'
     ).start()
 
 
@@ -17526,6 +18536,7 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
     # Do not await Schwab/DB writers here — that could stall Loading for ~60s
     # when the trader loop holds a write lock. Kick a background refresh instead.
     _schedule_dashboard_schwab_refresh()
+    _schedule_dividend_sync()
     positions_sync = _positions_sync_status_from_flags()
     conn = get_connection()
     cursor = conn.cursor()

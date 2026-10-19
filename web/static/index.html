@@ -199,7 +199,7 @@
         <div class="panel">
           <h2>Algorithm scorecard</h2>
           <p class="lead" style="margin-top:0">
-            How the bot's doing — realized and open gains since the algorithm started.
+            How the bot's doing — realized, open, and dividend gains since the algorithm started.
           </p>
           <div class="meta-row" id="algo-pills"></div>
           <div class="cards" id="algo-cards"></div>
@@ -578,14 +578,29 @@
           <p class="action-feedback" id="algo-feedback" hidden></p>
         </article>
 
+        <article class="action-card" id="dividend-sync-card">
+          <div class="action-card-head">
+            <h2>Dividend history</h2>
+          </div>
+          <p class="action-card-desc">
+            Pull cash dividends Schwab has credited on this account’s algorithm buys,
+            including names already sold. Updates the scorecard total.
+          </p>
+          <div class="action-row">
+            <button type="button" class="btn-primary" id="dividend-sync-btn">Sync now</button>
+          </div>
+          <p class="action-feedback" id="dividend-sync-feedback" hidden></p>
+        </article>
+
         <article class="action-card" id="account-audit-card">
           <div class="action-card-head">
             <h2>Account audit</h2>
             <span class="pill" id="account-audit-pill">—</span>
           </div>
           <p class="action-card-desc" id="account-audit-desc">
-            Weekly check of settings and holdings (books, stops, history). Also runs on a schedule;
-            use Run now anytime. A one-line summary is written to Events → Tasks.
+            Weekly check of settings and holdings (books, stops, history). Syncs Schwab anytime,
+            removes ghost locals no longer held there (e.g. transfers), then reports. Summary
+            also goes to Events → Tasks.
           </p>
           <div class="action-row">
             <button type="button" class="btn-primary" id="account-audit-run-btn">Run now</button>

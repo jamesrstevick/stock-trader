@@ -12,6 +12,8 @@ Usage:
   python main.py --yahoo-full        # one-shot Yahoo catch-up (all tickers, oldest-first)
   python main.py --backfill-fills [--user NAME]
                                     # rewrite historical BOUGHT/SOLD @ to Schwab execution
+  python main.py --sync-dividends [--user NAME]
+                                    # one-time Schwab dividend history for the scorecard
   python main.py --mark-algorithm-start [--force]
                                      # soft reset: snapshot + enroll all holdings (scorecard excludes them)
   python main.py --create-user NAME PASS [--display NAME] [--admin]
@@ -102,6 +104,19 @@ def main(argv=None):
         # batch_size=0 => no cap (full universe, oldest-first)
         st.refresh_market_data(batch_size=0)
         return
+    if '--sync-dividends' in argv:
+        usernames = []
+        i = 0
+        while i < len(argv):
+            if argv[i] == '--user' and i + 1 < len(argv):
+                usernames.append(argv[i + 1])
+                i += 2
+                continue
+            i += 1
+        result = st.run_sync_dividends(usernames=usernames or None)
+        users = result.get('users') or []
+        failed = [u for u in users if not u.get('ok')]
+        sys.exit(1 if failed else 0)
     if '--backfill-fills' in argv:
         usernames = []
         i = 0

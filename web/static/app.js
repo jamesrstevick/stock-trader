@@ -114,6 +114,14 @@
           rebase: { replaced: 0, unchanged: 0, failed: 0, skipped: 0, sold: 0, deferred: 0, dry_run: true, orders: [] },
         };
       }
+      if (path.indexOf('/api/dividends/sync') === 0) {
+        return {
+          ok: true,
+          rows: 2,
+          tickers: 2,
+          message: 'Saved 2 dividend credit(s) across 2 name(s) on this account.',
+        };
+      }
       if (path.indexOf('/api/account-audit') === 0) {
         return {
           ok: false,
@@ -1414,7 +1422,8 @@
       if (desc) {
         desc.textContent =
           'Weekly check of settings and holdings (books, stops, history). ' +
-          'Also runs on a schedule; use Run now anytime. A one-line summary goes to Events → Tasks.';
+          'Syncs Schwab anytime, removes ghost locals no longer held there, then reports. ' +
+          'Summary also goes to Events → Tasks.';
       }
       return;
     }
@@ -1434,6 +1443,9 @@
 
     var counts = report.counts || {};
     var when = report.ts ? String(report.ts).replace('T', ' ').slice(0, 19) : '—';
+    var repaired = ((report.repairs || {}).ghost_holdings || [])
+      .map(function (r) { return r && r.ticker; })
+      .filter(Boolean);
     if (summary) {
       summary.hidden = false;
       summary.textContent =
@@ -1441,7 +1453,10 @@
         ' · fail ' + (counts.fail != null ? counts.fail : 0) +
         ' · warn ' + (counts.warn != null ? counts.warn : 0) +
         ' · ok ' + (counts.ok != null ? counts.ok : 0) +
-        (report.owned_count != null ? (' · ' + report.owned_count + ' holdings') : '');
+        (report.owned_count != null ? (' · ' + report.owned_count + ' holdings') : '') +
+        (repaired.length
+          ? (' · removed ' + repaired.join(', '))
+          : '');
     }
 
     var issues = auditIssueFindings(report);
@@ -2108,6 +2123,33 @@
       algoLive.addEventListener('click', function () {
         if (!window.confirm('Go live? Real Schwab orders will be placed when the bot trades.')) return;
         algoAction('go_live');
+      });
+    }
+
+    var dividendSync = document.getElementById('dividend-sync-btn');
+    if (dividendSync) {
+      dividendSync.disabled = isReadOnly();
+      dividendSync.addEventListener('click', async function () {
+        if (isReadOnly()) return;
+        setActionFeedback('dividend-sync-feedback', 'Syncing dividend history for this account…', true);
+        dividendSync.disabled = true;
+        try {
+          var res = await postJson('/api/dividends/sync', {});
+          setActionFeedback(
+            'dividend-sync-feedback',
+            (res && res.message) || 'Dividend history updated.',
+            !res || res.ok !== false
+          );
+          loadTrader();
+        } catch (e) {
+          setActionFeedback(
+            'dividend-sync-feedback',
+            e.message || 'Dividend sync failed',
+            false
+          );
+        } finally {
+          dividendSync.disabled = isReadOnly();
+        }
       });
     }
 
@@ -3051,8 +3093,19 @@
 
         var realized = sc.realized_pl != null ? Number(sc.realized_pl) : 0;
         var unreal = sc.unrealized_pl != null ? Number(sc.unrealized_pl) : 0;
-        var totalPl = sc.total_pl != null ? Number(sc.total_pl) : realized + unreal;
+        var divPl = sc.dividend_pl != null ? Number(sc.dividend_pl) : 0;
+        var totalPl = sc.total_pl != null ? Number(sc.total_pl) : (realized + unreal + divPl);
+        // Deployed card is commented out below; keep the inputs so it can come back.
         var tradeCount = sc.trade_count != null ? sc.trade_count : 0;
+        var divHint = 'Kept after sale';
+        if (!sc.dividends_synced_at) {
+          divHint = 'Waiting for Schwab transaction sync';
+        } else if (!divPl) {
+          divHint = 'No cash dividends yet';
+        } else {
+          var divN = sc.dividend_count != null ? Number(sc.dividend_count) : 0;
+          divHint = (divN === 1 ? '1 credit' : (divN + ' credits')) + ', kept after sale';
+        }
         closedPositions = Array.isArray(sc.closed_positions) ? sc.closed_positions : [];
         var realizedTone = plTone(realized);
         algoCards.innerHTML =
@@ -3065,12 +3118,14 @@
           '<span class="card-expand-arrow" aria-hidden="true"></span>' +
           '</button>' +
           card('Unrealized G/L', money(unreal), 'Open positions', plTone(unreal)) +
-          card('Total G/L', money(totalPl), 'Realized + unrealized', plTone(totalPl)) +
-          card(
-            'Deployed',
-            money(sc.buy_dollars),
-            'Market Value ' + money(sc.open_market_value) + '\n' + tradeCount + ' trades'
-          );
+          card('Dividends', money(divPl), divHint, plTone(divPl)) +
+          card('Total G/L', money(totalPl), 'Realized + unrealized + dividends', plTone(totalPl));
+        // Deployed — liked, hidden for now so Dividends can take the fourth card.
+        // card(
+        //   'Deployed',
+        //   money(sc.buy_dollars),
+        //   'Market Value ' + money(sc.open_market_value) + '\n' + tradeCount + ' trades'
+        // );
         bindClosedPositionsUi();
         var closedModal = document.getElementById('closed-positions-modal');
         if (closedModal && !closedModal.hidden) renderClosedPositionsTable();
@@ -3392,11 +3447,13 @@
         escapeHtml(m[3]) + '</span>' + whyHtml + movesHtml;
     }
     var d = (ev && ev.detail) || {};
+    var isAudit = (
+      d.kind === 'account_audit' ||
+      String(msg).toUpperCase().indexOf('ACCOUNT AUDIT') >= 0
+    );
     var brief = d.findings_brief;
-    if (
-      (d.kind === 'account_audit' || String(msg).toUpperCase().indexOf('ACCOUNT AUDIT') >= 0) &&
-      Array.isArray(brief) && brief.length
-    ) {
+    var repaired = ((d.repairs || {}).ghost_removed) || [];
+    if (isAudit && Array.isArray(brief) && brief.length) {
       var items = brief.map(function (f) {
         var tick = (f.tickers || []).join(', ');
         if (f.tickers_more) tick += (tick ? '… +' : '+') + f.tickers_more;
@@ -3412,6 +3469,12 @@
             (brief.length === 1 ? '' : 's') + '</summary>' +
           '<ul>' + items + '</ul>' +
         '</details>';
+    }
+    if (isAudit && Array.isArray(repaired) && repaired.length) {
+      body +=
+        '<div class="event-audit-details">Repaired: removed ' +
+        escapeHtml(repaired.join(', ')) +
+        ' (not held at Schwab)</div>';
     }
     return body;
   }

@@ -22,6 +22,7 @@ USER_TABLES = frozenset([
     'account_snapshots',
     'trade_history',
     'position_book',
+    'dividend_credits',
     'event_log',
     'web_commands',
 ])

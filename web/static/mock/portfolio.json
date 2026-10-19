@@ -126,7 +126,10 @@
     "scorecard": {
       "realized_pl": -10.8,
       "unrealized_pl": 0.0,
-      "total_pl": -10.8,
+      "dividend_pl": 18.4,
+      "dividend_count": 2,
+      "dividends_synced_at": "2026-10-18T18:00:00",
+      "total_pl": 7.6,
       "buy_dollars": 1998.0,
       "sell_dollars": 1987.2,
       "trade_count": 4,
