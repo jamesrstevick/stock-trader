@@ -363,9 +363,9 @@ function Invoke-HostCommand {
             Invoke-PipInstall
             $shaAfter = (Get-GitSnapshot).sha
             if ($shaAfter -eq $shaBefore) {
-                $message = 'Already up to date ({0})  - restarting processes' -f $shaAfter
+                $message = 'Done. Already up to date ({0}). Processes restarted.' -f $shaAfter
             } else {
-                $message = 'Updated {0} -> {1}  - restarting processes' -f $shaBefore, $shaAfter
+                $message = 'Done. Updated {0} -> {1}. Processes restarted.' -f $shaBefore, $shaAfter
             }
             Request-CatchUp
             $supHashAfter = $null
