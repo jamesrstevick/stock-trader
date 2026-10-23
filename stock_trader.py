@@ -7269,6 +7269,10 @@ def _apply_schwab_positions_to_db(
             continue
         _log_position_closed_on_sync(ex)
     try:
+        _lift_trail_state_from_marks()
+    except Exception as e:
+        print('Warning: trail lift from Schwab marks failed: %s' % e)
+    try:
         bump_dashboard_rev()
     except Exception:
         pass
@@ -13033,6 +13037,7 @@ def compute_trail_state_for_position(
     follows peak − buffer. Off-watchlist uses the tighter saved floor.
 
     Returns peak/stop/kind without writing proposals. Caller may persist.
+    Pass the Schwab position mark (same print as Trader G/L).
     """
     activate = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10))
     buffer_on = float(getattr(config, 'TRAIL_BUFFER_PCT', 0.10))
@@ -13106,6 +13111,129 @@ def compute_trail_state_for_position(
     }
 
 
+def _lift_trail_state_from_marks():
+    # type: () -> List[Dict[str, Any]]
+    """
+    Arm/ratchet peak and trail_active from the Schwab position mark the
+    Trader table already shows. Does not place or replace broker STOP_LIMITs.
+    """
+    init_database()
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            '''
+            SELECT ticker, shares_owned, average_price, market_value,
+                   peak_gain_pct, stop_gain_pct, trail_active,
+                   stop_order_price, floor_tightened
+            FROM positions WHERE shares_owned > 0
+            '''
+        )
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        return []
+    conn.close()
+
+    activate = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10))
+    algo_start = get_algorithm_start()
+    armed = []  # type: List[Dict[str, Any]]
+    updates = []  # type: List[Tuple[float, Optional[float], int, str]]
+    for (
+        ticker, shares, avg_price, market_value, peak_gain, stop_gain,
+        trail_active, stop_px, floor_tn,
+    ) in rows:
+        shares_n = int(shares or 0)
+        if shares_n <= 0:
+            continue
+        if algo_start and get_position_book(ticker) != 'algorithm':
+            continue
+        purchase = _positive_float(avg_price)
+        if purchase is None:
+            continue
+        mark = _last_mark_price({
+            'market_value': market_value,
+            'shares_owned': shares_n,
+        })
+        if mark is None:
+            continue
+        gain = (mark - purchase) / purchase
+        was_active = bool(trail_active)
+        peak = None  # type: Optional[float]
+        if peak_gain is not None:
+            try:
+                peak = float(peak_gain)
+            except (TypeError, ValueError):
+                peak = None
+        # Skip names that are already in sync with this mark (no new high,
+        # and already armed or still below activate).
+        if (
+            peak is not None
+            and gain <= peak + 1e-9
+            and (was_active or gain < activate)
+        ):
+            continue
+        state = compute_trail_state_for_position(
+            str(ticker),
+            purchase,
+            mark,
+            peak_gain=peak_gain,
+            stop_gain=stop_gain,
+            trail_active=was_active,
+            existing_stop_price=stop_px,
+            floor_tightened=bool(floor_tn),
+        )
+        updates.append((
+            state['peak_gain_pct'],
+            state['stop_gain_pct'],
+            1 if state['trail_active'] else 0,
+            str(ticker),
+        ))
+        just_armed = bool(state['trail_active']) and not was_active
+        if just_armed:
+            armed.append(state)
+            try:
+                log_event(
+                    'sell',
+                    'Trail armed for %s after +%.1f%% Schwab mark — '
+                    'STOP-LIMIT follows next sell check'
+                    % (ticker, float(state['peak_gain_pct']) * 100.0),
+                    detail={
+                        'ticker': ticker,
+                        'price': mark,
+                        'purchase': purchase,
+                        'peak_gain_pct': state['peak_gain_pct'],
+                        'stop_price': state['stop_price'],
+                        'stop_gain_pct': state['stop_gain_pct'],
+                        'trail_active': True,
+                        'source': 'position_mark',
+                        'broker_stop_pending': True,
+                    },
+                )
+            except Exception:
+                pass
+    if updates:
+        conn = get_connection()
+        try:
+            conn.executemany(
+                '''
+                UPDATE positions
+                SET peak_gain_pct = ?, stop_gain_pct = ?, trail_active = ?
+                WHERE ticker = ?
+                ''',
+                updates,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    if armed:
+        try:
+            bump_dashboard_rev()
+        except Exception:
+            pass
+    return armed
+
+
 def bring_positions_up_to_speed(
     tickers: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
@@ -13117,8 +13245,8 @@ def bring_positions_up_to_speed(
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT ticker, shares_owned, average_price, peak_gain_pct, stop_gain_pct,
-               trail_active, stop_order_price, floor_tightened
+        SELECT ticker, shares_owned, average_price, market_value, peak_gain_pct,
+               stop_gain_pct, trail_active, stop_order_price, floor_tightened
         FROM positions WHERE shares_owned > 0
     """)
     rows = cursor.fetchall()
@@ -13130,7 +13258,8 @@ def bring_positions_up_to_speed(
 
     results = []  # type: List[Dict[str, Any]]
     for (
-        ticker, shares, avg_price, peak_gain, stop_gain, trail_active, stop_px, floor_tn
+        ticker, shares, avg_price, market_value, peak_gain, stop_gain,
+        trail_active, stop_px, floor_tn,
     ) in rows:
         if want is not None and ticker not in want:
             continue
@@ -13143,18 +13272,23 @@ def bring_positions_up_to_speed(
                 'reason': 'missing average_price',
             })
             continue
-        price = get_trade_price(ticker)
-        if not price or price <= 0:
+        mark = _last_mark_price({
+            'market_value': market_value,
+            'shares_owned': shares,
+        })
+        if mark is None:
+            mark = get_trade_price(ticker)
+        if not mark or mark <= 0:
             results.append({
                 'ticker': ticker,
                 'ok': False,
-                'reason': 'no live Schwab price',
+                'reason': 'no Schwab position mark',
             })
             continue
         state = compute_trail_state_for_position(
             ticker,
             float(avg_price),
-            float(price),
+            float(mark),
             peak_gain=peak_gain,
             stop_gain=stop_gain,
             trail_active=bool(trail_active),
@@ -13353,8 +13487,8 @@ def restore_algorithm_trails_from_events(
     cursor = conn.cursor()
     cursor.execute(
         '''
-        SELECT ticker, shares_owned, average_price, peak_gain_pct, stop_gain_pct,
-               trail_active, stop_order_price, floor_tightened
+        SELECT ticker, shares_owned, average_price, market_value, peak_gain_pct,
+               stop_gain_pct, trail_active, stop_order_price, floor_tightened
         FROM positions WHERE shares_owned > 0
         '''
     )
@@ -13363,7 +13497,8 @@ def restore_algorithm_trails_from_events(
     activate = float(getattr(config, 'TRAIL_ACTIVATE_PCT', 0.10))
     results = []  # type: List[Dict[str, Any]]
     for (
-        ticker, shares, avg_price, peak_gain, stop_gain, trail_active, stop_px, floor_tn
+        ticker, shares, avg_price, market_value, peak_gain, stop_gain,
+        trail_active, stop_px, floor_tn,
     ) in rows:
         if int(shares or 0) <= 0:
             continue
@@ -13387,12 +13522,18 @@ def restore_algorithm_trails_from_events(
                     source = 'events'
                 elif source == 'db':
                     source = 'db+events'
-        last = get_trade_price(ticker)
+        mark = _last_mark_price({
+            'market_value': market_value,
+            'shares_owned': shares,
+        })
+        if mark is None:
+            mark = get_trade_price(ticker)
+        last = mark
         if not last or float(last) <= 0:
             results.append({
                 'ticker': ticker,
                 'ok': False,
-                'reason': 'no live Schwab price',
+                'reason': 'no Schwab position mark',
                 'peak_source': source,
                 'events_stop': (events or {}).get('stop_price'),
             })
@@ -16727,17 +16868,17 @@ def propose_sells() -> List[Dict[str, Any]]:
     - place_stop_limit: protective stop-limit at computed stop price (not yet hit)
     - defer_stop_limit: would place stop but same ET purchase day (PDT) — wait until next day
     - skip_sell: would sell but min-hold blocks
-    Trail: peak +10% activate, 10% buffer on-list / 7% off-list (stop = peak − buffer).
+    Trail: peak +10% activate, buffer on-list / off-list (stop = peak − buffer).
+    Peak follows the Schwab position mark (same print as Trader G/L).
     Hard stop: saved percent below purchase cost (on-list / off-list). Changing
     either percent cancels and replaces the resting floor from that cost.
-    Trail still follows peak − buffer.
     """
     init_database()
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT ticker, shares_owned, average_price, peak_gain_pct, stop_gain_pct,
-               trail_active, stop_order_price, floor_tightened
+        SELECT ticker, shares_owned, average_price, market_value, peak_gain_pct,
+               stop_gain_pct, trail_active, stop_order_price, floor_tightened
         FROM positions WHERE shares_owned > 0
     """)
     rows = cursor.fetchall()
@@ -16745,7 +16886,8 @@ def propose_sells() -> List[Dict[str, Any]]:
 
     proposals = []  # type: List[Dict[str, Any]]
     for (
-        ticker, shares, avg_price, peak_gain, stop_gain, trail_active, stop_px, floor_tn
+        ticker, shares, avg_price, market_value, peak_gain, stop_gain,
+        trail_active, stop_px, floor_tn,
     ) in rows:
         shares = int(shares or 0)
         if shares <= 0:
@@ -16779,19 +16921,22 @@ def propose_sells() -> List[Dict[str, Any]]:
             continue
 
         purchase = float(avg_price)
-        price = get_trade_price(ticker)
-        if not price or price <= 0:
+        mark = _last_mark_price({
+            'market_value': market_value,
+            'shares_owned': shares,
+        })
+        if mark is None:
             proposals.append({
                 'action': 'skip_sell',
                 'ticker': ticker,
-                'reason': 'no live Schwab price',
+                'reason': 'no Schwab position mark',
             })
             continue
 
         state = compute_trail_state_for_position(
             ticker,
             purchase,
-            float(price),
+            float(mark),
             peak_gain=peak_gain,
             stop_gain=stop_gain,
             trail_active=bool(trail_active),
@@ -16823,7 +16968,7 @@ def propose_sells() -> List[Dict[str, Any]]:
             'shares': shares,
             'quantity': shares,
             'purchase': purchase,
-            'price': price,
+            'price': mark,
             'gain_pct': gain,
             'peak_gain_pct': peak,
             'stop_gain_pct': new_stop,
@@ -17933,7 +18078,10 @@ def get_trading_rules_dashboard() -> Dict[str, Any]:
             'id': 'trail_activate',
             'title': 'Trailing stop arms after a gain',
             'set_to': 'Arm at +%.0f%% peak unrealized' % trail_act,
-            'why': 'Protect winners once they have moved enough; ignore noise before that',
+            'why': (
+                'Protect winners once the Schwab position mark (Trader G/L) '
+                'has moved enough; ignore noise before that'
+            ),
         },
         {
             'id': 'trail_buffer',
@@ -18147,23 +18295,28 @@ def _dashboard_stop_display_price(
     stop_order_price: Optional[float],
     stop_gain_pct: Optional[float],
     average_price: Optional[float],
+    trail_active: bool = False,
 ) -> Optional[float]:
-    """Prefer resting broker stop trigger; else implied stop from trail/hard math."""
-    if stop_order_price is not None:
-        try:
-            px = float(stop_order_price)
-            if px > 0:
-                return px
-        except (TypeError, ValueError):
-            pass
+    """
+    Prefer resting broker stop; if a trail is armed and the implied stop is
+    higher (broker still on the old floor), show the intended trail level.
+    """
+    implied = None  # type: Optional[float]
     if stop_gain_pct is not None and average_price is not None:
         try:
             avg = float(average_price)
             if avg > 0:
-                return avg * (1.0 + float(stop_gain_pct))
+                implied = avg * (1.0 + float(stop_gain_pct))
         except (TypeError, ValueError):
-            pass
-    return None
+            implied = None
+    broker = _positive_float(stop_order_price)
+    if trail_active and implied is not None:
+        if broker is None or implied > broker + 0.009:
+            return implied
+        return broker
+    if broker is not None:
+        return broker
+    return implied
 
 
 def _dashboard_locked_pl(
@@ -18172,12 +18325,19 @@ def _dashboard_locked_pl(
     cost_basis: Optional[float],
     stop_limit_price: Optional[float],
     stop_display_price: Optional[float],
+    stop_order_price: Optional[float] = None,
+    average_price: Optional[float] = None,
 ) -> Optional[float]:
     """
     Dollars locked in if the resting STOP_LIMIT fills at its limit:
-    (limit × shares) − cost basis. Only for trail-armed rows.
+    (limit × shares) − cost basis. Only for trail-armed rows whose broker
+    stop is actually above cost (not still the hard floor).
     """
     if (status or '') != 'trail':
+        return None
+    broker = _positive_float(stop_order_price)
+    avg = _positive_float(average_price)
+    if broker is None or avg is None or broker <= avg:
         return None
     try:
         shares_f = float(shares or 0)
@@ -18193,6 +18353,11 @@ def _dashboard_locked_pl(
     if stop_limit_price is not None:
         try:
             limit = float(stop_limit_price)
+        except (TypeError, ValueError):
+            limit = None
+    if (limit is None or limit <= 0) and broker is not None:
+        try:
+            limit = stop_limit_price_from_stop(float(broker))
         except (TypeError, ValueError):
             limit = None
     if (limit is None or limit <= 0) and stop_display_price is not None:
@@ -18638,9 +18803,11 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
                 current_price = float(mv) / shares_f
             except (TypeError, ValueError, ZeroDivisionError):
                 current_price = None
-        stop_display = _dashboard_stop_display_price(stop_order_price, stop_g, avg)
         book = get_position_book(ticker) or 'untagged'
         trail_on = bool(trail) if trail is not None else False
+        stop_display = _dashboard_stop_display_price(
+            stop_order_price, stop_g, avg, trail_active=trail_on,
+        )
         status_info = _dashboard_position_status(
             ticker, book, stop_display, trail_active=trail_on,
         )
@@ -18651,6 +18818,8 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
             cost,
             stop_limit_px,
             stop_display,
+            stop_order_price=stop_order_price,
+            average_price=avg,
         )
         purchased_at = d.get('purchased_at') if have_purchased_at else None
         days_held = _dashboard_days_held(
@@ -18769,7 +18938,10 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
             p['stop_limit_price'] = live.get('limit_price')
             p['stop_order_qty'] = live.get('quantity')
             p['stop_display_price'] = _dashboard_stop_display_price(
-                live.get('stop_price'), p.get('stop_gain_pct'), p.get('average_price')
+                live.get('stop_price'),
+                p.get('stop_gain_pct'),
+                p.get('average_price'),
+                trail_active=bool(p.get('trail_active')),
             )
             status_info = _dashboard_position_status(
                 p.get('ticker'),
@@ -18781,6 +18953,15 @@ def get_dashboard_portfolio() -> Dict[str, Any]:
             p['status_label'] = status_info['status_label']
             p['min_hold_met'] = status_info['min_hold_met']
             p['hold_hours_left'] = status_info['hold_hours_left']
+            p['locked_pl'] = _dashboard_locked_pl(
+                status_info.get('status'),
+                p.get('shares_owned'),
+                p.get('cost_basis'),
+                live.get('limit_price'),
+                p.get('stop_display_price'),
+                stop_order_price=live.get('stop_price'),
+                average_price=p.get('average_price'),
+            )
         rebuilt = []  # type: List[Dict[str, Any]]
         for tkr, live in live_map.items():
             if tkr not in held:

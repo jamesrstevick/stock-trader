@@ -8,7 +8,7 @@ On your home machine (or Pi), `python main.py --loop` wakes on a schedule:
 
 - **Yahoo refresh** — oldest / missing tickers first (~150/hour), skips names already updated today, keeps the universe roughly within a few days.
 - **Watchlist + buys** — re-ranks with the active filter (default: `safe`), then considers ~$1k buys when cash rules allow.
-- **Sell check** — every ~15 minutes: arm trails after +10%, keep the hard floor locked vs cost, ratchet the trail with new highs, tighten once if the name fails the filter.
+- **Sell check** — every ~15 minutes: arm trails after +10% peak on the Schwab position mark (same print as Trader G/L), keep the hard floor locked vs cost, ratchet the trail with new highs, tighten once if the name fails the filter. Broker STOP_LIMIT replaces follow during RTH.
 
 A separate FastAPI dashboard (`python web_app.py`) uses **in-app login** (username/password, ~30-day session). Each user has their own Schwab link, filter, watchlist, positions, and log. Yahoo fundamentals are shared. Live data comes from the local API, or mock fixtures with `?mock=1`.
 
