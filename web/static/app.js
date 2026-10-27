@@ -2651,13 +2651,25 @@
     return (limit * shares) - cost;
   }
 
+  function positionLockedPctLabel(p, locked) {
+    var cost = Number(p && p.cost_basis);
+    if (!(cost > 0) || locked == null || isNaN(locked)) return null;
+    // Same dollars ÷ cost as the pill; nearest whole percent (3%, not 3.00%).
+    return Math.round((locked / cost) * 100) + '%';
+  }
+
   function formatPositionTicker(p) {
     var t = escapeHtml(p.ticker || '');
     var locked = positionLockedPl(p);
     if (locked == null || isNaN(locked)) return t;
+    var pctLabel = positionLockedPctLabel(p, locked);
+    var pctPill = pctLabel == null ? '' :
+      '<span class="pill ok pos-locked-pill" title="Locked-in gain as a percent of cost (same dollars ÷ cost), rounded to the nearest percent">' +
+      escapeHtml(pctLabel) + '</span>';
     return '<span class="pos-ticker-cell">' + t +
-      ' <span class="pill ok pos-locked-pill" title="Locked-in P/L if the resting stop-limit fills at its limit (limit × shares − cost)">' +
-      escapeHtml(moneyPl(locked)) + '</span></span>';
+      '<span class="pill ok pos-locked-pill" title="Locked-in P/L if the resting stop-limit fills at its limit (limit × shares − cost)">' +
+      escapeHtml(moneyPl(locked)) + '</span>' +
+      pctPill + '</span>';
   }
 
   function renderPositionsTable() {
