@@ -6884,6 +6884,10 @@ def fetch_and_sync_schwab_positions(account_hash: Optional[str] = None) -> int:
     Fetch positions from Schwab API and upsert into the positions table.
     Updates shares_owned (longQuantity), average_price, market_value,
     current_day_profit_loss, day_pct, long_open_profit_loss, open_pct.
+
+    Day G/L follows Schwab during the regular session. After the close, a 0
+    from Schwab is the day reset and does not replace the last real figure.
+    That figure is kept until the next regular open.
     
     Args:
         account_hash: Optional account hash. If None, uses first linked account.
@@ -6954,6 +6958,97 @@ def fetch_and_sync_schwab_positions(account_hash: Optional[str] = None) -> int:
     return -2
 
 
+def _day_pl_is_reset(value: Any) -> bool:
+    """True when Schwab omitted day P/L or sent a flat zero (the after-close reset)."""
+    if value is None:
+        return True
+    try:
+        return abs(float(value)) < 0.005
+    except (TypeError, ValueError):
+        return True
+
+
+def _day_pl_sync_mode(when: Optional[datetime] = None) -> str:
+    """
+    How to apply Schwab currentDayProfitLoss.
+
+    live — regular session: write Schwab's figure, including a real $0.
+    settle — a few minutes after the close: take a non-zero closing print,
+        but do not let a 0 replace the session.
+    hold — keep the stored day G/L until the next regular open.
+    """
+    now = when if when is not None else _now_market()
+    tz = _market_tz()
+    if tz is not None and now.tzinfo is None:
+        now = now.replace(tzinfo=tz)
+    elif tz is not None and now.tzinfo is not None:
+        now = now.astimezone(tz)
+    if now.weekday() >= 5:
+        return 'hold'
+    open_mins = (
+        int(getattr(config, 'MARKET_OPEN_HOUR', 9)) * 60
+        + int(getattr(config, 'MARKET_OPEN_MINUTE', 30))
+    )
+    close_mins = (
+        int(getattr(config, 'MARKET_CLOSE_HOUR', 16)) * 60
+        + int(getattr(config, 'MARKET_CLOSE_MINUTE', 0))
+    )
+    minutes = now.hour * 60 + now.minute
+    if open_mins <= minutes < close_mins:
+        return 'live'
+    grace = int(getattr(config, 'DAY_PL_CLOSE_GRACE_MINUTES', 5))
+    if grace < 0:
+        grace = 0
+    if close_mins <= minutes < close_mins + grace:
+        return 'settle'
+    return 'hold'
+
+
+def _as_optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_synced_day_pl(
+    incoming: Any,
+    stored_pl: Any,
+    stored_pct: Any,
+    market_value: Any,
+    mode: str,
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Day G/L to store for one position.
+
+    After the regular session, Schwab's currentDayProfitLoss resets to 0.
+    Keep the last real figure (and its percent) until the next open. During
+    the session, a real $0 is written through.
+    """
+    has_stored = stored_pl is not None
+    if mode == 'hold':
+        use_stored = has_stored
+    elif mode == 'settle':
+        use_stored = has_stored and _day_pl_is_reset(incoming)
+    else:
+        use_stored = False
+    if use_stored:
+        return _as_optional_float(stored_pl), _as_optional_float(stored_pct)
+
+    pl = _as_optional_float(incoming)
+    pct = None  # type: Optional[float]
+    if pl is not None and market_value is not None:
+        try:
+            sod_val = float(market_value) - pl
+        except (TypeError, ValueError):
+            sod_val = 0.0
+        if sod_val and abs(sod_val) > 1e-9:
+            pct = (pl / sod_val) * 100.0
+    return pl, pct
+
+
 def _apply_schwab_positions_to_db(
     positions_data: List[Dict[str, Any]],
     account_hash: Optional[str],
@@ -7007,6 +7102,17 @@ def _apply_schwab_positions_to_db(
                 )
         except sqlite3.OperationalError:
             buy_stamps = {}
+        prior_day = {}  # type: Dict[str, Tuple[Any, Any]]
+        try:
+            cursor.execute(
+                'SELECT ticker, current_day_profit_loss, day_pct FROM positions'
+            )
+            for tkr, pl, pct_v in cursor.fetchall():
+                if tkr:
+                    prior_day[str(tkr)] = (pl, pct_v)
+        except sqlite3.OperationalError:
+            prior_day = {}
+        day_pl_mode = _day_pl_sync_mode()
         if config.DEBUG and positions_data:
             print("DEBUG: First position keys:", list(positions_data[0].keys()))
             if positions_data[0].get('instrument'):
@@ -7025,13 +7131,16 @@ def _apply_schwab_positions_to_db(
             still_held_tickers.append(str(ticker))
             avg_price = p.get('averagePrice')
             market_val = p.get('marketValue')
-            current_day_pl = p.get('currentDayProfitLoss')
+            incoming_day_pl = p.get('currentDayProfitLoss')
             long_open_pl = p.get('longOpenProfitLoss')
-            day_pct = None
-            if current_day_pl is not None and market_val is not None:
-                sod_val = float(market_val) - float(current_day_pl)
-                if sod_val and abs(sod_val) > 1e-9:
-                    day_pct = (float(current_day_pl) / sod_val) * 100
+            stored_day = prior_day.get(str(ticker))
+            current_day_pl, day_pct = _resolve_synced_day_pl(
+                incoming_day_pl,
+                stored_day[0] if stored_day else None,
+                stored_day[1] if stored_day else None,
+                market_val,
+                day_pl_mode,
+            )
             open_pct = None
             if long_open_pl is not None and avg_price is not None and qty and float(avg_price) > 0:
                 cost_basis = qty * float(avg_price)

@@ -78,6 +78,10 @@ MARKET_OPEN_HOUR = 9
 MARKET_OPEN_MINUTE = 30
 MARKET_CLOSE_HOUR = 16
 MARKET_CLOSE_MINUTE = 0
+# After the bell, still take a non-zero day G/L so the closing print can land.
+# A 0 in this window is the Schwab reset and is ignored. After it, day G/L
+# stays at the last real figure until the next regular open.
+DAY_PL_CLOSE_GRACE_MINUTES = 5
 
 TRAIL_ACTIVATE_PCT = 0.10
 TRAIL_BUFFER_PCT = 0.10
