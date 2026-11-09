@@ -2635,27 +2635,64 @@
     if (!p || p.status !== 'trail') return null;
     if (p.locked_pl != null && p.locked_pl !== '') {
       var fromApi = Number(p.locked_pl);
-      if (!isNaN(fromApi)) return fromApi;
+      // A hard-floor loss is not a locked-in gain.
+      if (!isNaN(fromApi) && fromApi >= 0) return fromApi;
     }
     var shares = Number(p.shares_owned);
     var cost = Number(p.cost_basis);
-    if (!(shares > 0) || isNaN(cost)) return null;
-    var limit = Number(p.stop_limit_price);
-    if (!(limit > 0)) {
-      var stop = Number(p.stop_display_price != null ? p.stop_display_price : p.stop_order_price);
-      if (!(stop > 0)) return null;
-      // Match STOP_LIMIT_SLIPPAGE_PCT default (0.5%) when broker limit is missing
-      limit = Math.min(stop * 0.995, stop - 0.01);
-      if (!(limit > 0)) return null;
+    if (!(shares > 0) || !(cost > 0) || isNaN(cost)) return null;
+
+    function dollarsFromLimit(limit) {
+      var lim = Number(limit);
+      if (!(lim > 0)) return null;
+      return (lim * shares) - cost;
     }
-    return (limit * shares) - cost;
+
+    function limitFromStop(stop) {
+      var s = Number(stop);
+      if (!(s > 0)) return null;
+      // Match STOP_LIMIT_SLIPPAGE_PCT default (0.5%) when broker limit is missing
+      var limit = Math.min(s * 0.995, s - 0.01);
+      if (!(limit > 0)) return null;
+      return Math.round(limit * 100) / 100;
+    }
+
+    var restingLimit = Number(p.stop_limit_price);
+    var resting = dollarsFromLimit(restingLimit);
+    var stop = Number(
+      p.stop_display_price != null ? p.stop_display_price : p.stop_order_price
+    );
+    var avg = Number(p.average_price);
+    if (!(avg > 0)) avg = cost / shares;
+    var fromTrail = null;
+    if (stop > 0 && stop + 0.009 >= avg) {
+      fromTrail = dollarsFromLimit(limitFromStop(stop));
+      // Slippage can put the limit a hair under cost when the trail sits on cost.
+      if (fromTrail != null && fromTrail < 0) fromTrail = 0;
+    }
+    if (fromTrail != null) {
+      if (
+        resting != null && resting >= 0 &&
+        restingLimit > 0 && stop > 0 &&
+        restingLimit + 0.02 >= stop * 0.98 &&
+        restingLimit <= stop + 0.02
+      ) {
+        return resting;
+      }
+      return fromTrail;
+    }
+    if (resting != null && resting >= 0) return resting;
+    return null;
   }
 
   function positionLockedPctLabel(p, locked) {
     var cost = Number(p && p.cost_basis);
-    if (!(cost > 0) || locked == null || isNaN(locked)) return null;
+    if (!(cost > 0) || locked == null || isNaN(locked) || locked < 0) return null;
     // Same dollars ÷ cost as the pill; nearest whole percent (3%, not 3.00%).
-    return Math.round((locked / cost) * 100) + '%';
+    // Trail stops are floored at cost, so this percent is never negative.
+    var whole = Math.round((locked / cost) * 100);
+    if (whole < 0) whole = 0;
+    return whole + '%';
   }
 
   function formatPositionTicker(p) {
@@ -2664,18 +2701,67 @@
     if (locked == null || isNaN(locked)) return t;
     var pctLabel = positionLockedPctLabel(p, locked);
     var pctPill = pctLabel == null ? '' :
-      '<span class="pill ok pos-locked-pill" title="Locked-in gain as a percent of cost (same dollars ÷ cost), rounded to the nearest percent">' +
+      '<span class="pill ok pos-locked-pill" title="Locked-in gain at the trail stop, as a percent of cost, rounded to the nearest percent">' +
       escapeHtml(pctLabel) + '</span>';
     return '<span class="pos-ticker-cell">' + t +
-      '<span class="pill ok pos-locked-pill" title="Locked-in P/L if the resting stop-limit fills at its limit (limit × shares − cost)">' +
+      '<span class="pill ok pos-locked-pill" title="Locked-in P/L if the trail stop fills at its limit (limit × shares − cost). Never a loss.">' +
       escapeHtml(moneyPl(locked)) + '</span>' +
       pctPill + '</span>';
+  }
+
+  function positionsSummary(rows) {
+    var stocks = 0;
+    var trail = 0;
+    var red = 0;
+    var locked = 0;
+    (rows || []).forEach(function (p) {
+      if (!p) return;
+      stocks += 1;
+      if (p.status === 'trail') {
+        trail += 1;
+        var lock = positionLockedPl(p);
+        if (lock != null && !isNaN(lock)) locked += lock;
+      }
+      var pl = Number(p.open_pl);
+      if (!isNaN(pl) && pl < 0) red += 1;
+    });
+    return { stocks: stocks, trail: trail, red: red, locked: locked };
+  }
+
+  function renderPositionsSummary() {
+    var box = document.getElementById('positions-summary');
+    if (!box) return;
+    var s = positionsSummary(positionsRows);
+    function stat(label, value, tone, title) {
+      return (
+        '<div class="pos-stat"' + (title ? ' title="' + escapeHtml(title) + '"' : '') + '>' +
+          '<span class="label">' + escapeHtml(label) + '</span>' +
+          '<span class="value' + (tone ? ' ' + tone : '') + '">' + escapeHtml(value) + '</span>' +
+        '</div>'
+      );
+    }
+    box.innerHTML =
+      stat('Stocks', String(s.stocks), '', 'Open positions') +
+      stat('On trail', String(s.trail), s.trail ? 'pos' : '', 'Positions with an active trail stop') +
+      stat(
+        'In the red',
+        String(s.red),
+        s.red ? 'neg' : '',
+        'Positions with total G/L below $0'
+      ) +
+      stat(
+        'Locked trail',
+        moneyPl(s.locked),
+        s.locked > 0 ? 'pos' : '',
+        'Sum of locked-in P/L if trail stops fill at their limits'
+      );
   }
 
   function renderPositionsTable() {
     var tbody = document.querySelector('#positions-table tbody');
     if (!tbody) return;
     updatePositionsSortHeaders();
+    renderPositionsSummary();
     var sorted = sortPositions(positionsRows, positionsSort.key, positionsSort.dir);
     tbody.innerHTML = '';
     sorted.forEach(function (p) {
@@ -3258,6 +3344,8 @@
       closedPositions = [];
       watchlistRows = [];
       watchlistColumns = [];
+      var posSummary = document.getElementById('positions-summary');
+      if (posSummary) posSummary.innerHTML = '';
       tbody.innerHTML = '<tr><td colspan="9" class="empty">Could not load portfolio.</td></tr>';
       obody.innerHTML = '';
       var wbody = document.querySelector('#watchlist-table tbody');
@@ -4023,6 +4111,7 @@
     var algoPills = document.getElementById('algo-pills');
     var algoCards = document.getElementById('algo-cards');
     var tbody = document.querySelector('#positions-table tbody');
+    var posSummary = document.getElementById('positions-summary');
     var obody = document.querySelector('#orders-table tbody');
     var wbody = document.querySelector('#watchlist-table tbody');
     var whead = document.querySelector('#watchlist-table thead tr');
@@ -4033,6 +4122,7 @@
     if (algoPills) algoPills.innerHTML = '';
     if (algoCards) algoCards.innerHTML = '';
     if (tbody) tbody.innerHTML = '';
+    if (posSummary) posSummary.innerHTML = '';
     if (obody) obody.innerHTML = '';
     if (wbody) wbody.innerHTML = '';
     if (whead) whead.innerHTML = '';

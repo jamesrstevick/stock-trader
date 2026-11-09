@@ -460,6 +460,40 @@ body.modal-open { overflow: hidden; }
   margin: 0 0 0.75rem;
 }
 
+.pos-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.35rem;
+  align-items: baseline;
+  margin: -0.2rem 0 0.95rem;
+}
+
+.pos-stat {
+  min-width: 5.5rem;
+}
+
+.pos-stat .label {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-bottom: 0.15rem;
+}
+
+.pos-stat .value {
+  font-family: var(--display);
+  font-size: 1.35rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+.pos-stat .value.pos { color: var(--good); }
+.pos-stat .value.neg { color: var(--bad); }
+
 .prose p { line-height: 1.6; margin: 0 0 0.85rem; color: var(--ink); }
 .prose ul { margin: 0 0 1rem; padding-left: 1.2rem; color: var(--muted); line-height: 1.55; }
 .prose h3 {

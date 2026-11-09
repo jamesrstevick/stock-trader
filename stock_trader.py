@@ -18438,15 +18438,14 @@ def _dashboard_locked_pl(
     average_price: Optional[float] = None,
 ) -> Optional[float]:
     """
-    Dollars locked in if the resting STOP_LIMIT fills at its limit:
-    (limit × shares) − cost basis. Only for trail-armed rows whose broker
-    stop is actually above cost (not still the hard floor).
+    Dollars locked in for a trailed position: (limit × shares) − cost.
+
+    Trail stops are floored at cost, so this is never a loss. If the resting
+    broker limit is still the hard floor while Status shows a trail at or
+    above cost, use that trail level. A stop sitting on cost can slip a hair
+    under via the limit; that shows as $0.
     """
     if (status or '') != 'trail':
-        return None
-    broker = _positive_float(stop_order_price)
-    avg = _positive_float(average_price)
-    if broker is None or avg is None or broker <= avg:
         return None
     try:
         shares_f = float(shares or 0)
@@ -18458,25 +18457,61 @@ def _dashboard_locked_pl(
         cost_f = float(cost_basis)
     except (TypeError, ValueError):
         return None
-    limit = None  # type: Optional[float]
-    if stop_limit_price is not None:
-        try:
-            limit = float(stop_limit_price)
-        except (TypeError, ValueError):
-            limit = None
-    if (limit is None or limit <= 0) and broker is not None:
-        try:
-            limit = stop_limit_price_from_stop(float(broker))
-        except (TypeError, ValueError):
-            limit = None
-    if (limit is None or limit <= 0) and stop_display_price is not None:
-        try:
-            limit = stop_limit_price_from_stop(float(stop_display_price))
-        except (TypeError, ValueError):
-            limit = None
-    if limit is None or limit <= 0:
+    if cost_f <= 0:
         return None
-    return round((limit * shares_f) - cost_f, 2)
+
+    def _from_limit(limit):
+        # type: (Any) -> Optional[float]
+        try:
+            limit_f = float(limit)
+        except (TypeError, ValueError):
+            return None
+        if limit_f <= 0:
+            return None
+        return round((limit_f * shares_f) - cost_f, 2)
+
+    def _from_stop(stop):
+        # type: (Any) -> Optional[float]
+        try:
+            return _from_limit(stop_limit_price_from_stop(float(stop)))
+        except (TypeError, ValueError):
+            return None
+
+    avg = _positive_float(average_price)
+    if avg is None:
+        avg = cost_f / shares_f
+    display = _positive_float(stop_display_price)
+    broker = _positive_float(stop_order_price)
+    trail_stop = display if display is not None else broker
+    covers_cost = trail_stop is not None and trail_stop + 0.009 >= avg
+    from_trail = _from_stop(trail_stop) if covers_cost else None
+    if from_trail is not None and from_trail < 0:
+        from_trail = 0.0
+
+    resting_limit = _positive_float(stop_limit_price)
+    resting = _from_limit(stop_limit_price)
+    if from_trail is not None:
+        # Prefer the live limit when it belongs to this trail stop.
+        # A hard-floor limit still resting below cost is not a locked-in gain.
+        if (
+            resting is not None
+            and resting >= 0
+            and resting_limit is not None
+            and trail_stop is not None
+            and resting_limit + 0.02 >= trail_stop * 0.98
+            and resting_limit <= trail_stop + 0.02
+        ):
+            return resting
+        return from_trail
+
+    if resting is not None and resting >= 0:
+        return resting
+    if broker is not None and broker > avg:
+        from_broker = _from_stop(broker)
+        if from_broker is None:
+            return None
+        return from_broker if from_broker > 0 else 0.0
+    return None
 
 
 def _dashboard_days_held(
