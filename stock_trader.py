@@ -4515,6 +4515,72 @@ def _run_trader_pass_for_user(
     return next_wake
 
 
+def _touch_loop_wake(ts: Optional[str] = None) -> str:
+    """Update global last_loop_wake (dashboard uses this to detect a dead loop)."""
+    wake_ts = ts or datetime.now().isoformat(timespec='seconds')
+    prev = uc.current_user_id()
+    uc.set_current_user_id(None)
+    try:
+        set_runtime_flag('last_loop_wake', wake_ts)
+    finally:
+        uc.set_current_user_id(prev)
+    return wake_ts
+
+
+def get_loop_health() -> Dict[str, Any]:
+    """
+    Whether main.py --loop is still waking.
+
+    The loop refreshes last_loop_wake at each pass and during sleep chunks, so the
+    dashboard can warn even when only web_app.py is still up.
+    """
+    warn_minutes = float(getattr(config, 'LOOP_STALE_WARN_MINUTES', 20) or 20)
+    if warn_minutes < 1:
+        warn_minutes = 1.0
+    snooze_hours = float(getattr(config, 'LOOP_STALE_SNOOZE_HOURS', 4) or 4)
+    raw = get_runtime_flag('last_loop_wake')
+    age_seconds = None  # type: Optional[float]
+    if raw:
+        try:
+            woken = datetime.fromisoformat(str(raw).replace('Z', '+00:00')[:19])
+            age_seconds = max(0.0, (datetime.now() - woken).total_seconds())
+        except (TypeError, ValueError):
+            age_seconds = None
+    warn_after = warn_minutes * 60.0
+    if age_seconds is None:
+        stale = True
+        message = (
+            'Trader loop has never reported a wake — buys/sells will not run '
+            'until main.py --loop is started on the host.'
+        )
+    elif age_seconds >= warn_after:
+        stale = True
+        age_min = int(age_seconds // 60)
+        if age_min >= 120:
+            age_label = '%dh %dm' % (age_min // 60, age_min % 60)
+        else:
+            age_label = '%d min' % age_min
+        message = (
+            'Trader loop looks stopped (last wake %s ago). The website can still '
+            'be up while buys and scheduled sells are not running — restart the '
+            'Dell host processes.'
+        ) % age_label
+    else:
+        stale = False
+        message = 'Trader loop is waking normally.'
+    return {
+        'ok': not stale,
+        'stale': stale,
+        'warn': stale,
+        'last_loop_wake': raw,
+        'age_seconds': age_seconds,
+        'warn_after_seconds': warn_after,
+        'warn_minutes': warn_minutes,
+        'snooze_hours': snooze_hours,
+        'message': message,
+    }
+
+
 def run_trader(once: bool = True) -> None:
     """
     Parent entry: run due scheduled jobs for each active user.
@@ -4525,21 +4591,14 @@ def run_trader(once: bool = True) -> None:
     setup_file_logging()
     init_database()
     # Global wake flag (not user-scoped)
-    prev = uc.current_user_id()
-    uc.set_current_user_id(None)
-    set_runtime_flag('last_loop_wake', datetime.now().isoformat(timespec='seconds'))
-    uc.set_current_user_id(prev)
+    _touch_loop_wake()
 
     jobs = get_scheduled_jobs()
     sleep_chunk_seconds = 60
 
     while True:
         try:
-            wake_ts = datetime.now().isoformat(timespec='seconds')
-            prev = uc.current_user_id()
-            uc.set_current_user_id(None)
-            set_runtime_flag('last_loop_wake', wake_ts)
-            uc.set_current_user_id(prev)
+            wake_ts = _touch_loop_wake()
 
             market_open = is_us_equity_market_open()
             print_loop_status(
@@ -4638,6 +4697,12 @@ def run_trader(once: bool = True) -> None:
                 if remaining <= 0:
                     break
                 time.sleep(min(sleep_chunk_seconds, remaining))
+                # Heartbeat while sleeping so the dashboard can spot a dead loop
+                # even when the next job is an hour away.
+                try:
+                    _touch_loop_wake()
+                except Exception:
+                    pass
         except sqlite3.OperationalError as e:
             if 'locked' not in str(e).lower():
                 raise
@@ -18363,10 +18428,12 @@ def get_dashboard_status() -> Dict[str, Any]:
     except Exception:
         stage = 'done'
     last_audit = get_last_account_audit()
+    loop_health = get_loop_health()
     needs_attention = (
         stage != 'done'
         or bool(schwab.get('warn'))
         or bool(last_audit and last_audit.get('status') == 'fail')
+        or bool(loop_health.get('warn'))
     )
     return {
         'ts': datetime.now().isoformat(timespec='seconds'),
@@ -18375,7 +18442,8 @@ def get_dashboard_status() -> Dict[str, Any]:
         'buys_paused': buys_paused(),
         'market_open': market_open,
         'next_market_open': next_us_equity_market_open().isoformat(),
-        'last_loop_wake': get_runtime_flag('last_loop_wake'),
+        'last_loop_wake': loop_health.get('last_loop_wake'),
+        'loop_health': loop_health,
         'algorithm_start': get_algorithm_start(),
         'algorithm': get_algorithm_performance(),
         'jobs': jobs_out,

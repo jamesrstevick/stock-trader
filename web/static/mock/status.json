@@ -4,6 +4,17 @@
   "trade_dry_run": true,
   "buys_paused": false,
   "last_loop_wake": "2026-08-03T17:55:00",
+  "loop_health": {
+    "ok": true,
+    "stale": false,
+    "warn": false,
+    "last_loop_wake": "2026-08-03T17:55:00",
+    "age_seconds": 300,
+    "warn_after_seconds": 1200,
+    "warn_minutes": 20,
+    "snooze_hours": 4,
+    "message": "Trader loop is waking normally."
+  },
   "jobs": [
     {
       "job_name": "refresh_market_data",

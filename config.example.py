@@ -70,6 +70,10 @@ SCHWAB_SYNC_INTERVAL_MINUTES = 5
 ACCOUNT_AUDIT_INTERVAL_DAYS = 7
 # If a job stays status=running longer than this, reclaim it so the loop can retry.
 STALE_JOB_RUNNING_MINUTES = 5
+# Dashboard banner when last_loop_wake is older than this (loop heartbeats while sleeping).
+LOOP_STALE_WARN_MINUTES = 20
+# How long the site banner "Later" snooze lasts for a stale trader loop.
+LOOP_STALE_SNOOZE_HOURS = 4
 POST_ORDER_SYNC_DELAY_SECONDS = 3
 POSITIONS_SYNC_MIN_INTERVAL_SECONDS = 45
 

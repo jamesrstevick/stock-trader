@@ -622,7 +622,51 @@
     if (!badge) return;
     var attention = !!(status && status.actions_attention);
     if (!attention && status && status.schwab) attention = !!status.schwab.warn;
+    if (!attention && status && status.loop_health) attention = !!status.loop_health.warn;
     badge.hidden = !attention;
+  }
+
+  // --- Trader loop stale (website up, scheduler dead) ---
+  var LOOP_SNOOZE_KEY = 'loopStaleBannerSnoozeUntil';
+  var lastLoopHealth = null;
+
+  function loopSnoozeUntil() {
+    try {
+      var v = parseInt(localStorage.getItem(userScopedKey(LOOP_SNOOZE_KEY)) || '0', 10);
+      return isNaN(v) ? 0 : v;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  function setLoopSnooze(hours) {
+    var ms = (hours != null ? Number(hours) : 4) * 3600 * 1000;
+    try {
+      localStorage.setItem(userScopedKey(LOOP_SNOOZE_KEY), String(Date.now() + ms));
+    } catch (e) {}
+  }
+
+  function clearLoopSnooze() {
+    try { localStorage.removeItem(userScopedKey(LOOP_SNOOZE_KEY)); } catch (e) {}
+  }
+
+  function loopBannerSnoozed() {
+    return Date.now() < loopSnoozeUntil();
+  }
+
+  function applyLoopChrome(loopHealth) {
+    lastLoopHealth = loopHealth || null;
+    var banner = document.getElementById('loop-banner');
+    var bannerText = document.getElementById('loop-banner-text');
+    if (!banner || !bannerText) return;
+    var warn = !!(loopHealth && loopHealth.warn);
+    if (!warn || loopBannerSnoozed()) {
+      banner.hidden = true;
+      return;
+    }
+    bannerText.textContent = loopHealth.message ||
+      'Trader loop looks stopped — the website can still be up while buys are not running.';
+    banner.hidden = false;
   }
 
   function applyOnboardingBanner(stage) {
@@ -780,6 +824,7 @@
       applyActionsBadge(data);
       applyOnboardingBanner(stage);
       applySchwabChrome(schwab, stage);
+      applyLoopChrome(data.loop_health);
       var active = document.querySelector('.page.active');
       if (active && active.id === 'page-actions') {
         renderSchwabActionCard(schwab, stage);
@@ -1512,16 +1557,38 @@
     var pullBtn = document.getElementById('host-pull-btn');
     var restartBtn = document.getElementById('host-restart-btn');
     var alive = !!(data && data.supervisor);
+    var loopStale = !!(lastLoopHealth && lastLoopHealth.warn);
+    var children = (data && data.children) || {};
+    var loopChild = children.loop || {};
+    var loopStopped = alive && !loopChild.skipped && !loopChild.running;
+    card.classList.toggle('urgent', !alive || loopStale || loopStopped);
+    card.classList.toggle('urgent-warn', !!(alive && (loopStale || loopStopped)));
     if (pill) {
-      pill.textContent = alive ? (data.busy ? 'Busy' : 'Running') : 'Offline';
-      pill.className = 'pill ' + (alive ? (data.busy ? 'warn' : 'ok') : 'bad');
+      if (!alive) {
+        pill.textContent = 'Offline';
+        pill.className = 'pill bad';
+      } else if (loopStale || loopStopped) {
+        pill.textContent = 'Loop stale';
+        pill.className = 'pill warn';
+      } else if (data.busy) {
+        pill.textContent = 'Busy';
+        pill.className = 'pill warn';
+      } else {
+        pill.textContent = 'Running';
+        pill.className = 'pill ok';
+      }
     }
     if (detail) {
-      detail.textContent = alive
-        ? 'Pull from GitHub, restart, then catch-up (live) before normal jobs. Crashes restart on their own.'
-        : ((data && data.hint) || 'Supervisor is not running on this machine.');
+      if (!alive) {
+        detail.textContent = (data && data.hint) || 'Supervisor is not running on this machine.';
+      } else if (loopStale || loopStopped) {
+        detail.textContent = (lastLoopHealth && lastLoopHealth.message) ||
+          'Trader loop is not waking — restart processes so buys and sell checks resume.';
+      } else {
+        detail.textContent =
+          'Pull from GitHub, restart, then catch-up (live) before normal jobs. Crashes restart on their own.';
+      }
     }
-    var children = (data && data.children) || {};
     if (list) {
       list.innerHTML = ['loop', 'dashboard', 'tunnel'].map(function (name) {
         var c = children[name] || {};
@@ -1748,6 +1815,28 @@
         var hours = (lastSchwabStatus && lastSchwabStatus.snooze_hours) || 4;
         setSchwabSnooze(hours);
         applySchwabChrome(lastSchwabStatus, lastOnboardingStage);
+      });
+    }
+  })();
+
+  (function wireLoopBanner() {
+    var fixBtn = document.getElementById('loop-banner-fix');
+    var laterBtn = document.getElementById('loop-banner-later');
+    if (fixBtn) {
+      fixBtn.addEventListener('click', function () {
+        clearLoopSnooze();
+        // Host controls are admin-only; everyone else still lands on Actions.
+        var target = (currentUser && currentUser.is_admin)
+          ? 'host-deploy-card'
+          : 'algorithm-control-card';
+        scrollToActionCard(target);
+      });
+    }
+    if (laterBtn) {
+      laterBtn.addEventListener('click', function () {
+        var hours = (lastLoopHealth && lastLoopHealth.snooze_hours) || 4;
+        setLoopSnooze(hours);
+        applyLoopChrome(lastLoopHealth);
       });
     }
   })();
@@ -2563,12 +2652,16 @@
       applyOnboardingBanner(stage);
       applyActionsBadge(data);
       if (data.schwab) applySchwabChrome(data.schwab, stage);
+      applyLoopChrome(data.loop_health);
       var y = data.yahoo || {};
       setupFilterPanel(data.watchlist_filter || null);
 
       pills.innerHTML = '';
       if (data.last_loop_wake) {
-        pills.appendChild(pill('Last wake ' + timeAgo(data.last_loop_wake), ''));
+        var wakeCls = (data.loop_health && data.loop_health.warn) ? 'bad' : '';
+        pills.appendChild(pill('Last wake ' + timeAgo(data.last_loop_wake), wakeCls));
+      } else if (data.loop_health && data.loop_health.warn) {
+        pills.appendChild(pill('Loop never woke', 'bad'));
       }
       if (useMock()) pills.appendChild(pill('Mock data', 'warn'));
 
@@ -4217,6 +4310,7 @@
       applyOnboardingBanner(stage);
       applyActionsBadge(data);
       if (data.schwab) applySchwabChrome(data.schwab, stage);
+      applyLoopChrome(data.loop_health);
       var rev = data.dashboard_rev;
       if (rev === lastContentRev) return;
       lastContentRev = rev;
